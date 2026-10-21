@@ -1,0 +1,17 @@
+.env
+.env.*
+!.env.example
+
+# Python environments and generated files
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Node dependencies and generated builds
+node_modules/
+dist/
+
+# Local tooling
+.DS_Store
+.vscode/
