@@ -4,15 +4,17 @@
 
 ## 当前实现范围
 
-- `backend/app/`：FastAPI 应用、内部用户认证、基于服务端会话的登录/登出、首次登录强制修改密码及管理员检查。
-- `backend/app/models/`、`backend/migrations/`：SQLAlchemy 用户/会话模型与 Alembic 初始迁移。
+- `backend/app/`：FastAPI 应用、内部用户认证、基于服务端会话的登录/登出、首次登录强制修改密码、首期对象授权和 provider-neutral 渠道连接中心 API。
+- `backend/app/models/`、`backend/migrations/`：SQLAlchemy 用户/会话、渠道账号/授权、询盘/附件/内部通知、统一消息/消息附件模型与 Alembic 迁移（当前 head 为 `0003_messages`）。
+- `backend/app/message_ingestion.py`：provider-neutral 消息 mapping、fake/provider batch 接入、账号/provider/external ID 幂等和附件 metadata 保存服务；已由用户运行相关回归测试。
+- `backend/app/channels/`：provider 合同、能力目录、fake 测试 provider、入站 seam 和凭据引用安全边界；真实 provider 尚未配置。
 - `backend/scripts/create_admin.py`：管理员初始化脚本。
-- `backend/tests/`：健康检查、数据库配置及认证测试。
-- `frontend/`：Vue 3 + TypeScript + Vite 最小前端入口，尚无业务工作台页面。
+- `backend/tests/`：健康检查、数据库配置、认证、迁移、首期对象授权和渠道连接中心测试。
+- `frontend/`：Vue 3 + TypeScript + Vite 渠道连接中心最小页面和 API client；已验证构建，尚未完成生产部署/真实 API 联调。
 - `compose.yaml`、`backend/Dockerfile`：开发环境服务和后端镜像配置。
 - `PROJECT_SPEC.md`、`docs/`、`plan/`：项目范围、架构、交接记录及开发指南。
 
-渠道连接中心、Gmail/Outlook/WhatsApp 实际授权与消息处理、运营收件箱及业务工作流尚未实现。设计资料与代码文件存在不代表数据库迁移已在目标环境应用、真实渠道已连接或生产部署已验收。
+渠道连接中心的 provider-neutral 内部目录、账号状态 API、fake 状态测试、最小前端页面和三渠道入站 seam 已实现并由用户实际测试验证；Gmail/Outlook/WhatsApp 真实 adapter、授权与真实消息处理、运营收件箱及完整业务工作流尚未实现。设计资料、代码测试和前端构建成功不代表数据库迁移已在目标环境应用、真实渠道已连接或生产部署已验收。当前 Day 3 状态为“已实现，待真实环境验收”，不是整体完成。
 
 ## 开发环境
 

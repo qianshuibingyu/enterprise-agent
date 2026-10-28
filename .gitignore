@@ -15,3 +15,7 @@ dist/
 # Local tooling
 .DS_Store
 .vscode/
+
+plan/
+# Local development plans
+plan/

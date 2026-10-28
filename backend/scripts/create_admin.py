@@ -1,4 +1,10 @@
 import getpass
+import sys
+from pathlib import Path
+
+# Allow direct execution from the container as ``python scripts/create_admin.py``.
+# The script's directory is otherwise placed on sys.path instead of /app.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from sqlalchemy import select
 

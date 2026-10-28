@@ -2,9 +2,11 @@
 
 > **文档状态：当前架构基线草案。** 本文依据 `PROJECT_SPEC.md`、`docs/handoff/day1-scope.md`、`docs/handoff/day1-unknowns.md` 及已确认对话整理。它描述目标逻辑边界，不证明任何组件、接口、服务或数据流已经实现、部署或验证。
 >
-> **核对日期：2026-10-21（渠道接入策略更新：2026-10-21）**
+> **核对日期：2026-10-21（渠道接入策略更新：2026-10-27）**
 >
 > **当前首期边界（用户明确确认，2026-10-21，渠道接入策略后续调整）：** WhatsApp、Gmail、Outlook 首期均提供连接入口、客户侧前置条件指南及安全连接管理；客户负责平台准入/授权，系统不保证所有地区或账号都能接通。真实入站与最终出站按具备资格且完成授权的客户账号分别验收；平台阻塞如实呈现，不用模拟结果冒充接通，也不规避平台/地区限制。当前连接 MVP 先验证实际连通性/入站，不发送测试出站消息；项目最终仍需验收运营主动出站。其余首期聚焦运营消息处理、回复建议与人工审核发送、手动转交、询盘/售后链路状态和只读内部 AI。详见 [PROJECT_SPEC.md §1.1](../PROJECT_SPEC.md#11-当前首期开发边界2026-10-21)。
+>
+> **渠道实现基线（依据 [docs/external-channel-integration.md](external-channel-integration.md)，用户更新：2026-10-28）：** WhatsApp 不走 OAuth；采用项目自有独立 `WhatsApp Web + Baileys` adapter，账号所有者通过项目连接入口获取短时 QR 并扫码绑定关联设备，adapter 负责加密 auth state、连接、重连和入站事件。Gmail 由本项目直接完成 Google OAuth，使用 Gmail API、Gmail Watch、Google Pub/Sub、History API 和 Message API。Outlook 不采用当前仓库内置 IMAP watcher；通过外部 Outlook MCP Server 使用 Microsoft Graph 和 Entra OAuth 个人委派授权，按用户主动读取，不做后台长期无人值守。该方案是当前架构决策，不代表 adapter、Google OAuth、MCP、账号授权或真实渠道已验收。
 
 ## 1. 架构总览（当前实现与目标逻辑）
 
@@ -15,12 +17,12 @@
 ```mermaid
 flowchart LR
     Browser[内部用户浏览器]
-    Frontend[Vue 3 + TypeScript + Vite\n静态占位 UI；配置 dev/build]
+    Frontend[Vue 3 + TypeScript + Vite\n渠道连接中心最小 UI；配置 dev/build]
     Dist[frontend/dist 构建产物\n存在于工作区；未验证为最新]
 
     subgraph Compose[compose.yaml 定义的服务拓扑]
         subgraph Backend[backend 容器：Python 3.11 + Uvicorn]
-            API[FastAPI 应用\nGET /health → 固定 status=ok]
+            API[FastAPI 应用\n认证、对象授权、业务和渠道状态 API]
             DBModule[SQLAlchemy 数据库模块\nengine / SessionLocal / get_db]
             Migration[Alembic CLI 环境\nBase.metadata；无 revision 文件]
         end
@@ -30,10 +32,10 @@ flowchart LR
 
     Browser -. 页面由何处提供未在仓库配置 .-> Frontend
     Frontend -. vite build 输出 .-> Dist
-    API -. 只返回固定状态；未调用 DB .-> DBModule
+    API -. 健康检查不访问 DB；业务/渠道 API 通过依赖访问 DB .-> DBModule
     DBModule -. 连接配置指向 db:5432；历史只读连通性验证见 §9 .-> Postgres
-    Migration -->|导入 DATABASE_URL 与 Base.metadata；无 revision 可应用| DBModule
-    Migration -. 当前无业务迁移 .-> Postgres
+    Migration -->|导入 DATABASE_URL 与 Base.metadata；revision 由 Alembic 管理| DBModule
+    Migration -. 认证与首期业务 revision 已在代码中；目标库是否应用仍待用户核验 .-> Postgres
     Postgres --> Volume
 
     Note[当前未发现前端到后端 API 调用；\nCompose 无前端/Nginx 服务。\n端口映射：主机 127.0.0.1:8000 → backend:8000；\nPostgreSQL 未发布主机端口]
@@ -58,7 +60,7 @@ flowchart LR
     OAuth[渠道 OAuth/API 授权回调\n短期授权交换与刷新]
     Vault[后端凭据保护\n加密存储 / 客户账号隔离]
     Auth[登录、角色与必要的数据范围授权\n后端和查询层强制校验]
-    Channel[渠道适配层\nWhatsApp / Gmail / Outlook\n接收、抓取、运营主动发送]
+    Channel[渠道适配层\nWhatsApp Baileys adapter / Gmail API+Pub/Sub / Outlook MCP+Graph\n接收、主动读取、运营主动发送]
     Unified[统一消息层\n来源校验、去重、原始消息与附件元数据]
     Link[客户链路\n询盘 / 售后 / 负责人 / 状态]
     Router{消息场景与白名单分流}
@@ -115,18 +117,18 @@ flowchart LR
 - 回复 AI 与内部 AI 职责分离：前者生成需运营审核的客户回复建议；后者只做授权范围内查询、分析及操作指引，不执行写操作。内部 AI 的操作类意图可给出页面入口和步骤，由员工自行操作。
 - 询盘转交由运营手动触发，转交数据保留联系人、联系方式、客户原始内容和来源渠道；售后在转交业务或运营标记已处理后进入静默期。静默期长度、新消息到达后的处理与恢复规则仍待实现前确认。
 - 首期不建设部门内部作业系统、合同管理/OCR、统计报表或自动发送。业务员查看转交客户的必要原始信息和链路状态，不等于建设其完整作业工作台。
-- **尚未实现（按当前仓库检查）：** 渠道连接中心、OAuth/平台授权流程及凭据生命周期、真实渠道连接/消息处理、业务模型/迁移、登录与 RBAC、业务 API、Agent/RAG、队列/调度、前端工作台、SSE、审计业务事件、附件存储及生产 Nginx/HTTPS 部署。图中的逻辑连线不是接口或调用合同。
+- **尚未实现（按当前仓库检查）：** 真实 `whatsapp_web_baileys` 独立 Node adapter、Gmail OAuth/Pub/Sub、Outlook MCP/Graph/Entra 连接、完整凭据生命周期、生产调度、完整前端登录/工作台体系、SSE、完整审计保留生命周期、附件实际存储。当前已实现认证与会话、首期用户/渠道/询盘对象授权、认证/授权/消息/询盘事件 migration 文件、provider-neutral 目录/状态 API、fake adapter、统一消息入库 service、只读收件箱/询盘查询、询盘最小时间线、手动转交 UI/API 及最小前端渠道/链路页面；这些代码和隔离测试不代表真实 provider 已授权或真实入站已验收。图中的逻辑连线不是接口或调用合同。
 
 ### 当前骨架与目标能力差距
 
 | 领域 | 当前仓库证据 | 当前状态 |
 |---|---|---|
-| 前端 | [frontend/src/main.ts](../frontend/src/main.ts)、[frontend/package.json](../frontend/package.json) | Vue/Vite 最小占位入口；无路由、业务页面、API/SSE 客户端；未在本次运行构建验证 |
-| 后端 API | [backend/app/main.py](../backend/app/main.py) | 仅 `GET /health`；无业务 API，健康检查不访问数据库 |
-| 数据库连接 | [backend/app/database.py](../backend/app/database.py)、[compose.yaml](../compose.yaml) | SQLAlchemy PostgreSQL 连接/会话基础设施及 Compose PostgreSQL 16；未接入业务路由 |
-| 业务模型与迁移 | [backend/app/models/base.py](../backend/app/models/base.py)、[backend/migrations/env.py](../backend/migrations/env.py) | 只有空 ORM 基类和 Alembic 环境；无业务模型、revision 或已证实的业务 schema |
-| 认证与授权 | backend 源码、[backend/requirements.txt](../backend/requirements.txt) | 未发现登录、角色策略或对象级授权实现；§5.1 为已确认设计，不是实现 |
-| 渠道与消息处理 | backend 源码 | 未发现 WhatsApp/Gmail/Outlook 适配器、收发、webhook、去重或消息持久化 |
+| 前端 | [frontend/src/main.ts](../frontend/src/main.ts)、[frontend/src/App.vue](../frontend/src/App.vue)、[frontend/src/api/channels.ts](../frontend/src/api/channels.ts)、[frontend/src/api/inbox.ts](../frontend/src/api/inbox.ts) | Vue/Vite 渠道中心、收件箱/客户链路详情、最小 timeline、手动转交入口和只读分析卡片；用户构建成功；生产 frontend 容器/浏览器最新 bundle 仍需最后确认 |
+| 后端 API | [backend/app/main.py](../backend/app/main.py)、[backend/app/channel_routes.py](../backend/app/channel_routes.py)、[backend/app/business_routes.py](../backend/app/business_routes.py) | 认证、首期对象授权、渠道目录/账号状态、收件箱/询盘查询、timeline、转交和内部只读分析 API；真实 OAuth/adapter 尚未实现 |
+| 数据库连接 | [backend/app/database.py](../backend/app/database.py)、[compose.yaml](../compose.yaml) | SQLAlchemy PostgreSQL/Compose PostgreSQL 16；用户已核验目标库 revision 为 `0004_inquiry_events`，真实并发和 provider 数据验收仍待完成 |
+| 业务模型与迁移 | [backend/app/models/user.py](../backend/app/models/user.py)、[backend/app/models/business.py](../backend/app/models/business.py)、[backend/migrations/env.py](../backend/migrations/env.py)、[backend/migrations/versions/0004_inquiry_events.py](../backend/migrations/versions/0004_inquiry_events.py) | 认证、渠道账号/授权、询盘/附件/通知、消息/消息附件、最小询盘事件 ORM 与 `0001`–`0004` revisions；目标 PostgreSQL `0004` 已由用户应用并核验 `inquiry_events` 表和列 |
+| 认证与授权 | [backend/app/auth.py](../backend/app/auth.py)、[backend/app/authorization.py](../backend/app/authorization.py) | 服务端 session/CSRF/Argon2、首期对象授权、消息/询盘/timeline/转交范围测试通过；完整 RBAC、部门/经理权限未实现 |
+| 渠道与消息处理 | [backend/app/channels/](../backend/app/channels/)、[backend/app/channel_routes.py](../backend/app/channel_routes.py)、[backend/app/channels/inbound.py](../backend/app/channels/inbound.py)、[backend/app/message_ingestion.py](../backend/app/message_ingestion.py) | provider-neutral contract、能力目录、fake 状态、统一消息幂等入库、收件箱查询和渠道入站 seam 已实现并经隔离测试；真实 adapter、收发、Webhook/轮询和后台调度未实现 |
 | Agent、知识检索与报价 | backend 源码及依赖清单 | 未发现 Agent、RAG、产品/报价工具实现 |
 | 队列、调度与 SSE | backend 源码及依赖清单 | 未发现 worker、定时抓取、重试队列或 SSE 端点 |
 | 审计、提醒与生命周期 | backend 源码 | 未发现业务审计事件、提醒、归档或清理任务 |
@@ -295,7 +297,7 @@ WhatsApp / Gmail / Outlook
 - **【原始基线】** 权限必须由后端和数据查询层强制执行，不能只依赖前端或 Prompt；需要对象级授权和审计。[`PROJECT_SPEC.md §3、§11`](../PROJECT_SPEC.md#3-用户与角色)
 - **【用户明确确认】** 权限独立拆分、可解耦；管理员可新增角色并修改角色、个人和部门权限。具体权限项仍需实现前验证。
 - **【原始基线】** 凭据加密保存、密钥使用环境变量、日志脱敏、数据库不直接暴露公网、支持备份与恢复。[`PROJECT_SPEC.md §11`](../PROJECT_SPEC.md#11-安全运行与部署要求)
-- **【渠道连接安全要求】** OAuth/API 凭据只经 HTTPS 到达后端并加密存储，按客户与渠道账号隔离，限制最小权限；支持连接状态查看、重新授权、撤销/断开。不得放入浏览器 localStorage、URL、日志、分析事件或普通错误追踪。具体密钥管理、token 刷新/轮换、删除与撤销语义须实现前验证；手工粘贴长期 token 不作为默认连接流程。
+- **【渠道连接方案与安全要求】** 具体 provider 方案遵循 [docs/external-channel-integration.md](external-channel-integration.md)：WhatsApp 使用独立 `whatsapp_web_baileys` Node adapter（WhatsApp Web + Baileys，不采用 Meta Cloud API）；Gmail 使用项目 Google OAuth + Gmail API + Watch/Pub/Sub；Outlook 使用外部 MCP + Microsoft Graph/Entra 个人委派授权，按用户主动读取，不做后台长期无人值守。凭据只经 HTTPS 到达后端并加密存储，按客户与渠道账号隔离，限制最小权限；支持连接状态查看、重新授权、撤销/断开。不得将 OAuth token、Baileys QR/auth state、MCP 凭据或密码放入浏览器 localStorage、URL、日志、分析事件或普通错误追踪。具体密钥管理、token 刷新/轮换、删除与撤销语义须实现前验证；手工粘贴长期 token 不作为默认连接流程。该规范不代表真实 provider 已配置或账号已验收。
 - **【用户明确确认】** 不在文档、代码、测试数据或日志中记录 Token、密码、Client Secret、Access Token、Refresh Token 或客户敏感内容。
 
 ### 6.1 首期认证与授权边界及后续授权基线

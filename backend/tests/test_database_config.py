@@ -19,7 +19,7 @@ def isolated_database_module(monkeypatch):
 
 
 def test_database_url_uses_configured_values(isolated_database_module):
-    url = isolated_database_module.DATABASE_URL
+    url = isolated_database_module.get_database_url()
 
     assert isinstance(url, URL)
     assert url.drivername == "postgresql+psycopg"
@@ -41,19 +41,20 @@ def test_database_url_defaults_to_compose_db_and_postgres_port(monkeypatch):
 
     module = importlib.reload(database)
 
-    assert module.DATABASE_URL.host == "db"
-    assert module.DATABASE_URL.port == 5432
+    assert module.get_database_url().host == "db"
+    assert module.get_database_url().port == 5432
 
 
-def test_missing_required_database_setting_fails_without_connecting(monkeypatch):
+def test_missing_required_database_setting_fails_when_url_is_requested(monkeypatch):
     monkeypatch.delenv("POSTGRES_USER", raising=False)
     monkeypatch.setenv("POSTGRES_PASSWORD", "unit_test_password")
     monkeypatch.setenv("POSTGRES_DB", "unit_test_db")
 
     import app.database as database
 
+    module = importlib.reload(database)
     with pytest.raises(RuntimeError, match="POSTGRES_USER is not set"):
-        importlib.reload(database)
+        module.get_database_url()
 
 
 def test_get_db_closes_session_after_use(isolated_database_module, monkeypatch):

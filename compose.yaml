@@ -1,10 +1,25 @@
 services:
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:80"
+    depends_on:
+      backend:
+        condition: service_started
+
   backend:
+    restart: unless-stopped
     build:
       context: ./backend
       dockerfile: Dockerfile
     ports:
       - "127.0.0.1:8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
     environment:
       POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER must be set}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
@@ -12,6 +27,31 @@ services:
       DB_HOST: db
       DB_PORT: "5432"
       AUTH_ORIGIN: ${AUTH_ORIGIN:?AUTH_ORIGIN must be set to the canonical HTTPS origin}
+      # WhatsApp is handled by the project-owned Baileys adapter.
+      WHATSAPP_ADAPTER_URL: ${WHATSAPP_ADAPTER_URL:-}
+      WHATSAPP_ADAPTER_TOKEN: ${WHATSAPP_ADAPTER_TOKEN:-}
+      WHATSAPP_AUTH_STATE_KEY: ${WHATSAPP_AUTH_STATE_KEY:-}
+      WHATSAPP_CONNECT_TIMEOUT_SECONDS: ${WHATSAPP_CONNECT_TIMEOUT_SECONDS:-10}
+      WHATSAPP_SEND_TIMEOUT_SECONDS: ${WHATSAPP_SEND_TIMEOUT_SECONDS:-15}
+      # Gmail is handled directly through Google OAuth/API and Pub/Sub.
+      GMAIL_ENABLED: ${GMAIL_ENABLED:-false}
+      GMAIL_CLIENT_ID: ${GMAIL_CLIENT_ID:-}
+      GMAIL_CLIENT_SECRET: ${GMAIL_CLIENT_SECRET:-}
+      GMAIL_REDIRECT_URI: ${GMAIL_REDIRECT_URI:-}
+      GMAIL_PUBSUB_PROJECT: ${GMAIL_PUBSUB_PROJECT:-}
+      GMAIL_PUBSUB_TOPIC: ${GMAIL_PUBSUB_TOPIC:-}
+      GMAIL_PUBSUB_SUBSCRIPTION: ${GMAIL_PUBSUB_SUBSCRIPTION:-}
+      GMAIL_PUBSUB_PUSH_TOKEN: ${GMAIL_PUBSUB_PUSH_TOKEN:-}
+      GMAIL_SCOPES: ${GMAIL_SCOPES:-https://www.googleapis.com/auth/gmail.readonly}
+      GMAIL_TIMEOUT_SECONDS: ${GMAIL_TIMEOUT_SECONDS:-20}
+      GMAIL_RECONCILE_INTERVAL_SECONDS: ${GMAIL_RECONCILE_INTERVAL_SECONDS:-600}
+      GMAIL_USER_ID: ${GMAIL_USER_ID:-me}
+      # Outlook is an externally hosted MCP + Microsoft Graph/Entra service.
+      OUTLOOK_ENABLED: ${OUTLOOK_ENABLED:-false}
+      OUTLOOK_MCP_URL: ${OUTLOOK_MCP_URL:-}
+      OUTLOOK_MCP_SERVER_NAME: ${OUTLOOK_MCP_SERVER_NAME:-outlook}
+      OUTLOOK_MCP_TOKEN: ${OUTLOOK_MCP_TOKEN:-}
+      OUTLOOK_MCP_TIMEOUT_SECONDS: ${OUTLOOK_MCP_TIMEOUT_SECONDS:-20}
 
   db:
     image: postgres:16

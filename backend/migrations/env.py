@@ -1,9 +1,18 @@
 from alembic import context
-from sqlalchemy import engine_from_config, pool
+from sqlalchemy import create_engine, pool
 
-from app.database import DATABASE_URL
 from app.models.base import Base
 from app.models.user import User, UserSession  # noqa: F401
+from app.models.business import (  # noqa: F401
+    ChannelAccount,
+    ChannelGrant,
+    Inquiry,
+    InquiryAttachment,
+    InternalNotification,
+    InquiryEvent,
+    Message,
+    MessageAttachment,
+)
 
 config = context.config
 target_metadata = Base.metadata
@@ -12,7 +21,7 @@ target_metadata = Base.metadata
 def run_migrations_offline() -> None:
     # 配置 Alembic 的离线迁移环境
     context.configure(
-        url=DATABASE_URL.render_as_string(hide_password=False),
+        url="postgresql+psycopg://",
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle":"named"},
@@ -23,10 +32,11 @@ def run_migrations_offline() -> None:
 
 # 定义在线迁移函数，需要连接数据库
 def run_migrations_online() -> None:
+    from app.database import get_database_url
+
     # 根据配置创建 SQLAlchemy 数据库引擎
-    connectable = engine_from_config(
-        {"sqlalchemy.url": DATABASE_URL.render_as_string(hide_password=False)},
-        prefix="sqlalchemy.",
+    connectable = create_engine(
+        get_database_url(),
         poolclass=pool.NullPool,
     )
     # 建立数据库连接并自动关闭连接
