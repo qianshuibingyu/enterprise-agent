@@ -39,19 +39,22 @@ def business_client():
                 User(username="other-operator", password_hash=hash_password("otherop1"), role="staff", is_active=True, must_change_password=False),
                 User(username="sales", password_hash=hash_password("salespass1"), role="sales", is_active=True, must_change_password=False),
                 User(username="other-sales", password_hash=hash_password("othersale1"), role="sales", is_active=True, must_change_password=False),
+                User(username="empty-operator", password_hash=hash_password("emptyop1"), role="staff", is_active=True, must_change_password=False),
             ]
         )
         db.flush()
         first_account = ChannelAccount(owner_user_id=1, channel_type="gmail", status="connected")
         blocked_account = ChannelAccount(owner_user_id=1, channel_type="outlook", status="blocked")
         other_account = ChannelAccount(owner_user_id=2, channel_type="outlook", status="connected")
-        db.add_all([first_account, blocked_account, other_account])
+        revoked_account = ChannelAccount(owner_user_id=1, channel_type="gmail", status="revoked")
+        db.add_all([first_account, blocked_account, other_account, revoked_account])
         db.flush()
         db.add_all(
             [
                 ChannelGrant(channel_account_id=first_account.id, channel_type="gmail", owner_user_id=1),
                 ChannelGrant(channel_account_id=blocked_account.id, channel_type="outlook", owner_user_id=1),
                 ChannelGrant(channel_account_id=other_account.id, channel_type="outlook", owner_user_id=2),
+                ChannelGrant(channel_account_id=revoked_account.id, channel_type="gmail", owner_user_id=1),
                 Message(
                     channel_account_id=first_account.id,
                     provider="gmail_api_pubsub",
@@ -69,6 +72,16 @@ def business_client():
                             storage_reference="vault://fixture/secret-reference",
                         )
                     ],
+                ),
+                Message(
+                    channel_account_id=revoked_account.id,
+                    provider="gmail_api_pubsub",
+                    external_message_id="revoked-gmail-1",
+                    direction="inbound",
+                    status="received",
+                    handling_status="pending",
+                    occurred_at=datetime(2026, 10, 23, tzinfo=timezone.utc),
+                    raw_content="Revoked account historical message",
                 ),
                 Message(
                     channel_account_id=other_account.id,
@@ -147,6 +160,15 @@ def business_client():
                         )
                     ],
                 ),
+                Inquiry(
+                    customer_contact="revoked@example.com",
+                    customer_nickname="Revoked Customer",
+                    raw_message="Revoked source inquiry",
+                    source_channel_account_id=revoked_account.id,
+                    status="assigned",
+                    handling_status="pending",
+                    assigned_sales_user_id=3,
+                ),
             ]
         )
         db.commit()
@@ -180,6 +202,23 @@ def test_business_resources_require_authentication(business_client):
     assert business_client.get("/api/messages").status_code == 401
     assert business_client.get("/api/inquiries").status_code == 401
     assert business_client.post("/api/internal-ai/query", json={"query": "inquiries"}).status_code == 401
+
+
+def test_revoked_channel_is_not_readable_but_history_is_retained(business_client):
+    login(business_client, "operator", "operator1")
+
+    accounts = business_client.get("/api/channel-accounts")
+    messages = business_client.get("/api/messages")
+    inquiries = business_client.get("/api/inquiries")
+
+    assert accounts.status_code == 200
+    assert all(account["status"] != "revoked" for account in accounts.json())
+    assert messages.status_code == 200
+    assert all(message["external_message_id"] != "revoked-gmail-1" for message in messages.json())
+    assert inquiries.status_code == 200
+    assert all(item["source_channel_account_id"] != 4 for item in inquiries.json())
+    assert business_client.get("/api/messages/2").status_code == 403
+    assert business_client.get("/api/inquiries/2").status_code == 403
 
 
 def test_operator_reads_only_granted_owned_channel_and_inquiries(business_client):
@@ -242,6 +281,17 @@ def test_sales_reads_only_assigned_inquiry_and_notification(business_client):
 
     assert business_client.get("/api/inquiries/2").status_code == 403
     assert business_client.get("/api/notifications/1").status_code == 403
+    assert business_client.get("/api/inquiries/4").status_code == 403
+
+
+def test_sales_cannot_read_revoked_source_inquiry(business_client):
+    login(business_client, "sales", "salespass1")
+
+    inquiries = business_client.get("/api/inquiries")
+
+    assert inquiries.status_code == 200
+    assert [item["id"] for item in inquiries.json()] == [3]
+    assert business_client.get("/api/inquiries/4").status_code == 403
 
 
 def test_external_binding_is_scoped_and_prevents_duplicate_accounts(business_client):
@@ -388,8 +438,11 @@ def test_inquiry_handling_action_can_be_processed_and_analysis_counts_it(busines
     assert response.json()["handling_status"] == "processed"
     analysis = business_client.post("/api/internal-analysis", json={"operation": "read"})
     assert analysis.status_code == 200
-    assert analysis.json()["inquiries_by_handling_status"] == {"processed": 1}
-    assert "pending" not in analysis.json()["inquiries_by_handling_status"]
+    assert analysis.json()["inquiries_by_handling_status"] == {
+        "pending": 0,
+        "processed": 1,
+        "ignored": 0,
+    }
 
 
 def test_inquiry_handling_action_rolls_back_event_and_status_on_commit_failure(monkeypatch, business_client):
@@ -580,6 +633,29 @@ def test_transfer_db_failure_rolls_back_notification_and_event(monkeypatch, busi
     assert [event["event_type"] for event in inquiry.json()["timeline"]] == ["inquiry_created"]
 
 
+def test_internal_analysis_returns_zero_for_empty_authorized_scope(business_client):
+    login(business_client, "empty-operator", "emptyop1")
+
+    response = business_client.post(
+        "/api/internal-analysis",
+        json={"operation": "read"},
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["mode"] == "read_only"
+    assert data["read_only"] is True
+    assert data["pending_message_count"] == 0
+    assert data["inquiries_by_status"] == {"new": 0, "assigned": 0}
+    assert data["inquiries_by_handling_status"] == {
+        "pending": 0,
+        "processed": 0,
+        "ignored": 0,
+    }
+    assert data["my_transfers"] == []
+    assert data["channel_statuses"] == []
+
+
 def test_internal_analysis_is_authorized_and_read_only(business_client):
     login(business_client, "operator", "operator1")
 
@@ -593,7 +669,12 @@ def test_internal_analysis_is_authorized_and_read_only(business_client):
     assert data["mode"] == "read_only"
     assert data["read_only"] is True
     assert data["pending_message_count"] == 1
-    assert data["inquiries_by_status"] == {"new": 1}
+    assert data["inquiries_by_status"] == {"new": 1, "assigned": 0}
+    assert data["inquiries_by_handling_status"] == {
+        "pending": 1,
+        "processed": 0,
+        "ignored": 0,
+    }
     assert data["my_transfers"] == []
     assert data["test_only"]
     assert data["channel_statuses"] == [
@@ -627,7 +708,12 @@ def test_sales_analysis_is_scoped_to_assigned_inquiries(business_client):
     assert response.status_code == 200
     data = response.json()
     assert data["pending_message_count"] == 0
-    assert data["inquiries_by_status"] == {"assigned": 1}
+    assert data["inquiries_by_status"] == {"new": 0, "assigned": 1}
+    assert data["inquiries_by_handling_status"] == {
+        "pending": 1,
+        "processed": 0,
+        "ignored": 0,
+    }
     assert [item["inquiry_id"] for item in data["my_transfers"]] == [3]
     assert data["my_transfers"][0]["current_stage"] == "assigned"
     assert data["my_transfers"][0]["recent_event"]["source"] == "inquiry_events"

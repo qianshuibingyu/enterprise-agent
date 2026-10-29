@@ -45,6 +45,17 @@ export type InquiryEvent = {
   created_at: string
 }
 
+export type InquiryStatusCounts = {
+  new: number
+  assigned: number
+}
+
+export type InquiryHandlingStatusCounts = {
+  pending: number
+  processed: number
+  ignored: number
+}
+
 export type InternalAnalysis = {
   mode: 'read_only' | 'guidance'
   read_only: boolean
@@ -54,7 +65,8 @@ export type InternalAnalysis = {
   event_history_available?: boolean
   actor_id?: number
   pending_message_count?: number
-  inquiries_by_status?: Record<string, number>
+  inquiries_by_status?: InquiryStatusCounts
+  inquiries_by_handling_status?: InquiryHandlingStatusCounts
   my_transfers?: Array<{
     inquiry_id: number
     customer_nickname: string

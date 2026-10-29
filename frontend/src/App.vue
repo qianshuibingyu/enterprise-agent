@@ -76,6 +76,13 @@ function statusLabel(status: string) {
   return status
 }
 
+function handlingStatusLabel(status: string) {
+  if (status === 'pending') return '待处理'
+  if (status === 'processed') return '已处理'
+  if (status === 'ignored') return '已忽略'
+  return status
+}
+
 async function loadWorkspace() {
   loading.value = true
   error.value = ''
@@ -330,6 +337,10 @@ onMounted(() => {
         <div class="analysis-card">
           <span>询盘状态</span>
           <strong>{{ Object.entries(analysis.inquiries_by_status ?? {}).map(([status, count]) => `${statusLabel(status)} ${count}`).join(' · ') || '无数据' }}</strong>
+        </div>
+        <div class="analysis-card">
+          <span>人工处理</span>
+          <strong>{{ Object.entries(analysis.inquiries_by_handling_status ?? {}).map(([status, count]) => `${handlingStatusLabel(status)} ${count}`).join(' · ') || '无数据' }}</strong>
         </div>
         <div class="analysis-card">
           <span>我的转交</span>

@@ -28,6 +28,9 @@ from app.models.user import User, UserSession
 
 router = APIRouter(prefix="/api", tags=["business"])
 
+INQUIRY_STATUSES = ("new", "assigned")
+INQUIRY_HANDLING_STATUSES = ("pending", "processed", "ignored")
+
 
 class TransferBody(BaseModel):
     sales_user_id: int = Field(gt=0)
@@ -356,6 +359,12 @@ def internal_analysis(
         .group_by(inquiry_query.c.status)
         .order_by(inquiry_query.c.status)
     ).all()
+    handling_status_rows = db.execute(
+        select(inquiry_query.c.handling_status, func.count())
+        .select_from(inquiry_query)
+        .group_by(inquiry_query.c.handling_status)
+        .order_by(inquiry_query.c.handling_status)
+    ).all()
     assigned_rows = db.execute(
         select(
             inquiry_query.c.id,
@@ -396,16 +405,22 @@ def internal_analysis(
         "actor_id": user.id,
         "pending_message_count": pending_messages,
         "inquiries_by_status": {
-            str(row.status): row[1] for row in status_rows
+            status: next(
+                (count for row_status, count in status_rows if str(row_status) == status),
+                0,
+            )
+            for status in INQUIRY_STATUSES
         },
         "inquiries_by_handling_status": {
-            str(row.handling_status): row[1]
-            for row in db.execute(
-                select(inquiry_query.c.handling_status, func.count())
-                .select_from(inquiry_query)
-                .group_by(inquiry_query.c.handling_status)
-                .order_by(inquiry_query.c.handling_status)
-            ).all()
+            handling_status: next(
+                (
+                    count
+                    for row_status, count in handling_status_rows
+                    if str(row_status) == handling_status
+                ),
+                0,
+            )
+            for handling_status in INQUIRY_HANDLING_STATUSES
         },
         "my_transfers": [
             {

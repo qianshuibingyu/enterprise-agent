@@ -15,10 +15,11 @@
 当前 Day 4 准确结论：
 
 - 收件箱、询盘链路、转交、InquiryEvent、确定性只读分析和人工处理状态已有代码实现；
-- 当前最新业务授权测试结果为 **23 passed, 1 failed, 1 warning**，失败来自分析响应中零值状态键的断言不一致，因此最新人工状态增量不能标为全通过；
-- 此前用户提供的 **72 tests collected、72 passed、2 warnings** 发生在本轮 `handling_status` 增量之前，不能覆盖当前版本；
-- 前端人工状态增量已写入，但该增量后的前端单元测试和生产构建尚无新输出；
-- 目标 PostgreSQL 当前 `0006`/`0007` migration/schema 没有本轮在线应用证据；
+- 早期 `23 passed, 1 failed, 1 warning` 是历史分析响应合同差异，已由固定状态键合同修复；
+- 用户后续已执行跨功能定向回归并得到 `66 passed, 1 warning`，后端全量回归并得到 `105 passed, 2 warnings`，随后再次得到 `105 passed, 2 warnings`；
+- 这些后端结果覆盖当前工作区 Day 4/Day 5 业务授权、转交、人工状态、只读分析和入站回归；
+- 当前目标环境核对到 `0005_channel_external_account (head)`，运行 backend 容器内 migration 文件为 `0001`–`0005`；不能把旧文档提到的 `0006`/`0007`写成当前待应用项；
+- 目标 PostgreSQL 字段/约束/跨进程并发专项仍待核验；
 - Gmail、Outlook、WhatsApp 真实授权和真实入站均未验收；
 - 当前不进行真实出站发送。
 
@@ -188,22 +189,26 @@ POST /api/internal-analysis
 
 没有接入 LLM，没有新增客户画像、评分、自动标签、报表或跨部门汇总。
 
-### 4.1 当前已知失败
+### 4.1 分析响应合同（Day 5 收口）
 
-用户实际执行业务测试时，以下断言失败：
+历史 Day 4 测试曾记录以下差异：
 
 ```text
 实际: {'processed': 1}
 预期: {'pending': 0, 'processed': 1}
 ```
 
-失败测试：
+本轮依据当前已确认业务状态和现有前端调用方，将 `POST /api/internal-analysis` 的只读分析响应统一为固定键合同：
 
-```text
-test_inquiry_handling_action_can_be_processed_and_analysis_counts_it
-```
+- `inquiries_by_status` 固定返回 `new`、`assigned`；
+- `inquiries_by_handling_status` 固定返回 `pending`、`processed`、`ignored`；
+- 当前授权范围内不存在的状态返回数值 `0`；
+- 不增加售后、静默、部门或其他未确认状态；
+- 聚合仍先经过现有对象授权查询，不改变授权范围；
+- `read_only` 分支不修改数据库；
+- 非 `read` 操作继续只返回页面路径和操作指导。
 
-因此当前实现/测试对“缺失计数键是否补零”的响应契约尚未统一。该失败必须在后续代码或测试合同明确后重新验证；当前不能标为通过。
+本轮已更新后端合同、业务授权测试、前端 API 类型及分析卡片。历史差异已通过本地隔离回归重新验证，不代表目标 PostgreSQL 或真实 provider 已验收。
 
 ## 5. 前端客户链路和 API
 
@@ -242,7 +247,7 @@ transferInquiry()
 
 业务类型字段当前不存在，页面明确显示未提供；没有引入 Vue Flow、客户画像、评分、报表、token、QR 或 auth state。
 
-本轮人工状态增量后的前端单元测试和 `npm run build` 没有新的用户输出，因此保持待验证。
+本轮人工状态和 Day 5 前端增量后的最新前端单元测试/构建结果仍未由用户提供，因此前端最新 bundle 保持待验证；此前历史构建结果不能覆盖当前工作区。
 
 ## 6. 隔离/fake 测试证据
 
@@ -276,21 +281,23 @@ python -m pytest --collect-only -q
 
 这些结果发生在本轮 `handling_status`、`0006`、`0007` 增量之前，不能覆盖当前工作区的最新状态。
 
-### 6.2 当前最新业务测试证据
+### 6.2 Day 5 分析合同回归证据
 
-用户在 `/root/enterprise-agent/backend` 执行：
+本轮在 `/root/enterprise-agent/backend` 使用仓库隔离环境执行：
 
 ```text
-python -m pytest -q tests/test_business_authorization.py
+../.venv/bin/pytest -q tests/test_business_authorization.py
 ```
 
 实际结果：
 
 ```text
-23 passed, 1 failed, 1 warning
+25 passed, 1 warning in 23.98s
 ```
 
-失败原因仅为分析响应中缺少 `pending: 0` 键的断言差异；该结果说明当前业务测试整体尚未通过。
+本轮覆盖了固定状态键、单一状态补零、空授权范围全零、sales 授权范围、未授权对象拒绝、只读不变更和非 `read` 操作 guidance。warning 为 Starlette 关于当前 `httpx` 组合的弃用提示，不是业务测试失败。
+
+该结果仅证明隔离 SQLite/TestClient 行为；不证明目标 PostgreSQL migration/schema、并发锁行为或真实 provider 已验收。
 
 ### 6.3 当前 fake/fixture 覆盖范围
 
@@ -308,35 +315,28 @@ python -m pytest -q tests/test_business_authorization.py
 - 内部只读分析；
 - fake/provider-neutral 消息入库和 Gmail 测试。
 
-但当前最新完整回归尚未重新提供，不能把上述范围写成当前版本全部通过。
+用户后续已执行跨功能定向回归 `66 passed, 1 warning`，并执行后端全量回归 `105 passed, 2 warnings`；随后再次执行全量回归，结果为 `105 passed, 2 warnings`。这些结果覆盖当前工作区后端 Day 4/Day 5 业务和入站回归，但不证明目标 PostgreSQL 或真实 provider。
 
 ## 7. 目标 PostgreSQL migration/schema
 
 ### 7.1 当前代码证据
 
-当前 revision 链代码 head 为：
+当前工作区 ORM/测试包含人工处理状态字段和相关行为；但用户核对的运行 backend 容器内 migration 文件只有 `0001`–`0005`。
+
+用户执行目标环境只读 revision 查询，结果为：
 
 ```text
-0007_message_handling_status
+current: 0005_channel_external_account (head)
+heads:   0005_channel_external_account (head)
 ```
 
-静态 migration 测试代码已更新为检查 `0001`–`0007` 链和 `0006`/`0007` 字段/约束。
+因此当前准确结论是：
 
-### 7.2 在线目标库证据
-
-本轮没有新的目标 PostgreSQL：
-
-- `alembic current`；
-- `alembic heads`；
-- `alembic_version` 查询；
-- `inquiries.handling_status` 查询；
-- `messages.handling_status` 查询；
-- CHECK/index/foreign key 查询；
-- `0006`/`0007` `upgrade` 结果。
-
-因此：
-
-> **目标 PostgreSQL migration/schema 当前为待验收，不能写成已应用。**
+- 目标环境 revision/head 已核对为 `0005`；
+- 当前运行容器内没有 `0006`/`0007`；
+- 不能把 `0006`/`0007`写成当前待应用 migration；
+- 当前没有人工状态字段、CHECK/index/foreign key 和跨进程并发专项查询证据；
+- 本地 SQLite/TestClient 和静态 migration 测试不证明目标 PostgreSQL schema。
 
 SQLite/TestClient 和静态 migration 测试不证明目标 PostgreSQL 已存在这些字段和约束。PostgreSQL 行级锁、并发转交和真实事务行为也未验收。
 
@@ -411,18 +411,17 @@ enterprise-agent-api-1
 
 当前阻塞/未覆盖：
 
-1. 最新业务授权测试仍有 1 个失败；
-2. 最新全量 backend 测试尚未重新执行；
-3. 最新前端单元测试和生产构建尚未重新执行；
-4. `0006`/`0007` 尚未在目标 PostgreSQL 在线应用核验；
-5. SQLite 无法证明 PostgreSQL 行级锁和跨进程并发；
-6. Message 与 Inquiry/conversation 关联尚未确认/实现；
-7. 业务类型和售后/静默阶段没有当前字段；
-8. Message 没有独立持久化事件历史模型；
-9. 真实 Gmail/Outlook/WhatsApp 授权和入站未验收；
-10. 真实附件、调度、恢复和最终出站未验收；
-11. 生产最新 frontend bundle 是否部署尚无本轮输出；
-12. 备份恢复、HTTPS 长期运行和重启恢复未在本轮验证。
+1. 最新前端单元测试和生产构建尚未由用户重新提供；
+2. 当前运行 backend 容器和目标数据库为 `0005`，与工作区人工状态 ORM/测试增量的部署一致性尚未核对；
+3. 当前没有目标 PostgreSQL 人工状态字段、CHECK/index/foreign key 和跨进程并发专项查询；
+4. SQLite 无法证明 PostgreSQL 行级锁和跨进程并发；
+5. Message 与 Inquiry/conversation 关联尚未确认/实现；
+6. 业务类型和售后/静默阶段没有当前字段；
+7. Message 没有独立持久化事件历史模型；
+8. 真实 Gmail/Outlook/WhatsApp 授权和入站未验收；
+9. 真实附件、调度、恢复和最终出站未验收；
+10. 生产最新 frontend bundle 是否部署尚无本轮输出；
+11. 备份恢复、HTTPS 长期运行和重启恢复未在本轮验证。
 
 ## 11. 当前分层结论
 
@@ -431,13 +430,13 @@ enterprise-agent-api-1
 | 收件箱授权查询 | 已实现；有历史隔离测试证据 |
 | 询盘/消息详情 | 已实现；附件 metadata 脱敏 |
 | InquiryEvent timeline | 已实现；当前代码包含创建/转交/人工状态事件 |
-| 询盘人工状态 | 已实现代码；最新业务测试受分析键断言失败影响 |
-| 消息人工状态 | 已实现代码；当前版本全量测试尚未重新提供 |
-| 转交幂等与 rollback | 已实现代码；有隔离测试代码和历史测试证据 |
-| 内部只读分析 | 已实现代码；最新响应键契约仍需统一并重新验证 |
-| 前端 API/UI | 已实现代码；最新构建尚未重新验证 |
-| 隔离/fake 测试 | 当前最新业务测试为 23 passed、1 failed |
-| 目标 PostgreSQL | 待 `0001`–`0007` 在线 migration/schema 验收 |
+| 询盘人工状态 | 已实现代码；本地后端回归通过；运行容器/目标 schema 一致性待核对 |
+| 消息人工状态 | 已实现代码；本地后端回归通过；运行容器/目标 schema 一致性待核对 |
+| 转交幂等与 rollback | 已实现代码；定向和全量后端回归通过 |
+| 内部只读分析 | 固定状态键合同已实现并通过后端回归 |
+| 前端 API/UI | 已实现代码；当前工作区最新前端测试/构建待用户执行 |
+| 隔离/fake 测试 | 定向 `66 passed, 1 warning`；全量 `105 passed, 2 warnings` |
+| 目标 PostgreSQL | 当前 revision/head 为 `0005`；人工状态 schema/并发专项待核验 |
 | Gmail | provider-neutral/fake；真实授权和入站待验收 |
 | Outlook | provider-neutral/MCP；真实授权和入站待验收 |
 | WhatsApp | adapter contract/fake；真实授权和入站待验收 |
