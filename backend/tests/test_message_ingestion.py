@@ -177,6 +177,26 @@ def test_same_external_id_isolated_by_account_and_provider(db_session):
     assert db_session.query(Message).count() == 3
 
 
+@pytest.mark.parametrize("external_message_id", [None, "", "   "])
+def test_missing_or_empty_external_id_is_rejected_before_database_write(
+    db_session, external_message_id
+):
+    with pytest.raises(ValueError, match="external_message_id must be a non-empty string"):
+        ingest_provider_message(
+            db_session,
+            channel_account_id=1,
+            provider="gmail_api_pubsub",
+            message={
+                "external_message_id": external_message_id,
+                "direction": "inbound",
+                "status": "received",
+                "occurred_at": datetime(2026, 10, 22, tzinfo=timezone.utc),
+                "raw_content": "body",
+            },
+        )
+    assert db_session.query(Message).count() == 0
+
+
 def test_missing_attachment_metadata_is_rejected_before_database_write(db_session):
     with pytest.raises(ValueError, match="attachment 0 missing metadata"):
         ingest_provider_message(
@@ -193,6 +213,34 @@ def test_missing_attachment_metadata_is_rejected_before_database_write(db_sessio
             },
         )
     assert db_session.query(Message).count() == 0
+
+
+def test_duplicate_delivery_does_not_append_attachment_on_replay(db_session):
+    first = ingest_message(db_session, payload(1, content="original"))
+    db_session.commit()
+
+    duplicate = ingest_message(
+        db_session,
+        InboundMessageInput(
+            **{
+                **payload(1, content="replayed").__dict__,
+                "attachments": (
+                    AttachmentInput(
+                        original_filename="different.pdf",
+                        media_type="application/pdf",
+                        size_bytes=99,
+                        storage_reference="vault://message/replayed",
+                    ),
+                ),
+            }
+        ),
+    )
+    db_session.commit()
+
+    assert duplicate.created is False
+    assert duplicate.message.id == first.message.id
+    assert [attachment.original_filename for attachment in duplicate.message.attachments] == ["quote.pdf"]
+    assert db_session.query(Message).one().raw_content == "original"
 
 
 def test_fake_provider_batch_uses_common_ingest_path_and_database_idempotency(db_session):
@@ -222,6 +270,70 @@ def test_fake_provider_batch_uses_common_ingest_path_and_database_idempotency(db
     assert [result.created for result in results] == [True, False]
     assert db_session.query(Message).count() == 1
     assert db_session.query(Message).one().raw_content == "fake body"
+
+
+def test_batch_mapping_failure_rolls_back_preceding_message(db_session):
+    fake = FakeTestProvider(
+        "gmail",
+        provider_descriptor("gmail").capabilities,
+        messages=[
+            {
+                "external_message_id": "batch-first",
+                "direction": "inbound",
+                "status": "received",
+                "occurred_at": datetime(2026, 10, 22, tzinfo=timezone.utc),
+                "raw_content": "first",
+            },
+            {
+                "external_message_id": "batch-invalid",
+                "direction": "inbound",
+                "status": "received",
+                "raw_content": "missing occurred_at",
+            },
+        ],
+    )
+
+    with pytest.raises(ValueError, match="missing normalized message fields: occurred_at"):
+        ingest_provider_batch(
+            db_session,
+            channel_account_id=1,
+            provider=fake,
+            external_account_id="fake-account",
+        )
+
+    assert db_session.query(Message).count() == 0
+
+
+def test_batch_commit_failure_rolls_back_all_messages(monkeypatch, db_session):
+    fake = FakeTestProvider(
+        "gmail",
+        provider_descriptor("gmail").capabilities,
+        messages=[
+            {
+                "external_message_id": "batch-commit-failure",
+                "direction": "inbound",
+                "status": "received",
+                "occurred_at": datetime(2026, 10, 22, tzinfo=timezone.utc),
+                "raw_content": "body",
+            },
+        ],
+    )
+
+    def fail_commit(self):
+        raise RuntimeError("batch commit failed")
+
+    from sqlalchemy.orm import Session
+
+    monkeypatch.setattr(Session, "commit", fail_commit)
+    with pytest.raises(RuntimeError, match="batch commit failed"):
+        ingest_provider_batch(
+            db_session,
+            channel_account_id=1,
+            provider=fake,
+            external_account_id="fake-account",
+        )
+
+    assert db_session.query(Message).count() == 0
 
 
 def test_provider_mapping_without_attachments_is_valid(db_session):

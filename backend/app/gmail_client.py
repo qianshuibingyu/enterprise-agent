@@ -5,7 +5,12 @@ from typing import Any, Mapping
 
 import httpx
 
-from app.channels.inbound import ProviderRateLimited, ProviderTemporaryFailure
+from app.channels.inbound import (
+    ProviderAuthorizationFailure,
+    ProviderPermanentFailure,
+    ProviderRateLimited,
+    ProviderTemporaryFailure,
+)
 
 TOKEN_URL = "https://oauth2.googleapis.com/token"
 GMAIL_API_URL = "https://gmail.googleapis.com/gmail/v1/users"
@@ -44,10 +49,14 @@ class GmailApiClient:
                 "grant_type": "refresh_token",
             },
         )
-        if response.status_code in {429, 500, 502, 503, 504}:
+        if response.status_code == 429:
+            raise ProviderRateLimited("Gmail OAuth provider rate limited")
+        if response.status_code in {500, 502, 503, 504}:
             raise ProviderTemporaryFailure("Gmail OAuth provider temporarily unavailable")
+        if response.status_code in {401, 403}:
+            raise ProviderAuthorizationFailure("Gmail OAuth authorization failed")
         if response.status_code >= 400:
-            raise GmailConfigurationError("Gmail OAuth refresh failed")
+            raise ProviderPermanentFailure("Gmail OAuth refresh failed")
         token = response.json().get("access_token")
         if not isinstance(token, str) or not token:
             raise GmailConfigurationError("Gmail OAuth response has no access token")
@@ -64,8 +73,10 @@ class GmailApiClient:
             raise ProviderRateLimited("Gmail API rate limited")
         if response.status_code in {500, 502, 503, 504}:
             raise ProviderTemporaryFailure("Gmail API temporarily unavailable")
+        if response.status_code in {401, 403}:
+            raise ProviderAuthorizationFailure("Gmail API authorization failed")
         if response.status_code >= 400:
-            raise GmailConfigurationError("Gmail API request failed")
+            raise ProviderPermanentFailure("Gmail API request failed")
         return response.json()
 
     def list_history(self, *, account_id: int, history_id: str) -> list[Mapping[str, Any]]:

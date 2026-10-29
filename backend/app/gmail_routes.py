@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 from app.channels.inbound import (
     InboundBatchResult,
     InvalidProviderAuthorization,
+    SourceValidationFailure,
     ingest_gmail_history,
 )
 from app.database import get_db
@@ -110,7 +111,7 @@ def gmail_pubsub(
     query_token: str | None = Query(default=None, alias="token"),
     db: Session = Depends(get_db),
     client: GmailClient = Depends(get_gmail_client),
-) -> dict[str, int | str]:
+) -> dict[str, int | str | None]:
     expected_token = _expected_push_token()
     if not expected_token:
         raise HTTPException(
@@ -132,11 +133,11 @@ def gmail_pubsub(
             push_token=push_token,
             expected_push_token=expected_token,
         )
-    except InvalidProviderAuthorization as exc:
+    except (InvalidProviderAuthorization, SourceValidationFailure) as exc:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="没有权限访问") from exc
 
     return {
         "accepted": len(result.results),
         "created": sum(item.created for item in result.results),
-        "cursor": result.cursor or history_id,
+        "cursor": result.cursor,
     }

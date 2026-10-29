@@ -24,14 +24,24 @@ def scoped_channel_account_ids(user: User) -> Select:
             ChannelGrant.owner_user_id == ChannelAccount.owner_user_id,
             ChannelGrant.owner_user_id == user.id,
         ),
-    ).where(ChannelAccount.owner_user_id == user.id)
+    ).where(
+        ChannelAccount.owner_user_id == user.id,
+        ChannelAccount.status != "revoked",
+    )
 
 
 def scoped_inquiries(user: User) -> Select:
     """Build a query whose predicates enforce the caller's object scope."""
     channel_scope = scoped_channel_account_ids(user)
     if user.role == "sales":
-        return select(Inquiry).where(Inquiry.assigned_sales_user_id == user.id)
+        return (
+            select(Inquiry)
+            .join(ChannelAccount, ChannelAccount.id == Inquiry.source_channel_account_id)
+            .where(
+                Inquiry.assigned_sales_user_id == user.id,
+                ChannelAccount.status != "revoked",
+            )
+        )
     return select(Inquiry).where(Inquiry.source_channel_account_id.in_(channel_scope))
 
 
@@ -72,9 +82,11 @@ def get_scoped_notification(db: Session, user: User, notification_id: int) -> In
     notification = db.scalar(
         select(InternalNotification)
         .join(Inquiry, InternalNotification.inquiry_id == Inquiry.id)
+        .join(ChannelAccount, ChannelAccount.id == Inquiry.source_channel_account_id)
         .where(
             InternalNotification.id == notification_id,
             Inquiry.assigned_sales_user_id == user.id,
+            ChannelAccount.status != "revoked",
         )
     )
     if notification is None:

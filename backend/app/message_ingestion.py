@@ -7,6 +7,8 @@ from sqlalchemy.orm import Session
 
 from app.models.business import Message, MessageAttachment
 
+MESSAGE_IDENTITY_CONSTRAINT = "uq_messages_account_provider_external_id"
+
 
 class ReceivingProvider(Protocol):
     name: str
@@ -88,10 +90,14 @@ def map_provider_message(
             )
         )
 
+    external_message_id = message["external_message_id"]
+    if not isinstance(external_message_id, str) or not external_message_id.strip():
+        raise ValueError("external_message_id must be a non-empty string")
+
     return InboundMessageInput(
         channel_account_id=channel_account_id,
         provider=provider,
-        external_message_id=str(message["external_message_id"]),
+        external_message_id=external_message_id,
         direction=str(message["direction"]),
         status=str(message["status"]),
         occurred_at=message["occurred_at"],
@@ -130,16 +136,23 @@ def ingest_provider_batch(
     No in-process deduplication is used; every item goes through the database
     unique constraint and the same idempotent ingest service.
     """
-    results = [
-        ingest_provider_message(
-            db,
-            channel_account_id=channel_account_id,
-            provider=provider.name,
-            message=message,
-        )
-        for message in provider.receive(external_account_id=external_account_id)
-    ]
-    db.commit()
+    batch_savepoint = db.begin_nested()
+    try:
+        results = [
+            ingest_provider_message(
+                db,
+                channel_account_id=channel_account_id,
+                provider=provider.name,
+                message=message,
+            )
+            for message in provider.receive(external_account_id=external_account_id)
+        ]
+        db.commit()
+    except Exception:
+        if batch_savepoint.is_active:
+            batch_savepoint.rollback()
+        db.rollback()
+        raise
     return results
 
 
@@ -176,16 +189,39 @@ def ingest_message(db: Session, payload: InboundMessageInput) -> IngestResult:
             for attachment in payload.attachments
         ],
     )
+    savepoint = db.begin_nested()
     db.add(message)
     try:
         db.flush()
-    except IntegrityError:
-        db.rollback()
+    except IntegrityError as exc:
+        savepoint.rollback()
+        if not _is_identity_conflict(exc):
+            raise
         existing = _find_existing(db, payload)
         if existing is None:
             raise
         return IngestResult(message=existing, created=False)
+    except Exception:
+        savepoint.rollback()
+        raise
+    else:
+        savepoint.commit()
     return IngestResult(message=message, created=True)
+
+
+def _is_identity_conflict(error: IntegrityError) -> bool:
+    """Return whether the database reports the message identity unique key."""
+    constraint_name = getattr(getattr(error, "orig", None), "diag", None)
+    constraint_name = getattr(constraint_name, "constraint_name", None)
+    if constraint_name == MESSAGE_IDENTITY_CONSTRAINT:
+        return True
+    error_text = str(error).lower()
+    if MESSAGE_IDENTITY_CONSTRAINT in error_text:
+        return True
+    return (
+        "unique constraint failed: messages.channel_account_id, messages.provider, "
+        "messages.external_message_id"
+    ) in error_text
 
 
 def _find_existing(db: Session, payload: InboundMessageInput) -> Message | None:

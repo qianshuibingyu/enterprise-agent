@@ -1,7 +1,12 @@
 import httpx
 import pytest
 
-from app.channels.inbound import ProviderRateLimited, ProviderTemporaryFailure
+from app.channels.inbound import (
+    ProviderAuthorizationFailure,
+    ProviderPermanentFailure,
+    ProviderRateLimited,
+    ProviderTemporaryFailure,
+)
 from app.gmail_client import GmailApiClient, GmailConfigurationError
 
 
@@ -65,6 +70,43 @@ def test_gmail_client_propagates_rate_limit(monkeypatch):
     client = GmailApiClient(http=httpx.Client(transport=httpx.MockTransport(handler)))
     with pytest.raises(ProviderRateLimited):
         client.list_history(account_id=1, history_id="history-1")
+
+
+@pytest.mark.parametrize("status_code", [401, 403])
+def test_gmail_client_treats_authorization_failure_as_non_retryable(monkeypatch, status_code):
+    monkeypatch.setenv("GMAIL_CLIENT_ID", "client-id")
+    monkeypatch.setenv("GMAIL_CLIENT_SECRET", "client-secret")
+    monkeypatch.setenv("GMAIL_REFRESH_TOKEN", "refresh-token")
+
+    def handler(request: httpx.Request):
+        if request.url.host == "oauth2.googleapis.com":
+            return httpx.Response(200, json={"access_token": "short-lived"})
+        return httpx.Response(status_code, text="sensitive provider details")
+
+    client = GmailApiClient(http=httpx.Client(transport=httpx.MockTransport(handler)))
+    with pytest.raises(ProviderAuthorizationFailure) as raised:
+        client.list_history(account_id=1, history_id="history-1")
+
+    assert raised.value.retryable is False
+    assert "sensitive provider details" not in str(raised.value)
+
+
+def test_gmail_client_treats_other_client_error_as_permanent(monkeypatch):
+    monkeypatch.setenv("GMAIL_CLIENT_ID", "client-id")
+    monkeypatch.setenv("GMAIL_CLIENT_SECRET", "client-secret")
+    monkeypatch.setenv("GMAIL_REFRESH_TOKEN", "refresh-token")
+
+    def handler(request: httpx.Request):
+        if request.url.host == "oauth2.googleapis.com":
+            return httpx.Response(200, json={"access_token": "short-lived"})
+        return httpx.Response(400, text="sensitive provider details")
+
+    client = GmailApiClient(http=httpx.Client(transport=httpx.MockTransport(handler)))
+    with pytest.raises(ProviderPermanentFailure) as raised:
+        client.list_history(account_id=1, history_id="history-1")
+
+    assert raised.value.retryable is False
+    assert "sensitive provider details" not in str(raised.value)
 
 
 def test_gmail_client_propagates_temporary_failure(monkeypatch):
