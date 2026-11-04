@@ -10,6 +10,14 @@ export type ChannelAccount = {
   owner_user_id: number
   channel_type: string
   status: string
+  external_account_id?: string | null
+  test_only?: boolean
+}
+
+export type CurrentUser = {
+  id: number
+  username: string
+  role: string
 }
 
 export type TransferTarget = {
@@ -22,7 +30,11 @@ export type Inquiry = {
   id: number
   customer_contact: string
   customer_nickname: string
-  raw_message: string
+  display_text: string
+  display_excerpt: string
+  content_format: 'text/plain'
+  content_sanitized: boolean
+  content_truncated: boolean
   source_channel_account_id: number
   status: string
   handling_status: 'pending' | 'processed' | 'ignored'
@@ -102,7 +114,11 @@ export type Message = {
   handling_status: 'pending' | 'processed' | 'ignored'
   occurred_at: string
   created_at: string | null
-  raw_content: string
+  display_text: string
+  display_excerpt: string
+  content_format: 'text/plain'
+  content_sanitized: boolean
+  content_truncated: boolean
   attachments: AttachmentMetadata[]
 }
 
@@ -141,21 +157,39 @@ async function getJson<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const inboxApi = {
+  getCurrentUser: () => getJson<CurrentUser>('/auth/me'),
   getAccounts: () => getJson<ChannelAccount[]>('/api/channel-accounts'),
   getMessages: () => getJson<Message[]>('/api/messages'),
   getInquiries: () => getJson<Inquiry[]>('/api/inquiries'),
   getInquiry: (id: number) => getJson<Inquiry>(`/api/inquiries/${id}`),
   getOutlookMessages: (accountId: number, count = 50) =>
-    getJson<Array<{ id: number; created: boolean }>>(`/api/integrations/outlook/accounts/${accountId}/messages?count=${count}`),
+    getJson<{
+      messages: Array<{ id: number; created: boolean }>
+      total: number
+      created: number
+      duplicates: number
+    } | Array<{ id: number; created: boolean }>>(`/api/integrations/outlook/accounts/${accountId}/messages?count=${count}`),
   getInternalAnalysis: () => getJson<InternalAnalysis>('/api/internal-analysis', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ operation: 'read' }),
   }),
   getTransferTargets: () => getJson<TransferTarget[]>('/api/inquiry-transfer-targets'),
-  getCsrf: () => getJson<{ csrf_token: string }>('/auth/csrf', {
-    headers: { Origin: window.location.origin },
-  }),
+  getCsrf: async () => {
+    const result = await getJson<{ csrf_token: string }>('/auth/csrf', {
+      headers: { Origin: window.location.origin },
+    })
+    return result
+  },
+  logout: async (csrfToken: string) => {
+    await getJson<void>('/auth/logout', {
+      method: 'POST',
+      headers: {
+        Origin: window.location.origin,
+        'X-CSRF-Token': csrfToken,
+      },
+    })
+  },
   transferInquiry: (inquiryId: number, salesUserId: number, csrfToken: string) =>
     getJson<Inquiry>(`/api/inquiries/${inquiryId}/transfer`, {
       method: 'POST',

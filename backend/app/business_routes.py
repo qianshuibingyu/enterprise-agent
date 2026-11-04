@@ -6,6 +6,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session, selectinload
 
 from app.auth import current_user, require_csrf
+from app.content_security import content_view
 from app.authorization import (
     can_transfer_inquiry,
     get_scoped_inquiry,
@@ -72,7 +73,7 @@ def _inquiry_view(inquiry: Inquiry) -> dict[str, object]:
         "id": inquiry.id,
         "customer_contact": inquiry.customer_contact,
         "customer_nickname": inquiry.customer_nickname,
-        "raw_message": inquiry.raw_message,
+        **content_view(inquiry.raw_message),
         "source_channel_account_id": inquiry.source_channel_account_id,
         "status": inquiry.status,
         "handling_status": inquiry.handling_status,
@@ -114,7 +115,7 @@ def _message_view(message: Message) -> dict[str, object]:
         "handling_status": message.handling_status,
         "occurred_at": message.occurred_at,
         "created_at": message.created_at,
-        "raw_content": message.raw_content,
+        **content_view(message.raw_content),
         "attachments": [_attachment_view(attachment) for attachment in message.attachments],
     }
 

@@ -204,6 +204,58 @@ def test_business_resources_require_authentication(business_client):
     assert business_client.post("/api/internal-ai/query", json={"query": "inquiries"}).status_code == 401
 
 
+def test_gmail_account_initialization_is_idempotent_and_not_provider_connected(business_client):
+    login(business_client, "empty-operator", "emptyop1")
+    csrf = business_client.cookies.get("ea_csrf")
+    headers = {"Origin": "https://testserver", "X-CSRF-Token": csrf}
+
+    first = business_client.post("/api/channels/gmail/accounts", headers=headers)
+    second = business_client.post("/api/channels/gmail/accounts", headers=headers)
+
+    assert first.status_code == 200
+    assert first.json()["channel_type"] == "gmail"
+    assert first.json()["status"] == "not_ready"
+    assert first.json()["external_account_id"] is None
+    assert second.status_code == 200
+    assert second.json()["id"] == first.json()["id"]
+    assert second.json()["status"] == "not_ready"
+
+
+def test_gmail_account_initialization_requires_authentication(business_client):
+    assert business_client.post("/api/channels/gmail/accounts").status_code == 401
+
+
+def test_whatsapp_account_initialization_repairs_scope_after_revoke(business_client):
+    login(business_client, "empty-operator", "emptyop1")
+    csrf = business_client.cookies.get("ea_csrf")
+    headers = {"Origin": "https://testserver", "X-CSRF-Token": csrf}
+
+    first = business_client.post("/api/channels/whatsapp/accounts", headers=headers)
+    assert first.status_code == 200
+    account_id = first.json()["id"]
+    assert first.json()["status"] == "not_ready"
+
+    revoked = business_client.post(
+        f"/api/channels/accounts/{account_id}/revoke",
+        headers=headers,
+    )
+    assert revoked.status_code == 200
+    assert revoked.json()["status"] == "revoked"
+
+    repaired = business_client.post("/api/channels/whatsapp/accounts", headers=headers)
+    assert repaired.status_code == 200
+    assert repaired.json()["id"] == account_id
+    assert repaired.json()["status"] == "not_ready"
+    assert business_client.get("/api/channel-accounts").json() == [
+        {
+            "id": account_id,
+            "owner_user_id": 5,
+            "channel_type": "whatsapp",
+            "status": "not_ready",
+        }
+    ]
+
+
 def test_revoked_channel_is_not_readable_but_history_is_retained(business_client):
     login(business_client, "operator", "operator1")
 
@@ -249,7 +301,7 @@ def test_operator_reads_only_granted_owned_channel_and_inquiries(business_client
 
     inquiries = business_client.get("/api/inquiries")
     assert inquiries.status_code == 200
-    assert [inquiry["raw_message"] for inquiry in inquiries.json()] == ["Need a quote"]
+    assert [inquiry["display_text"] for inquiry in inquiries.json()] == ["Need a quote"]
     assert inquiries.json()[0]["timeline_complete"] is True
     assert [event["event_type"] for event in inquiries.json()[0]["timeline"]] == ["inquiry_created"]
 
@@ -749,7 +801,7 @@ def test_internal_ai_is_read_only_and_returns_operation_guidance(business_client
     assert read.json()["mode"] == "read_only"
     assert read.json()["actor_id"] == 1
     assert read.json()["read_only"] is True
-    assert [item["raw_message"] for item in read.json()["data"]] == ["Need a quote"]
+    assert [item["display_text"] for item in read.json()["data"]] == ["Need a quote"]
     assert read.json()["data"][0]["timeline_complete"] is True
 
     write = business_client.post(
