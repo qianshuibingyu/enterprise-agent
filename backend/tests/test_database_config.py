@@ -1,4 +1,5 @@
 import importlib
+import os
 
 import pytest
 from sqlalchemy import URL
@@ -73,3 +74,25 @@ def test_get_db_closes_session_after_use(isolated_database_module, monkeypatch):
     with pytest.raises(StopIteration):
         next(dependency)
     assert session.closed
+
+
+def test_load_project_env_preserves_exported_values_and_parses_quotes(monkeypatch, tmp_path):
+    import app.environment as environment
+
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "# Comment\n"
+        "POSTGRES_USER=file_user\n"
+        'POSTGRES_PASSWORD="file password"\n'
+        "export POSTGRES_DB=file_db\n"
+        "NOT-AN-ENV=ignored\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("POSTGRES_USER", "exported_user")
+    monkeypatch.delenv("POSTGRES_PASSWORD", raising=False)
+    monkeypatch.delenv("POSTGRES_DB", raising=False)
+    environment.load_project_env(env_file)
+
+    assert os.environ["POSTGRES_USER"] == "exported_user"
+    assert os.environ["POSTGRES_PASSWORD"] == "file password"
+    assert os.environ["POSTGRES_DB"] == "file_db"

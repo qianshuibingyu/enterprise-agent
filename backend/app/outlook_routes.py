@@ -10,13 +10,24 @@ from app.database import get_db
 from app.message_ingestion import ingest_provider_message
 from app.models.business import ChannelAccount
 from app.models.user import User
-from app.outlook_mcp_http import OutlookMcpError, OutlookMcpHttpClient
+from app.outlook_graph import OutlookGraphError, OutlookGraphClient, outlook_graph_client_for_ciphertext
 
 router = APIRouter(prefix="/api/integrations/outlook", tags=["outlook"])
 
 
-def get_outlook_client() -> OutlookMcpHttpClient:
-    raise HTTPException(status_code=503, detail="Outlook MCP client is not configured")
+def get_outlook_client(account_id: int, db: Session = Depends(get_db)) -> OutlookGraphClient:
+    account = db.scalar(
+        select(ChannelAccount).where(
+            ChannelAccount.id == account_id,
+            ChannelAccount.channel_type == "outlook",
+        )
+    )
+    if account is None or not account.outlook_credential_ciphertext:
+        raise HTTPException(status_code=503, detail="Outlook OAuth is not configured for this account")
+    try:
+        return outlook_graph_client_for_ciphertext(account.outlook_credential_ciphertext)
+    except OutlookGraphError as exc:
+        raise HTTPException(status_code=503, detail="Outlook credential is unavailable") from exc
 
 
 def _account(db: Session, user: User, account_id: int) -> ChannelAccount:
@@ -48,18 +59,17 @@ def list_outlook_messages(
     account_id: int,
     user: Annotated[User, Depends(current_user)],
     db: Session = Depends(get_db),
-    client: OutlookMcpHttpClient = Depends(get_outlook_client),
+    client: OutlookGraphClient = Depends(get_outlook_client),
     count: int = Query(default=50, ge=1, le=100),
-) -> list[dict[str, object]]:
+) -> dict[str, object]:
     account = _account(db, user, account_id)
     try:
-        result = client.list_emails(count=count)
-    except OutlookMcpError as exc:
-        raise HTTPException(status_code=502, detail="Outlook MCP 读取失败") from exc
-
-    messages = result.get("messages", result) if isinstance(result, dict) else result
-    if not isinstance(messages, list):
-        raise HTTPException(status_code=502, detail="Outlook MCP 返回格式无效")
+        messages = client.list_emails(
+            external_account_id=account.external_account_id,
+            count=count,
+        )
+    except OutlookGraphError as exc:
+        raise HTTPException(status_code=502, detail="Outlook Graph 读取失败") from exc
 
     output: list[dict[str, object]] = []
     for item in messages:
@@ -75,5 +85,19 @@ def list_outlook_messages(
             message=normalized,
         )
         output.append({"id": ingested.message.id, "created": ingested.created})
-    db.commit()
-    return output
+    created = sum(1 for item in output if item["created"] is True)
+    if output and account.status == "connected_pending_inbound":
+        # A successful provider read and normalized persistence proves the
+        # minimal Outlook inbound path; duplicate reads are valid evidence too.
+        account.status = "verified_inbound"
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    return {
+        "messages": output,
+        "total": len(output),
+        "created": created,
+        "duplicates": len(output) - created,
+    }

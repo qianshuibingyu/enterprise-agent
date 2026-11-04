@@ -55,9 +55,27 @@ def _check_login_csrf(request: Request) -> None:
 
 
 @router.get("/csrf")
-def csrf_token(request: Request, response: Response) -> dict[str, str]:
-    _check_origin(request)
+def csrf_token(
+    request: Request,
+    response: Response,
+    db: Session = Depends(get_db),
+) -> dict[str, str]:
+    # Same-origin browsers may omit Origin on a safe GET. The state-changing
+    # login endpoint still performs the strict origin + double-submit checks.
+    origin = request.headers.get("origin")
+    if origin is not None:
+        _check_origin(request)
     token = secrets.token_urlsafe(32)
+    session_token = request.cookies.get(SESSION_COOKIE)
+    if session_token:
+        session = db.scalar(select(UserSession).where(UserSession.token_hash == digest(session_token)))
+        if session is not None and session.revoked_at is None:
+            cookie_token = request.cookies.get(CSRF_COOKIE)
+            if cookie_token and secrets.compare_digest(digest(cookie_token), session.csrf_token_hash):
+                token = cookie_token
+            else:
+                session.csrf_token_hash = digest(token)
+                db.commit()
     response.set_cookie(
         CSRF_COOKIE,
         token,

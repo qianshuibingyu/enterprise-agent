@@ -1,5 +1,6 @@
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+import base64
 import os
 from typing import Any, Mapping
 
@@ -27,10 +28,10 @@ class GmailApiClient:
     returned by this class. Provider-specific payload parsing stays here.
     """
 
-    def __init__(self, *, http: httpx.Client | None = None):
+    def __init__(self, *, refresh_token: str, http: httpx.Client | None = None):
         self.client_id = os.environ.get("GMAIL_CLIENT_ID")
         self.client_secret = os.environ.get("GMAIL_CLIENT_SECRET")
-        self.refresh_token = os.environ.get("GMAIL_REFRESH_TOKEN")
+        self.refresh_token = refresh_token
         self.user_id = os.environ.get("GMAIL_USER_ID", "me")
         if not all((self.client_id, self.client_secret, self.refresh_token)):
             raise GmailConfigurationError("gmail OAuth client is not configured")
@@ -120,11 +121,20 @@ def _parse_date(value: str | None) -> datetime:
         return datetime.now(timezone.utc)
 
 
+def _decode_body_data(data: str) -> str:
+    try:
+        encoded = data.replace("-", "+").replace("_", "/")
+        encoded += "=" * (-len(encoded) % 4)
+        return base64.b64decode(encoded, validate=True).decode("utf-8", errors="replace")
+    except (ValueError, TypeError, UnicodeError, base64.binascii.Error):
+        return data
+
+
 def _extract_text(payload: Mapping[str, Any]) -> str:
     body = payload.get("body", {})
     data = body.get("data")
     if isinstance(data, str):
-        return data
+        return _decode_body_data(data)
     parts = payload.get("parts", [])
     text_parts = [_extract_text(part) for part in parts if isinstance(part, Mapping)]
     return "\n".join(part for part in text_parts if part)

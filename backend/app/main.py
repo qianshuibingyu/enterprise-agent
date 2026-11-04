@@ -7,6 +7,7 @@ from app.gmail_routes import router as gmail_router
 from app.external_routes import router as external_router
 from app.provider_auth_routes import router as provider_auth_router
 from app.whatsapp_routes import router as whatsapp_router
+from app.whatsapp_ingress import router as whatsapp_ingress_router
 from app.outlook_routes import router as outlook_router
 
 app = FastAPI(
@@ -21,6 +22,7 @@ app.include_router(gmail_router)
 app.include_router(external_router)
 app.include_router(provider_auth_router)
 app.include_router(whatsapp_router)
+app.include_router(whatsapp_ingress_router)
 app.include_router(outlook_router)
 
 

@@ -38,6 +38,7 @@ def _account_for_ingress(
             ChannelAccount.id == account_id,
             ChannelAccount.channel_type == channel_type,
             ChannelAccount.external_account_id == external_account_id,
+            ChannelAccount.status != "revoked",
         )
     )
     if account is None:

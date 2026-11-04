@@ -30,6 +30,11 @@ class ChannelAccount(Base):
     owner_user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
     channel_type: Mapped[str] = mapped_column(String(32), index=True)
     external_account_id: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
+    credential_reference: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    gmail_credential_ciphertext: Mapped[str | None] = mapped_column(Text, nullable=True)
+    outlook_credential_ciphertext: Mapped[str | None] = mapped_column(Text, nullable=True)
+    gmail_watch_history_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    gmail_watch_expiration: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     status: Mapped[str] = mapped_column(String(32), index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(

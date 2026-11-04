@@ -21,8 +21,8 @@ test('fake authorization changes only fixture state', () => {
   const channel = fakeChannels[0]
   const connected = fakeAuthorize(channel)
 
-  assert.equal(channel.status, 'not_connected')
-  assert.equal(connected.status, 'connected')
+  assert.equal(channel.status, 'not_ready')
+  assert.equal(connected.status, 'connected_pending_inbound')
   assert.equal(connected.test_only, true)
   assert.match(connected.message, /不代表真实 provider/)
 })

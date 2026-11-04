@@ -70,7 +70,7 @@ def gmail_client(monkeypatch):
             must_change_password=False,
         ))
         db.flush()
-        account = ChannelAccount(owner_user_id=1, channel_type="gmail", status="connected")
+        account = ChannelAccount(owner_user_id=1, channel_type="gmail", status="connected_pending_inbound")
         db.add(account)
         db.flush()
         db.add(ChannelGrant(
@@ -129,6 +129,7 @@ def gmail_client(monkeypatch):
                 "handling_statuses": db.execute(
                     select(Inquiry.id, Inquiry.handling_status)
                 ).all(),
+                "gmail_status": db.get(ChannelAccount, 1).status,
             }
 
     def override_client():
@@ -147,6 +148,18 @@ def headers(token="test-push-token"):
     return {"X-Gmail-PubSub-Token": token}
 
 
+def test_gmail_pubsub_accepts_urlsafe_unpadded_numeric_history_id(gmail_client):
+    client, fake, counts = gmail_client
+    encoded = base64.urlsafe_b64encode(json.dumps({"historyId": 123456}).encode()).decode().rstrip("=")
+    response = client.post(
+        "/api/integrations/gmail/pubsub/1",
+        json={"message": {"data": encoded}},
+        headers=headers(),
+    )
+    assert response.status_code == 202
+    assert fake.history_calls == [(1, "123456")]
+
+
 def test_gmail_pubsub_route_fetches_history_details_and_ingests(gmail_client):
     client, fake, counts = gmail_client
     response = client.post(
@@ -157,9 +170,27 @@ def test_gmail_pubsub_route_fetches_history_details_and_ingests(gmail_client):
     assert response.status_code == 202
     assert response.json() == {"accepted": 1, "created": 1, "cursor": "history-2"}
     assert fake.history_calls == [(1, "history-1")]
+    assert counts()["gmail_status"] == "verified_inbound"
     assert fake.message_calls == [(1, "gmail-message-1")]
 
 
+def test_gmail_pubsub_uses_persisted_cursor_and_advances_it(gmail_client):
+    client, fake, counts = gmail_client
+    first = client.post(
+        "/api/integrations/gmail/pubsub/1",
+        json={"message": {"data": encode_notification("notification-1")}},
+        headers=headers(),
+    )
+    assert first.status_code == 202
+
+    fake.events = [{"history_id": "history-3", "message_id": "gmail-message-2"}]
+    second = client.post(
+        "/api/integrations/gmail/pubsub/1",
+        json={"message": {"data": encode_notification("notification-2")}},
+        headers=headers(),
+    )
+    assert second.status_code == 202
+    assert fake.history_calls == [(1, "notification-1"), (1, "history-2")]
 def test_gmail_pubsub_empty_history_does_not_advance_cursor(gmail_client):
     client, fake, counts = gmail_client
     fake.events = []
@@ -186,7 +217,7 @@ def test_gmail_pubsub_duplicate_delivery_is_idempotent(gmail_client):
 
     assert first.json()["created"] == 1
     assert second.json()["created"] == 0
-    assert fake.history_calls == [(1, "history-1"), (1, "history-1")]
+    assert fake.history_calls == [(1, "history-1"), (1, "history-2")]
     assert fake.message_calls == [(1, "gmail-message-1"), (1, "gmail-message-1")]
     assert counts()["messages"] == 1
 

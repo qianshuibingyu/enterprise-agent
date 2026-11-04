@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 from app.auth import current_user, require_csrf
 from app.authorization import scoped_channel_account_ids
 from app.database import get_db
-from app.models.business import ChannelAccount
+from app.models.business import ChannelAccount, ChannelGrant
 from app.models.user import User, UserSession
 from app.channels.registry import provider_descriptor
 from app.whatsapp_adapter import WhatsAppAdapterClient
@@ -20,7 +20,12 @@ _SUPPORTED_CHANNELS = {"gmail", "outlook", "whatsapp"}
 
 class ExternalBindingBody(BaseModel):
     external_account_id: str = Field(min_length=1, max_length=255)
-    status: Literal["external_authorization_required", "blocked", "error", "revoked"] = "external_authorization_required"
+    status: Literal[
+        "not_ready", "awaiting_authorization", "connected_pending_inbound",
+        "blocked", "system_error", "revoked",
+        # Legacy fixture statuses remain accepted for test-only compatibility.
+        "external_authorization_required", "error",
+    ] = "awaiting_authorization"
 
 
 def _account_view(account: ChannelAccount) -> dict[str, int | str | bool]:
@@ -54,11 +59,12 @@ def _channel_view(channel_type: str) -> dict[str, object]:
         "test_only": descriptor.test_only,
         "legacy": descriptor.legacy,
         "status_values": [
-            "not_connected",
-            "external_authorization_required",
-            "connected",
+            "not_ready",
+            "awaiting_authorization",
+            "connected_pending_inbound",
+            "verified_inbound",
             "blocked",
-            "error",
+            "system_error",
             "revoked",
         ],
     }
@@ -93,6 +99,131 @@ def list_channel_accounts(
         .order_by(ChannelAccount.id)
     ).all()
     return [_account_view(account) for account in accounts]
+
+
+@router.post("/channels/whatsapp/accounts")
+def create_whatsapp_account(
+    pair: Annotated[tuple[User, UserSession], Depends(require_csrf)],
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    """Create a local WhatsApp account shell before Baileys pairing."""
+    user, _ = pair
+    existing = db.scalar(
+        select(ChannelAccount).where(
+            ChannelAccount.owner_user_id == user.id,
+            ChannelAccount.channel_type == "whatsapp",
+        ).order_by(ChannelAccount.id)
+    )
+    if existing is not None:
+        # Repair accounts created before grants were persisted, and make an
+        # explicit re-pair possible after a phone-side logout/revocation.
+        grant = db.scalar(
+            select(ChannelGrant).where(
+                ChannelGrant.channel_account_id == existing.id,
+                ChannelGrant.channel_type == existing.channel_type,
+                ChannelGrant.owner_user_id == user.id,
+            )
+        )
+        if grant is None:
+            db.add(ChannelGrant(
+                channel_account_id=existing.id,
+                channel_type=existing.channel_type,
+                owner_user_id=user.id,
+            ))
+        if existing.status == "revoked":
+            existing.status = "not_ready"
+            existing.external_account_id = None
+        db.commit()
+        return _account_view(existing)
+    account = ChannelAccount(
+        owner_user_id=user.id,
+        channel_type="whatsapp",
+        status="not_ready",
+    )
+    db.add(account)
+    db.flush()
+    db.add(ChannelGrant(
+        channel_account_id=account.id,
+        channel_type="whatsapp",
+        owner_user_id=user.id,
+    ))
+    db.commit()
+    return _account_view(account)
+
+
+@router.post("/channels/gmail/accounts")
+def create_gmail_account(
+    pair: Annotated[tuple[User, UserSession], Depends(require_csrf)],
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    """Create the local Gmail account shell before official OAuth.
+
+    This deliberately stores no email, token, secret, or provider identity.
+    """
+    user, _ = pair
+    existing = db.scalar(
+        select(ChannelAccount).where(
+            ChannelAccount.owner_user_id == user.id,
+            ChannelAccount.channel_type == "gmail",
+        ).order_by(ChannelAccount.id)
+    )
+    if existing is not None:
+        return _account_view(existing)
+    account = ChannelAccount(
+        owner_user_id=user.id,
+        channel_type="gmail",
+        status="not_ready",
+    )
+    db.add(account)
+    db.flush()
+    db.add(ChannelGrant(
+        channel_account_id=account.id,
+        channel_type="gmail",
+        owner_user_id=user.id,
+    ))
+    db.commit()
+    return _account_view(account)
+
+
+@router.post("/channels/outlook/accounts")
+def create_outlook_account(
+    pair: Annotated[tuple[User, UserSession], Depends(require_csrf)],
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    """Create the local Outlook account shell before Microsoft OAuth."""
+    user, _ = pair
+    existing = db.scalar(
+        select(ChannelAccount).where(
+            ChannelAccount.owner_user_id == user.id,
+            ChannelAccount.channel_type == "outlook",
+        ).order_by(ChannelAccount.id)
+    )
+    if existing is not None:
+        grant = db.scalar(
+            select(ChannelGrant).where(
+                ChannelGrant.channel_account_id == existing.id,
+                ChannelGrant.channel_type == "outlook",
+                ChannelGrant.owner_user_id == user.id,
+            )
+        )
+        if grant is None:
+            db.add(ChannelGrant(
+                channel_account_id=existing.id,
+                channel_type="outlook",
+                owner_user_id=user.id,
+            ))
+            db.commit()
+        return _account_view(existing)
+    account = ChannelAccount(owner_user_id=user.id, channel_type="outlook", status="not_ready")
+    db.add(account)
+    db.flush()
+    db.add(ChannelGrant(
+        channel_account_id=account.id,
+        channel_type="outlook",
+        owner_user_id=user.id,
+    ))
+    db.commit()
+    return _account_view(account)
 
 
 @router.post("/channels/{channel_type}/authorize")

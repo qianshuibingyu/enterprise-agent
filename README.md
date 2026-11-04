@@ -23,4 +23,14 @@
 - 本地环境文件使用 `.env`，不得提交；可参考 `.env.example` 配置。
 - `.venv/`、`node_modules/`、缓存和 `frontend/dist/` 均为本地产物，不属于版本控制内容。
 
+## 数据库迁移
+
+生产 Compose 部署中，PostgreSQL 只在 Compose 网络内提供给 `backend` 服务，数据库主机名为 `db`。因此应从运行中的 backend 容器执行迁移：
+
+```bash
+docker compose --env-file .env exec -T backend python -m alembic upgrade head
+```
+
+不要在宿主机上以 `DB_HOST=db` 直接连接数据库。开发机直接运行 Alembic 时，后端会读取仓库根目录 `.env` 中尚未导出的变量；已导出的环境变量优先。若仍提示缺少 `POSTGRES_USER`、`POSTGRES_PASSWORD` 或 `POSTGRES_DB`，请在 `.env` 中配置对应的非空值，且不要把它们输出到终端或提交到版本库。
+
 请按对应阶段指南运行并记录测试、迁移及部署验证结果；历史测试或文档计划不能替代当前运行证据。

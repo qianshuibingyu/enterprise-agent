@@ -1,3 +1,5 @@
+import base64
+
 import httpx
 import pytest
 
@@ -32,11 +34,11 @@ def test_gmail_client_refreshes_token_and_fetches_history_and_message(monkeypatc
             "id": "gmail-1",
             "payload": {
                 "headers": [{"name": "Date", "value": "Thu, 22 Oct 2026 08:00:00 +0000"}],
-                "body": {"data": "message body"},
+                "body": {"data": base64.urlsafe_b64encode("message body".encode()).decode().rstrip("=")},
             },
         })
 
-    client = GmailApiClient(http=httpx.Client(transport=httpx.MockTransport(handler)))
+    client = GmailApiClient(refresh_token="refresh-token", http=httpx.Client(transport=httpx.MockTransport(handler)))
     history = client.list_history(account_id=1, history_id="history-1")
     message = client.fetch_message(account_id=1, message_id="gmail-1")
 
@@ -54,7 +56,7 @@ def test_gmail_client_requires_server_credentials(monkeypatch):
     for name in ("GMAIL_CLIENT_ID", "GMAIL_CLIENT_SECRET", "GMAIL_REFRESH_TOKEN"):
         monkeypatch.delenv(name, raising=False)
     with pytest.raises(GmailConfigurationError):
-        GmailApiClient()
+        GmailApiClient(refresh_token="")
 
 
 def test_gmail_client_propagates_rate_limit(monkeypatch):
@@ -67,7 +69,7 @@ def test_gmail_client_propagates_rate_limit(monkeypatch):
             return httpx.Response(200, json={"access_token": "short-lived"})
         return httpx.Response(429)
 
-    client = GmailApiClient(http=httpx.Client(transport=httpx.MockTransport(handler)))
+    client = GmailApiClient(refresh_token="refresh-token", http=httpx.Client(transport=httpx.MockTransport(handler)))
     with pytest.raises(ProviderRateLimited):
         client.list_history(account_id=1, history_id="history-1")
 
@@ -83,7 +85,7 @@ def test_gmail_client_treats_authorization_failure_as_non_retryable(monkeypatch,
             return httpx.Response(200, json={"access_token": "short-lived"})
         return httpx.Response(status_code, text="sensitive provider details")
 
-    client = GmailApiClient(http=httpx.Client(transport=httpx.MockTransport(handler)))
+    client = GmailApiClient(refresh_token="refresh-token", http=httpx.Client(transport=httpx.MockTransport(handler)))
     with pytest.raises(ProviderAuthorizationFailure) as raised:
         client.list_history(account_id=1, history_id="history-1")
 
@@ -101,7 +103,7 @@ def test_gmail_client_treats_other_client_error_as_permanent(monkeypatch):
             return httpx.Response(200, json={"access_token": "short-lived"})
         return httpx.Response(400, text="sensitive provider details")
 
-    client = GmailApiClient(http=httpx.Client(transport=httpx.MockTransport(handler)))
+    client = GmailApiClient(refresh_token="refresh-token", http=httpx.Client(transport=httpx.MockTransport(handler)))
     with pytest.raises(ProviderPermanentFailure) as raised:
         client.list_history(account_id=1, history_id="history-1")
 
@@ -119,6 +121,6 @@ def test_gmail_client_propagates_temporary_failure(monkeypatch):
             return httpx.Response(200, json={"access_token": "short-lived"})
         return httpx.Response(503)
 
-    client = GmailApiClient(http=httpx.Client(transport=httpx.MockTransport(handler)))
+    client = GmailApiClient(refresh_token="refresh-token", http=httpx.Client(transport=httpx.MockTransport(handler)))
     with pytest.raises(ProviderTemporaryFailure):
         client.list_history(account_id=1, history_id="history-1")
