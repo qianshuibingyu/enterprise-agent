@@ -55,8 +55,17 @@ def scoped_messages(user: User) -> Select:
     return select(Message).where(Message.channel_account_id.in_(channel_scope))
 
 
-def get_scoped_message(db: Session, user: User, message_id: int) -> Message:
-    message = db.scalar(scoped_messages(user).where(Message.id == message_id))
+def get_scoped_message(
+    db: Session,
+    user: User,
+    message_id: int,
+    *,
+    for_update: bool = False,
+) -> Message:
+    query = scoped_messages(user).where(Message.id == message_id)
+    if for_update:
+        query = query.with_for_update()
+    message = db.scalar(query)
     if message is None:
         raise deny()
     return message

@@ -22,6 +22,16 @@ import {
 
 const accounts = ref<ChannelAccount[]>([])
 const messages = ref<Message[]>([])
+const messagePage = ref(1)
+const messageHasMore = ref(false)
+const messageLoadingMore = ref(false)
+const expandedMessageIds = ref<Set<number>>(new Set())
+const messageHandlingFilter = ref('')
+const messageIngestionFilter = ref('')
+const messageChannelAccountFilter = ref('')
+const inquiryStatusFilter = ref('')
+const inquiryHandlingFilter = ref('')
+const filterLoading = ref(false)
 const inquiries = ref<Inquiry[]>([])
 const analysis = ref<InternalAnalysis | null>(null)
 const transferTargets = ref<TransferTarget[]>([])
@@ -39,7 +49,10 @@ const error = ref('')
 const actionMessage = ref('')
 const actionError = ref('')
 const handlingSubmitting = ref(false)
+const providerOpeningMessageId = ref<number | null>(null)
+const providerFallback = ref<{ label: string; url: string } | null>(null)
 const unauthorized = ref(false)
+const unauthorizedStatus = ref<401 | 403 | null>(null)
 const gmailMessage = ref('')
 const gmailError = ref('')
 const whatsappMessage = ref('')
@@ -95,6 +108,10 @@ const connectionStatusGuidance: Record<string, string> = {
 
 const realAccounts = computed(() => new Map(accounts.value.map((account) => [account.channel_type, account])))
 
+const messageChannelAccounts = computed(() =>
+  accounts.value.filter((account) => ['gmail', 'outlook', 'whatsapp'].includes(account.channel_type)),
+)
+
 function connectionStatusLabel(status: string | undefined) {
   return connectionStatusLabels[status || 'not_ready'] || status || '未连接'
 }
@@ -109,7 +126,11 @@ function channelAccount(channelType: ChannelType) {
 
 function channelActionLabel(channelType: ChannelType, status: string | undefined) {
   if (channelType === 'whatsapp') return status === 'connected_pending_inbound' || status === 'verified_inbound' ? '重新关联' : '开始关联'
-  return status === 'connected_pending_inbound' || status === 'verified_inbound' ? '重新授权' : '开始授权'
+  return '开始授权'
+}
+
+function needsChannelAuthorization(status: string | undefined) {
+  return !['connected', 'connected_pending_inbound', 'verified_inbound'].includes(status ?? '')
 }
 
 async function disconnectChannel(channelType: ChannelType) {
@@ -157,6 +178,61 @@ function selectInquiry(id: number) {
   selectedInquiryId.value = id
 }
 
+function toggleMessageExpanded(messageId: number) {
+  const next = new Set(expandedMessageIds.value)
+  if (next.has(messageId)) next.delete(messageId)
+  else next.add(messageId)
+  expandedMessageIds.value = next
+}
+
+async function loadMoreMessages() {
+  if (messageLoadingMore.value || !messageHasMore.value) return
+  messageLoadingMore.value = true
+  actionError.value = ''
+  try {
+    const next = await inboxApi.getMessages(queryString({
+      handling_status: messageHandlingFilter.value,
+      ingestion_status: messageIngestionFilter.value,
+      channel_account_id: messageChannelAccountFilter.value,
+      page: String(messagePage.value + 1),
+      page_size: '20',
+      sort: 'occurred_at',
+      descending: 'false',
+    }))
+    messages.value = next.items
+    messagePage.value = next.page
+    messageHasMore.value = next.has_more
+  } catch (cause) {
+    actionError.value = cause instanceof Error ? cause.message : '更多消息加载失败，请稍后重试。'
+  } finally {
+    messageLoadingMore.value = false
+  }
+}
+
+async function loadPreviousMessages() {
+  if (messageLoadingMore.value || messagePage.value <= 1) return
+  messageLoadingMore.value = true
+  actionError.value = ''
+  try {
+    const previous = await inboxApi.getMessages(queryString({
+      handling_status: messageHandlingFilter.value,
+      ingestion_status: messageIngestionFilter.value,
+      channel_account_id: messageChannelAccountFilter.value,
+      page: String(messagePage.value - 1),
+      page_size: '20',
+      sort: 'occurred_at',
+      descending: 'false',
+    }))
+    messages.value = previous.items
+    messagePage.value = previous.page
+    messageHasMore.value = previous.has_more
+  } catch (cause) {
+    actionError.value = cause instanceof Error ? cause.message : '消息分页加载失败，请稍后重试。'
+  } finally {
+    messageLoadingMore.value = false
+  }
+}
+
 function formatTime(value: string | null | undefined) {
   if (!value) return '未提供'
   return new Date(value).toLocaleString('zh-CN', { hour12: false })
@@ -167,9 +243,44 @@ function accountLabel(accountId: number) {
   return account ? `${account.channel_type} #${account.id}` : `账号 #${accountId}`
 }
 
+function accountStatus(accountId: number) {
+  return accountById.value.get(accountId)?.status
+}
+
+function messageContactLabel(message: Message) {
+  if (message.channel_type !== 'whatsapp') {
+    return message.customer_contact || message.customer_nickname || '联系方式未提供'
+  }
+  const externalId = message.external_message_id || ''
+  if (externalId.includes('@g.us')) return '群聊'
+  if (message.customer_contact && /^\d{6,15}$/.test(message.customer_contact)) {
+    return `+${message.customer_contact}`
+  }
+  if (externalId.includes('@lid')) return 'WhatsApp 联系人（LID）'
+  return 'WhatsApp 联系人'
+}
+
+function messageSenderLabel(message: Message) {
+  if (message.channel_type === 'whatsapp') return message.customer_nickname || '发送人未提供'
+  return message.customer_nickname || ''
+}
+
+function queryString(values: Record<string, string>) {
+  const params = new URLSearchParams()
+  Object.entries(values).forEach(([key, value]) => { if (value) params.set(key, value) })
+  return params.toString() ? `?${params.toString()}` : ''
+}
+
 function statusLabel(status: string) {
   if (status === 'new') return '新询盘'
   if (status === 'assigned') return '已转交'
+  return status
+}
+
+function ingestionStatusLabel(status: string) {
+  if (status === 'received') return '已接收'
+  if (status === 'processed') return '已处理入站'
+  if (status === 'failed') return '入站失败'
   return status
 }
 
@@ -192,7 +303,9 @@ async function logoutSystemAccount() {
 }
 
 async function loadWorkspace() {
-  loading.value = true
+  const initialLoad = accounts.value.length === 0 && messages.value.length === 0 && inquiries.value.length === 0 && analysis.value === null
+  if (initialLoad) loading.value = true
+  filterLoading.value = true
   error.value = ''
   actionError.value = ''
   unauthorized.value = false
@@ -201,8 +314,17 @@ async function loadWorkspace() {
     const [nextAccounts, nextChannelAccounts, nextMessages, nextInquiries, nextAnalysis, nextTargets] = await Promise.all([
       inboxApi.getAccounts(),
       channelsApi.accounts(),
-      inboxApi.getMessages(),
-      inboxApi.getInquiries(),
+      inboxApi.getMessages(queryString({
+        handling_status: messageHandlingFilter.value,
+        ingestion_status: messageIngestionFilter.value,
+        channel_account_id: messageChannelAccountFilter.value,
+        page: '1', page_size: '20', sort: 'occurred_at', descending: 'false',
+      })),
+      inboxApi.getInquiries(queryString({
+        status: inquiryStatusFilter.value,
+        handling_status: inquiryHandlingFilter.value,
+        page: '1', page_size: '50', sort: 'updated_at', descending: 'true',
+      })),
       inboxApi.getInternalAnalysis(),
       inboxApi.getTransferTargets().catch((cause) => {
         if (cause instanceof ApiError && cause.status === 403) return []
@@ -216,16 +338,21 @@ async function loadWorkspace() {
         ? { ...account, status: channelAccount.status, external_account_id: channelAccount.external_account_id }
         : account
     })
-    messages.value = nextMessages
-    inquiries.value = nextInquiries
+    messages.value = nextMessages.items
+    messagePage.value = nextMessages.page
+    messageHasMore.value = nextMessages.has_more
+    expandedMessageIds.value = new Set()
+    inquiries.value = nextInquiries.items
     analysis.value = nextAnalysis
     transferTargets.value = nextTargets
-    if (selectedInquiryId.value === null && nextInquiries.length > 0) {
-      selectedInquiryId.value = nextInquiries[0].id
+    if (!nextInquiries.items.some((inquiry) => inquiry.id === selectedInquiryId.value)) {
+      selectedInquiryId.value = nextInquiries.items[0]?.id ?? null
+      selectedSalesUserId.value = null
     }
   } catch (cause) {
     if (cause instanceof ApiError && (cause.status === 401 || cause.status === 403)) {
       unauthorized.value = true
+      unauthorizedStatus.value = cause.status
       error.value = cause.message
     } else if (cause instanceof Error) {
       error.value = cause.message
@@ -233,7 +360,8 @@ async function loadWorkspace() {
       error.value = '工作台数据加载失败'
     }
   } finally {
-    loading.value = false
+    if (initialLoad) loading.value = false
+    filterLoading.value = false
   }
 }
 
@@ -251,15 +379,16 @@ function revokeFakeChannel(channelType: FakeChannel['channel_type']) {
 
 async function startWhatsAppPairing() {
   let account = accounts.value.find((item) => item.channel_type === 'whatsapp')
-  if (!account) {
-    const csrf = await inboxApi.getCsrf()
-    account = await channelsApi.createWhatsAppAccount(csrf.csrf_token)
-    accounts.value = [...accounts.value, account]
-  }
   whatsappError.value = ''
   whatsappMessage.value = ''
   whatsappQr.value = ''
   try {
+    if (!account) {
+      const csrf = await inboxApi.getCsrf()
+      account = await channelsApi.createWhatsAppAccount(csrf.csrf_token)
+      accounts.value = [...accounts.value, account]
+    }
+    if (!account) throw new Error('WhatsApp 账号初始化失败。')
     const csrf = await inboxApi.getCsrf()
     const result = await channelsApi.startWhatsAppPairing(account.id, csrf.csrf_token)
     whatsappQr.value = result.qr
@@ -349,18 +478,31 @@ function readGmailCallbackState() {
 
 async function startOutlookAuthorization() {
   let account = accounts.value.find((item) => item.channel_type === 'outlook')
-  if (!account) {
-    const csrf = await inboxApi.getCsrf()
-    await channelsApi.createOutlookAccount(csrf.csrf_token)
-    await loadWorkspace()
-    account = accounts.value.find((item) => item.channel_type === 'outlook')
+  outlookAuthorizationError.value = ''
+  outlookAuthorizationMessage.value = ''
+  if (account && !needsChannelAuthorization(account.status)) {
+    outlookAuthorizationMessage.value = 'Outlook 已连接，无需重新授权。请在消息队列点击“去渠道处理”打开邮件。'
+    return
   }
-  if (!account) return
+  const authorizationWindow = window.open('about:blank', '_blank')
+  if (authorizationWindow) authorizationWindow.opener = null
   try {
+    if (!account) {
+      const csrf = await inboxApi.getCsrf()
+      await channelsApi.createOutlookAccount(csrf.csrf_token)
+      await loadWorkspace()
+      account = accounts.value.find((item) => item.channel_type === 'outlook')
+    }
+    if (!account) throw new Error('Outlook 账号初始化失败。')
     const csrf = await inboxApi.getCsrf()
     const result = await channelsApi.startOutlookAuthorization(account.id, csrf.csrf_token)
-    window.location.assign(result.authorization_url)
+    if (authorizationWindow && !authorizationWindow.closed) {
+      authorizationWindow.location.assign(result.authorization_url)
+    } else {
+      window.location.assign(result.authorization_url)
+    }
   } catch (cause) {
+    if (authorizationWindow && !authorizationWindow.closed) authorizationWindow.close()
     outlookAuthorizationError.value = cause instanceof Error ? cause.message : 'Outlook 授权启动失败。'
   }
 }
@@ -382,9 +524,11 @@ async function readOutlookMessages() {
           total: result.length,
           created: result.filter((item) => item.created).length,
           duplicates: result.filter((item) => !item.created).length,
+          links_repaired: 0,
         }
       : result
-    outlookMessage.value = `Outlook 主动读取完成：确认 ${summary.total} 条，其中新增 ${summary.created} 条，重复 ${summary.duplicates} 条。`
+    const repaired = summary.links_repaired ? `，补齐邮件链接 ${summary.links_repaired} 条` : ''
+    outlookMessage.value = `Outlook 主动读取完成：确认 ${summary.total} 条，其中新增 ${summary.created} 条，重复 ${summary.duplicates} 条${repaired}。`
     await loadWorkspace()
   } catch (cause) {
     if (cause instanceof ApiError && (cause.status === 401 || cause.status === 403)) {
@@ -398,6 +542,75 @@ async function readOutlookMessages() {
     }
   } finally {
     outlookReading.value = false
+  }
+}
+
+function isWebUrl(url: string) {
+  return /^https?:\/\//i.test(url)
+}
+
+function isAppSchemeUrl(url: string) {
+  return /^[a-z][a-z0-9+.-]*:/i.test(url) && !isWebUrl(url)
+}
+
+/**
+ * Hand an app scheme (whatsapp://) to the OS.
+ *
+ * A tab cannot render this protocol, so opening it through a pre-opened blank
+ * popup left an empty window behind when the desktop app was missing.
+ */
+function launchAppScheme(url: string) {
+  const anchor = document.createElement('a')
+  anchor.href = url
+  anchor.rel = 'noopener noreferrer'
+  anchor.style.display = 'none'
+  document.body.append(anchor)
+  anchor.click()
+  anchor.remove()
+}
+
+async function openMessageProvider(message: Message) {
+  actionError.value = ''
+  actionMessage.value = ''
+  providerFallback.value = null
+  providerOpeningMessageId.value = message.id
+  const providerWindow = window.open('about:blank', '_blank')
+  if (providerWindow) providerWindow.opener = null
+  try {
+    const result = await inboxApi.getMessageProviderAction(message.id)
+    if (result.supported && result.url) {
+      const appScheme = isAppSchemeUrl(result.url)
+      if (!appScheme) {
+        if (providerWindow && !providerWindow.closed) {
+          providerWindow.location.assign(result.url)
+        } else {
+          // A strict popup policy may still block the pre-opened tab.
+          window.location.assign(result.url)
+        }
+      } else {
+        if (providerWindow && !providerWindow.closed) providerWindow.close()
+        launchAppScheme(result.url)
+      }
+      if (result.web_url && result.web_url !== result.url && isWebUrl(result.web_url)) {
+        providerFallback.value = {
+          label: result.channel_type === 'whatsapp' ? '改用 WhatsApp 网页版打开' : '改用网页版打开',
+          url: result.web_url,
+        }
+      }
+      actionMessage.value = result.reason || (appScheme
+        ? '已请求打开本机应用；若系统没有响应，可用下面的网页版入口。'
+        : '已在新窗口打开渠道处理入口。')
+      return
+    }
+    if (providerWindow && !providerWindow.closed) providerWindow.close()
+    actionError.value = result.reason || '当前消息暂不支持渠道处理。'
+  } catch (cause) {
+    if (providerWindow && !providerWindow.closed) providerWindow.close()
+    actionError.value = cause instanceof Error ? cause.message : '渠道处理入口获取失败。'
+  } finally {
+    window.setTimeout(() => {
+      if (providerOpeningMessageId.value === message.id) providerOpeningMessageId.value = null
+    }, 700)
   }
 }
 
@@ -522,12 +735,14 @@ onMounted(() => {
             </div>
             <div class="setting-actions">
               <button
+                v-if="channelType === 'whatsapp' || needsChannelAuthorization(channelAccount(channelType)?.status)"
                 class="primary"
                 type="button"
                 @click="channelType === 'gmail' ? startGmailAuthorization() : channelType === 'outlook' ? startOutlookAuthorization() : startWhatsAppPairing()"
               >
                 {{ channelActionLabel(channelType, channelAccount(channelType)?.status) }}
               </button>
+              <span v-else class="connection-ready">已连接</span>
               <button
                 v-if="channelType === 'outlook' && channelAccount(channelType)"
                 class="secondary"
@@ -587,31 +802,43 @@ onMounted(() => {
       <p class="security-note">浏览器不保存 token、refresh token、client secret、OAuth code、QR 或 auth state；OAuth 只通过后端返回的官方授权地址启动。</p>
     </section>
 
-    <section v-if="loading" class="notice">正在加载授权范围内的数据…</section>
-    <section v-else-if="unauthorized" class="notice error">
-      当前会话无权访问工作台。请先登录，或联系管理员配置渠道权限。
+    <template v-else-if="!profileOpen">
+      <section v-if="loading" class="notice">正在加载授权范围内的数据…</section>
+      <section v-else-if="unauthorized" class="notice error">
+      {{ unauthorizedStatus === 401 ? '当前会话已失效，请重新登录。' : '当前账号无权访问该运营收件箱。' }}
     </section>
     <section v-else-if="error" class="notice error">
       {{ error }}
       <button class="link-button" type="button" @click="loadWorkspace">重试</button>
     </section>
-    <section v-else class="content-grid">
+    <section v-else class="content-grid" data-ui="inbox">
       <section v-if="analysis" class="analysis-strip">
+        <div class="overview-heading">
+          <div>
+            <p class="eyebrow">今日工作量</p>
+            <h2>先看异常，再处理消息</h2>
+          </div>
+          <span class="overview-note">数据来自当前授权范围</span>
+        </div>
         <div class="analysis-card">
           <span>待处理消息</span>
           <strong>{{ analysis.pending_message_count ?? 0 }}</strong>
+          <small>需要人工查看</small>
         </div>
         <div class="analysis-card">
           <span>询盘状态</span>
           <strong>{{ Object.entries(analysis.inquiries_by_status ?? {}).map(([status, count]) => `${statusLabel(status)} ${count}`).join(' · ') || '无数据' }}</strong>
+          <small>当前询盘分布</small>
         </div>
         <div class="analysis-card">
           <span>人工处理</span>
           <strong>{{ Object.entries(analysis.inquiries_by_handling_status ?? {}).map(([status, count]) => `${handlingStatusLabel(status)} ${count}`).join(' · ') || '无数据' }}</strong>
+          <small>处理状态分布</small>
         </div>
         <div class="analysis-card">
           <span>我的转交</span>
           <strong>{{ analysis.my_transfers?.length ?? 0 }}</strong>
+          <small>本周期转交记录</small>
         </div>
         <div class="analysis-card">
           <span>渠道异常</span>
@@ -620,16 +847,28 @@ onMounted(() => {
         </div>
       </section>
 
-      <aside class="inbox-panel panel">
+      <section class="inbox-panel panel" :class="{ 'is-refreshing': filterLoading }">
         <div class="panel-heading">
           <div>
-            <p class="eyebrow">授权范围</p>
-            <h2>询盘列表</h2>
+            <p class="eyebrow">运营收件箱</p>
+            <h2>消息处理队列</h2>
           </div>
-          <span class="count">{{ inquiries.length }}</span>
+          <span class="count">{{ messages.length }} 条待查</span>
         </div>
 
-        <p v-if="inquiries.length === 0" class="empty">当前授权范围内没有询盘。</p>
+        <div class="inbox-filters">
+          <div class="filter-group">
+            <span>询盘</span>
+            <select v-model="inquiryStatusFilter" aria-label="询盘业务状态" @change="loadWorkspace">
+              <option value="">全部阶段</option><option value="new">新询盘</option><option value="assigned">已转交</option>
+            </select>
+            <select v-model="inquiryHandlingFilter" aria-label="询盘人工状态" @change="loadWorkspace">
+              <option value="">全部处理状态</option><option value="pending">待处理</option><option value="processed">已处理</option><option value="ignored">已忽略</option>
+            </select>
+          </div>
+        </div>
+        <p v-if="filterLoading" class="refresh-state" role="status">正在刷新当前筛选结果…</p>
+        <p v-if="inquiries.length === 0" class="empty">当前授权范围内没有符合条件的询盘。</p>
         <button
           v-for="inquiry in inquiries"
           :key="inquiry.id"
@@ -647,18 +886,65 @@ onMounted(() => {
         </button>
 
         <div class="subsection">
-          <div class="panel-heading compact">
-            <h2>消息</h2>
-            <span class="count">{{ messages.length }}</span>
+          <div class="panel-heading compact message-heading">
+            <div>
+              <p class="eyebrow">逐条处理</p>
+              <h2>消息</h2>
+            </div>
+            <span class="count">{{ messages.length }} 条</span>
           </div>
-          <p v-if="messages.length === 0" class="empty">当前授权范围内没有消息。</p>
+          <div class="inbox-filters">
+            <div class="filter-group">
+              <span>渠道</span>
+              <select v-model="messageChannelAccountFilter" aria-label="消息渠道" @change="loadWorkspace">
+                <option value="">全部渠道</option>
+                <option v-for="account in messageChannelAccounts" :key="account.id" :value="String(account.id)">
+                  {{ account.channel_type === 'whatsapp' ? 'WhatsApp' : account.channel_type === 'outlook' ? 'Outlook' : 'Gmail' }}
+                </option>
+              </select>
+            </div>
+            <div class="filter-group">
+              <span>状态</span>
+              <select v-model="messageIngestionFilter" aria-label="消息入站状态" @change="loadWorkspace">
+                <option value="">全部入站</option><option value="received">已接收</option><option value="processed">已处理入站</option><option value="failed">入站失败</option>
+              </select>
+              <select v-model="messageHandlingFilter" aria-label="消息人工状态" @change="loadWorkspace">
+                <option value="">全部人工</option><option value="pending">待处理</option><option value="processed">已处理</option><option value="ignored">已忽略</option>
+              </select>
+            </div>
+          </div>
+          <p v-if="actionMessage" class="inline-feedback success" role="status">{{ actionMessage }}</p>
+          <p v-if="providerFallback" class="inline-feedback success">
+            <a :href="providerFallback.url" target="_blank" rel="noopener noreferrer">{{ providerFallback.label }}</a>
+          </p>
+          <p v-if="actionError" class="inline-feedback error" role="alert">{{ actionError }}</p>
+          <p v-if="messages.length === 0" class="empty">当前授权范围内没有符合条件的消息。</p>
           <div v-for="message in messages" :key="message.id" class="message-row">
-            <strong>{{ message.channel_type }} · {{ message.ingestion_status }}</strong>
-            <span>{{ formatTime(message.occurred_at) }} · 人工状态：{{ message.handling_status }}</span>
-            <p>{{ message.display_excerpt || '（无正文）' }}</p>
+            <div class="message-meta">
+              <span class="channel-mark" :class="`channel-${message.channel_type}`">{{ message.channel_type === 'whatsapp' ? 'WS' : message.channel_type === 'outlook' ? 'OL' : 'GM' }}</span>
+              <strong>{{ messageContactLabel(message) }}</strong>
+              <span v-if="messageSenderLabel(message)" class="sender">发送人：{{ messageSenderLabel(message) }}</span>
+              <span class="meta-time">{{ formatTime(message.occurred_at) }}</span>
+              <span class="state-label ingestion-state">入站：{{ ingestionStatusLabel(message.ingestion_status) }}</span>
+              <span class="state-label">人工：{{ handlingStatusLabel(message.handling_status) }}</span>
+              <span v-if="accountStatus(message.channel_account_id) === 'blocked'" class="status-warning">渠道阻塞</span><span v-if="accountStatus(message.channel_account_id) === 'revoked'" class="status-warning">渠道已撤销</span>
+            </div>
+            <p :class="{ 'message-preview': !expandedMessageIds.has(message.id) }">{{ expandedMessageIds.has(message.id) ? (message.display_text || '（无正文）') : (message.display_excerpt || '（无正文）') }}</p>
             <div class="message-actions">
+              <button class="action-button action-secondary" type="button" @click="toggleMessageExpanded(message.id)">
+                {{ expandedMessageIds.has(message.id) ? '收起正文' : '展开正文' }}
+              </button>
               <button
-                class="link-button"
+                class="action-button action-primary"
+                :class="{ 'is-opening': providerOpeningMessageId === message.id }"
+                type="button"
+                :disabled="providerOpeningMessageId === message.id"
+                @click="openMessageProvider(message)"
+              >
+                {{ providerOpeningMessageId === message.id ? '正在打开…' : '去渠道处理' }}
+              </button>
+              <button
+                class="action-button action-secondary"
                 type="button"
                 :disabled="handlingSubmitting || message.handling_status === 'processed'"
                 @click="updateMessageHandling(message, 'processed')"
@@ -666,7 +952,7 @@ onMounted(() => {
                 {{ message.handling_status === 'processed' ? '已处理' : '标记已处理' }}
               </button>
               <button
-                class="link-button"
+                class="action-button action-secondary"
                 type="button"
                 :disabled="handlingSubmitting || message.handling_status === 'ignored'"
                 @click="updateMessageHandling(message, 'ignored')"
@@ -675,8 +961,13 @@ onMounted(() => {
               </button>
             </div>
           </div>
+          <div v-if="messageHasMore || messagePage > 1" class="pagination-bar">
+            <button v-if="messagePage > 1" class="secondary" type="button" :disabled="messageLoadingMore" @click="loadPreviousMessages">上一页</button>
+            <span>第 {{ messagePage }} 页 · 每页 20 条</span>
+            <button class="secondary" type="button" :disabled="messageLoadingMore || !messageHasMore" @click="loadMoreMessages">下一页</button>
+          </div>
         </div>
-      </aside>
+      </section>
 
       <section v-if="selectedInquiry" class="detail-panel panel">
         <div class="panel-heading">
@@ -684,7 +975,7 @@ onMounted(() => {
             <p class="eyebrow">链路详情 · fixture #{{ selectedInquiry.id }}</p>
             <h2>{{ selectedInquiry.customer_nickname || selectedInquiry.customer_contact }}</h2>
           </div>
-          <span class="test-chip">TEST_ONLY</span>
+          <span class="status-pill" :class="connectionStatusClass(accountStatus(selectedInquiry.source_channel_account_id))">{{ connectionStatusLabel(accountStatus(selectedInquiry.source_channel_account_id)) }}</span>
         </div>
 
         <div class="facts-grid">
@@ -792,7 +1083,8 @@ onMounted(() => {
         <h2>暂无可展示的链路</h2>
         <p>授权范围内没有询盘，或后端返回为空。</p>
       </section>
-    </section>
+      </section>
+    </template>
   </main>
 </template>
 
@@ -848,10 +1140,15 @@ h3 { margin-bottom: 14px; font-size: 15px; }
 .channel, .preview, .message-row span, .muted, .empty { color: #758198; font-size: 13px; }
 .channel, .preview { display: block; margin-top: 6px; }
 .preview { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.inbox-filters { display: flex; flex-wrap: wrap; gap: 8px; padding: 0 20px 10px; }
+.inbox-filters select { min-width: 0; padding: 7px 8px; color: #172033; background: white; border: 1px solid #cbd6f4; border-radius: 7px; }
+.status-warning { color: #9a2f3b; font-size: 11px; font-weight: 700; }
 .subsection { margin: 25px 20px 0; padding-top: 20px; border-top: 1px solid #e5eaf2; }
 .message-row { padding: 11px 0; border-top: 1px solid #edf0f5; font-size: 13px; }
-.message-row p { margin: 5px 0 0; line-height: 1.5; }
-.message-actions { display: flex; gap: 12px; margin-top: 7px; }
+.message-row p { margin: 5px 0 0; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
+.message-preview { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; overflow: hidden; }
+.message-actions { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 7px; }
+.load-more-messages { display: block; width: 100%; margin-top: 12px; }
 .notice { margin-top: 20px; padding: 18px; background: white; border: 1px solid #e2e7f0; border-radius: 12px; }
 .notice.error { color: #9a2f3b; border-color: #efc7cd; background: #fff7f8; }
 .facts-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin: 26px 0; }
@@ -929,4 +1226,257 @@ h3 { margin-bottom: 14px; font-size: 15px; }
 @media (max-width: 800px) { .channel-setting { grid-template-columns: 1fr; gap: 18px; } .profile-heading { display: block; } .back-link { margin-top: 12px; } }
 @media (max-width: 480px) { .analysis-strip { grid-template-columns: 1fr; } .transfer-form { grid-template-columns: 1fr; } .transfer-form .primary { grid-column: 1; } .profile-view { margin-top: 20px; } .profile-heading h2 { font-size: 25px; } .setting-panel { padding: 16px; } .setting-facts { grid-template-columns: 1fr; gap: 12px; } .fixture-row { display: grid; align-items: start; } .setting-actions > button { min-height: 42px; } }
 @media (max-width: 480px) { .workspace { width: min(100% - 24px, 1240px); padding-top: 22px; } .detail-panel { padding: 20px; } .facts-grid { grid-template-columns: 1fr; } .attachment-list li { display: grid; gap: 5px; } }
+
+/* Inbox refresh: a quiet ledger surface with a clear top-to-bottom work path. */
+:root {
+  color: #20272d;
+  background: #eef0f2;
+  letter-spacing: 0;
+}
+body { background: #eef0f2; }
+.workspace { width: min(1320px, calc(100% - 56px)); padding: 30px 0 72px; }
+.topbar { align-items: flex-end; margin-bottom: 28px; }
+.eyebrow { color: #68727b; letter-spacing: .1em; }
+h1 { color: #20272d; font-size: clamp(30px, 4vw, 46px); line-height: 1.05; letter-spacing: 0; }
+h2 { color: #20272d; font-size: 22px; letter-spacing: 0; }
+h3 { color: #20272d; }
+.current-user { color: #66717a; }
+.panel, .notice { border: 1px solid #d7dde1; border-radius: 8px; box-shadow: none; }
+.content-grid { display: flex; flex-direction: column; gap: 18px; margin-top: 24px; }
+.analysis-strip { grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 0; margin-top: 0; border-top: 1px solid #c8d0d5; border-bottom: 1px solid #c8d0d5; }
+.overview-heading { grid-column: 1 / -1; display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; padding: 22px 20px 18px; background: #eef0f2; }
+.overview-heading h2 { margin: 0; }
+.overview-heading .eyebrow { margin-bottom: 7px; }
+.overview-note { color: #68727b; font-size: 12px; }
+.analysis-card { min-height: 116px; gap: 8px; padding: 19px 20px; background: #f8f9fa; border: 0; border-right: 1px solid #d7dde1; border-radius: 0; }
+.analysis-card:last-child { border-right: 0; }
+.analysis-card span { color: #68727b; font-size: 12px; font-weight: 650; letter-spacing: .04em; text-transform: uppercase; }
+.analysis-card strong { color: #20272d; font-size: 28px; font-weight: 700; }
+.analysis-card small { color: #68727b; font-size: 12px; line-height: 1.4; }
+.inbox-panel { padding: 0; overflow: visible; }
+.inbox-panel > .panel-heading { padding: 22px 24px 10px; }
+.inbox-panel > .panel-heading p { margin: 5px 0 0; color: #68727b; font-size: 13px; }
+.count { min-width: 30px; height: 30px; border-radius: 4px; color: #fff; background: #20272d; }
+.inbox-filters { align-items: center; gap: 10px; padding: 12px 24px 18px; border-bottom: 1px solid #d7dde1; }
+.inbox-filters::before { content: "筛选"; color: #68727b; font-size: 12px; font-weight: 700; }
+.inbox-filters select, .transfer-form select { min-height: 36px; padding: 7px 30px 7px 10px; color: #20272d; background: #fff; border: 1px solid #bfc8ce; border-radius: 4px; }
+.subsection { margin: 0; padding: 20px 24px 24px; border-top: 0; }
+.subsection > .panel-heading.compact { padding: 0 0 12px; }
+.subsection > .panel-heading.compact h3 { margin: 0; }
+.message-row { display: grid; grid-template-columns: minmax(190px, .65fr) minmax(0, 1.7fr) auto; column-gap: 18px; align-items: start; padding: 16px 0; border-top: 1px solid #e3e7e9; }
+.message-meta { grid-column: 1; display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 8px; min-width: 0; }
+.message-meta strong { flex-basis: 100%; color: #20272d; font-size: 13px; }
+.message-meta .sender, .message-meta .meta-time, .message-meta .state-label { color: #68727b; font-size: 12px; line-height: 1.45; }
+.message-meta .state-label { color: #1d5fbf; font-weight: 700; }
+.message-meta .ingestion-state { color: #68727b; font-weight: 600; }
+.message-row p { grid-column: 2; grid-row: 1; margin: 0; color: #344047; line-height: 1.55; }
+.message-row .message-actions { grid-column: 3; grid-row: 1 / span 2; justify-content: flex-end; align-items: flex-start; margin-top: 0; }
+.message-row .channel-mark { display: inline-flex; width: fit-content; margin-top: 2px; padding: 3px 6px; color: #1d5fbf; background: #e8f0fb; border-radius: 3px; font-size: 11px; font-weight: 800; }
+.message-row .message-preview { grid-column: 2; }
+.message-actions { gap: 8px; }
+.action-button, .primary, .secondary { min-height: 36px; padding: 8px 12px; border-radius: 4px; font-size: 13px; font-weight: 700; cursor: pointer; }
+.action-button { border: 1px solid #bfc8ce; }
+.action-primary, .primary { color: #fff; background: #20272d; border-color: #20272d; }
+.action-primary:hover, .primary:hover { background: #1d5fbf; border-color: #1d5fbf; }
+.action-secondary, .secondary { color: #20272d; background: #fff; border-color: #bfc8ce; }
+.action-secondary:hover, .secondary:hover { color: #1d5fbf; border-color: #1d5fbf; }
+.action-button:disabled, .primary:disabled, .secondary:disabled { color: #89939b; background: #edf0f2; border-color: #d4dade; cursor: not-allowed; }
+.pagination-bar { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 18px; padding-top: 16px; border-top: 1px solid #d7dde1; }
+.pagination-bar button { min-height: 34px; padding: 7px 11px; color: #20272d; background: #fff; border: 1px solid #bfc8ce; border-radius: 4px; cursor: pointer; }
+.pagination-bar button:disabled { color: #9aa3aa; background: #edf0f2; cursor: not-allowed; }
+.pagination-bar span { color: #68727b; font-size: 12px; }
+.detail-panel { padding: 26px 30px; }
+.detail-panel > .panel-heading { align-items: flex-start; }
+.detail-panel > .panel-heading p { margin: 6px 0 0; color: #68727b; font-size: 13px; }
+.facts-grid { gap: 0; margin: 24px 0; border-top: 1px solid #d7dde1; border-bottom: 1px solid #d7dde1; }
+.facts-grid div { padding: 14px 16px; background: #f8f9fa; border-right: 1px solid #d7dde1; border-radius: 0; }
+.facts-grid div:last-child { border-right: 0; }
+.facts-grid strong { color: #20272d; }
+.detail-section { border-color: #d7dde1; }
+.transfer-form { grid-template-columns: minmax(180px, 1fr) minmax(180px, 1fr) auto; }
+.transfer-form .primary { grid-column: auto; }
+.empty-state { min-height: 230px; background: #f8f9fa; }
+@media (max-width: 800px) {
+  .workspace { width: min(100% - 32px, 1320px); }
+  .analysis-strip { grid-template-columns: repeat(2, 1fr); }
+  .analysis-card:nth-child(2) { border-right: 0; }
+  .analysis-card:nth-child(-n + 2) { border-bottom: 1px solid #d7dde1; }
+  .message-row { grid-template-columns: 1fr; gap: 7px; }
+  .message-row .message-meta, .message-row p, .message-row .message-preview, .message-row .message-actions, .message-row .channel-mark { grid-column: 1; grid-row: auto; }
+  .message-row .message-actions { justify-content: flex-start; margin-top: 7px; }
+  .message-row .channel-mark { margin-top: 0; }
+  .pagination-bar { align-items: stretch; flex-direction: column; }
+}
+@media (max-width: 480px) {
+  .workspace { width: min(100% - 24px, 1320px); padding-top: 22px; }
+  .topbar { align-items: flex-start; flex-direction: column; }
+  .analysis-strip { grid-template-columns: 1fr; }
+  .analysis-card, .analysis-card:nth-child(2) { border-right: 0; border-bottom: 1px solid #d7dde1; }
+  .analysis-card:last-child { border-bottom: 0; }
+  .inbox-panel > .panel-heading, .inbox-filters, .subsection { padding-left: 16px; padding-right: 16px; }
+  .detail-panel { padding: 20px 16px; }
+  .facts-grid { grid-template-columns: 1fr; }
+  .facts-grid div { border-right: 0; border-bottom: 1px solid #d7dde1; }
+  .facts-grid div:last-child { border-bottom: 0; }
+  .transfer-form { grid-template-columns: 1fr; }
+  .transfer-form .primary { grid-column: 1; }
+}
+
+/* Current workspace: a compact operations desk, ordered by the decision a user makes next. */
+:root {
+  color: #1f2933;
+  background: #f4f6f7;
+  font-family: "Microsoft YaHei", "PingFang SC", "Noto Sans SC", system-ui, sans-serif;
+}
+body { background: #f4f6f7; }
+.workspace { width: min(1280px, calc(100% - 64px)); padding: 28px 0 64px; }
+.topbar { align-items: center; min-height: 48px; margin-bottom: 30px; }
+.topbar > div:first-child .eyebrow,
+.content-grid .eyebrow { display: none; }
+h1 { margin: 0; color: #1f2933; font-size: 26px; font-weight: 700; line-height: 1.25; }
+h2 { font-size: 18px; font-weight: 700; line-height: 1.35; }
+h3 { font-size: 14px; font-weight: 700; }
+.topbar-actions { gap: 8px; }
+.current-user { margin-right: 8px; color: #52606d; font-size: 13px; }
+.topbar .link-button { color: #52606d; text-decoration: none; }
+.topbar .link-button:hover { color: #c0392b; }
+
+.content-grid { gap: 28px; margin-top: 0; }
+.analysis-strip { grid-template-columns: repeat(5, minmax(0, 1fr)); border: 0; background: transparent; }
+.overview-heading { align-items: center; padding: 0 0 12px; background: transparent; }
+.overview-heading h2 { font-size: 17px; }
+.overview-note { color: #6b7785; font-size: 13px; }
+.analysis-card { min-height: 98px; padding: 14px 16px; background: #ffffff; border: 1px solid #e1e7ea; border-right: 0; }
+.analysis-card:first-of-type { border-radius: 7px 0 0 7px; }
+.analysis-card:last-child { border-right: 1px solid #e1e7ea; border-radius: 0 7px 7px 0; }
+.analysis-card span { color: #62707c; font-size: 12px; font-weight: 500; letter-spacing: 0; text-transform: none; }
+.analysis-card strong { color: #1f2933; font-size: 22px; font-weight: 700; line-height: 1.25; font-variant-numeric: tabular-nums; }
+.analysis-card small { color: #74818c; font-size: 12px; }
+
+.panel { border-color: #dfe6e9; border-radius: 8px; background: #ffffff; }
+.inbox-panel > .panel-heading { align-items: center; padding: 24px 26px 16px; }
+.inbox-panel > .panel-heading h2 { margin: 0; font-size: 20px; }
+.count { min-width: auto; height: 28px; padding: 0 9px; border-radius: 4px; color: #165d68; background: #e5f3f4; font-size: 12px; font-weight: 700; }
+.inbox-filters { gap: 20px; padding: 14px 26px 18px; background: #fafbfb; border-top: 1px solid #edf0f1; border-bottom: 1px solid #e5eaec; }
+.inbox-filters::before { display: none; }
+.filter-group { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.filter-group > span { color: #52606d; font-size: 13px; font-weight: 700; }
+.inbox-filters select, .transfer-form select { min-height: 34px; padding: 6px 28px 6px 9px; border-color: #cbd5d9; color: #334e57; font-size: 13px; }
+.inquiry-row { padding: 14px 26px; border-color: #eef1f2; }
+.inquiry-row:hover { background: #f7fbfb; }
+.inquiry-row.selected { background: #eef8f8; box-shadow: inset 3px 0 0 #147a85; }
+.inquiry-row strong { color: #243b44; font-size: 14px; }
+.status { color: #147a85; font-size: 12px; font-weight: 700; }
+.channel, .preview { color: #667681; font-size: 12px; }
+.subsection { margin: 0; padding: 26px; border-top: 8px solid #f4f6f7; }
+.message-heading { align-items: center; padding-bottom: 14px !important; }
+.message-heading h2 { margin: 0; font-size: 18px; }
+.subsection .inbox-filters { margin: 0 -26px; padding-left: 26px; padding-right: 26px; }
+.message-row { grid-template-columns: 220px minmax(0, 1fr) auto; column-gap: 24px; padding: 18px 0; border-color: #e8edef; }
+.message-meta { align-content: start; gap: 5px 8px; }
+.message-meta strong { color: #243b44; font-size: 14px; line-height: 1.35; }
+.message-meta .sender, .message-meta .meta-time, .message-meta .state-label { font-size: 12px; }
+.message-meta .state-label { color: #147a85; }
+.message-row p { color: #334e57; font-size: 14px; line-height: 1.65; }
+.message-row .channel-mark { padding: 3px 6px; color: #165d68; background: #e5f3f4; font-size: 11px; }
+.message-actions { max-width: 244px; gap: 6px; }
+.action-button, .primary, .secondary { min-height: 34px; padding: 7px 10px; border-radius: 4px; font-size: 12px; font-weight: 700; }
+.action-primary, .primary { background: #202a31; border-color: #202a31; }
+.action-primary:hover, .primary:hover { background: #165d68; border-color: #165d68; }
+.action-secondary, .secondary { color: #40535c; border-color: #cbd5d9; }
+.action-secondary:hover, .secondary:hover { color: #165d68; border-color: #82b7bd; background: #f5fbfb; }
+.pagination-bar { justify-content: flex-start; min-height: 44px; margin-top: 0; padding: 16px 0 0; border-top: 0; }
+.pagination-bar span { margin-right: auto; color: #687782; font-size: 12px; }
+.pagination-bar button { min-width: 72px; }
+.pagination-bar button:last-child { order: 3; }
+
+.detail-panel { padding: 26px; }
+.detail-panel > .panel-heading { padding: 0 0 16px; }
+.detail-panel > .panel-heading h2 { font-size: 20px; }
+.facts-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); margin: 18px 0 22px; border: 1px solid #e1e7ea; border-radius: 6px; overflow: hidden; }
+.facts-grid div { padding: 14px 16px; background: #fafbfb; }
+.facts-grid span, .contact-list dt { color: #677681; font-size: 12px; }
+.facts-grid strong { color: #243b44; font-size: 14px; }
+.detail-section { padding: 20px 0; }
+.detail-section h3 { margin-bottom: 12px; }
+.contact-list dd { color: #334e57; font-size: 14px; }
+
+@media (max-width: 1000px) {
+  .analysis-strip { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .analysis-card { border-right: 1px solid #e1e7ea; border-radius: 7px; }
+  .message-row { grid-template-columns: 180px minmax(0, 1fr); }
+  .message-row .message-actions { grid-column: 2; grid-row: 2; justify-content: flex-start; max-width: none; margin-top: 12px; }
+}
+@media (max-width: 700px) {
+  .workspace { width: min(100% - 32px, 1280px); padding-top: 20px; }
+  .topbar { align-items: flex-start; flex-direction: column; gap: 16px; }
+  .topbar-actions { width: 100%; flex-wrap: wrap; }
+  .current-user { width: 100%; }
+  .analysis-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+  .overview-heading { grid-column: 1 / -1; align-items: flex-start; flex-direction: column; gap: 4px; }
+  .analysis-card, .analysis-card:first-of-type, .analysis-card:last-child { min-height: 88px; border: 1px solid #e1e7ea; border-radius: 7px; }
+  .inbox-panel > .panel-heading, .subsection, .detail-panel { padding-left: 18px; padding-right: 18px; }
+  .inbox-filters, .subsection .inbox-filters { margin-left: -18px; margin-right: -18px; padding-left: 18px; padding-right: 18px; }
+  .message-row { grid-template-columns: 1fr; gap: 8px; }
+  .message-row .message-meta, .message-row p, .message-row .message-preview, .message-row .message-actions { grid-column: 1; grid-row: auto; }
+  .message-row .message-actions { margin-top: 6px; }
+  .facts-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .facts-grid div:nth-child(2) { border-right: 0; }
+  .facts-grid div:nth-child(-n + 2) { border-bottom: 1px solid #d7dde1; }
+}
+@media (max-width: 440px) {
+  h1 { font-size: 23px; }
+  .analysis-strip { grid-template-columns: 1fr; }
+  .analysis-card { min-height: auto; }
+  .filter-group { width: 100%; align-items: flex-start; flex-direction: column; }
+  .filter-group select { width: 100%; }
+  .message-actions { max-width: none; }
+  .action-button { flex: 1 1 calc(50% - 6px); }
+  .facts-grid { grid-template-columns: 1fr; }
+  .facts-grid div, .facts-grid div:nth-child(2) { border-right: 0; border-bottom: 1px solid #d7dde1; }
+  .facts-grid div:last-child { border-bottom: 0; }
+}
+
+/* Interaction feedback stays local to the object being worked on. */
+.analysis-card:nth-child(2) { border-radius: 7px 0 0 7px; }
+button, select, .inquiry-row, .message-row, .panel {
+  transition: background-color 160ms ease, border-color 160ms ease, color 160ms ease, opacity 160ms ease, transform 120ms ease;
+}
+button:not(:disabled):active { transform: translateY(1px); }
+button:focus-visible, select:focus-visible, .inquiry-row:focus-visible {
+  outline: 3px solid rgba(20, 122, 133, .28);
+  outline-offset: 2px;
+}
+.inquiry-row { position: relative; }
+.inquiry-row:hover { transform: translateX(2px); }
+.message-row { position: relative; }
+.message-row:hover { background: #fbfdfd; }
+.message-row:hover::before {
+  position: absolute;
+  top: 10px;
+  bottom: 10px;
+  left: -10px;
+  width: 2px;
+  background: #82b7bd;
+  content: "";
+}
+.is-refreshing .inbox-filters { background: #f2f9f9; }
+.refresh-state { margin: 10px 26px 0; color: #165d68; font-size: 12px; }
+.inline-feedback { margin: 12px 0 2px; padding: 9px 11px; border-radius: 4px; font-size: 13px; line-height: 1.45; animation: feedback-in 160ms ease-out; }
+.inline-feedback.success { color: #135c44; background: #eef8f2; }
+.inline-feedback.error { color: #a12e25; background: #fff2f0; }
+.inline-feedback a { color: inherit; font-weight: 700; }
+.action-primary.is-opening { cursor: progress; opacity: .78; }
+.connection-ready { color: #135c44; font-size: 13px; font-weight: 700; }
+@keyframes feedback-in {
+  from { opacity: 0; transform: translateY(-3px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; transition-duration: .01ms !important; }
+}
+@media (max-width: 700px) {
+  .refresh-state { margin-left: 18px; margin-right: 18px; }
+  .message-row:hover { transform: none; }
+}
 </style>

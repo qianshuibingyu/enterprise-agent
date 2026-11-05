@@ -40,6 +40,7 @@ def business_client():
                 User(username="sales", password_hash=hash_password("salespass1"), role="sales", is_active=True, must_change_password=False),
                 User(username="other-sales", password_hash=hash_password("othersale1"), role="sales", is_active=True, must_change_password=False),
                 User(username="empty-operator", password_hash=hash_password("emptyop1"), role="staff", is_active=True, must_change_password=False),
+                User(username="admin", password_hash=hash_password("adminpass1"), role="admin", is_active=True, must_change_password=False),
             ]
         )
         db.flush()
@@ -47,7 +48,8 @@ def business_client():
         blocked_account = ChannelAccount(owner_user_id=1, channel_type="outlook", status="blocked")
         other_account = ChannelAccount(owner_user_id=2, channel_type="outlook", status="connected")
         revoked_account = ChannelAccount(owner_user_id=1, channel_type="gmail", status="revoked")
-        db.add_all([first_account, blocked_account, other_account, revoked_account])
+        admin_account = ChannelAccount(owner_user_id=6, channel_type="gmail", status="connected")
+        db.add_all([first_account, blocked_account, other_account, revoked_account, admin_account])
         db.flush()
         db.add_all(
             [
@@ -55,6 +57,7 @@ def business_client():
                 ChannelGrant(channel_account_id=blocked_account.id, channel_type="outlook", owner_user_id=1),
                 ChannelGrant(channel_account_id=other_account.id, channel_type="outlook", owner_user_id=2),
                 ChannelGrant(channel_account_id=revoked_account.id, channel_type="gmail", owner_user_id=1),
+                ChannelGrant(channel_account_id=admin_account.id, channel_type="gmail", owner_user_id=6),
                 Message(
                     channel_account_id=first_account.id,
                     provider="gmail_api_pubsub",
@@ -266,9 +269,9 @@ def test_revoked_channel_is_not_readable_but_history_is_retained(business_client
     assert accounts.status_code == 200
     assert all(account["status"] != "revoked" for account in accounts.json())
     assert messages.status_code == 200
-    assert all(message["external_message_id"] != "revoked-gmail-1" for message in messages.json())
+    assert all(message["external_message_id"] != "revoked-gmail-1" for message in messages.json()["items"])
     assert inquiries.status_code == 200
-    assert all(item["source_channel_account_id"] != 4 for item in inquiries.json())
+    assert all(item["source_channel_account_id"] != 4 for item in inquiries.json()["items"])
     assert business_client.get("/api/messages/2").status_code == 403
     assert business_client.get("/api/inquiries/2").status_code == 403
 
@@ -278,19 +281,19 @@ def test_operator_reads_only_granted_owned_channel_and_inquiries(business_client
 
     messages = business_client.get("/api/messages")
     assert messages.status_code == 200
-    assert [message["external_message_id"] for message in messages.json()] == ["fixture-gmail-1"]
-    assert messages.json()[0]["channel_type"] == "gmail"
-    assert messages.json()[0]["ingestion_status"] == "received"
-    assert messages.json()[0]["handling_status"] == "pending"
-    assert messages.json()[0]["attachments"] == [
+    assert [message["external_message_id"] for message in messages.json()["items"]] == ["fixture-gmail-1"]
+    assert messages.json()["items"][0]["channel_type"] == "gmail"
+    assert messages.json()["items"][0]["ingestion_status"] == "received"
+    assert messages.json()["items"][0]["handling_status"] == "pending"
+    assert messages.json()["items"][0]["attachments"] == [
         {
-            "id": messages.json()[0]["attachments"][0]["id"],
+            "id": messages.json()["items"][0]["attachments"][0]["id"],
             "original_filename": "fixture.pdf",
             "media_type": "application/pdf",
             "size_bytes": 42,
         }
     ]
-    assert "storage_reference" not in messages.json()[0]["attachments"][0]
+    assert "storage_reference" not in messages.json()["items"][0]["attachments"][0]
     assert business_client.get("/api/messages/2").status_code == 403
     assert business_client.get("/api/messages/999").status_code == 403
 
@@ -301,9 +304,9 @@ def test_operator_reads_only_granted_owned_channel_and_inquiries(business_client
 
     inquiries = business_client.get("/api/inquiries")
     assert inquiries.status_code == 200
-    assert [inquiry["display_text"] for inquiry in inquiries.json()] == ["Need a quote"]
-    assert inquiries.json()[0]["timeline_complete"] is True
-    assert [event["event_type"] for event in inquiries.json()[0]["timeline"]] == ["inquiry_created"]
+    assert [inquiry["display_text"] for inquiry in inquiries.json()["items"]] == ["Need a quote"]
+    assert inquiries.json()["items"][0]["timeline_complete"] is True
+    assert [event["event_type"] for event in inquiries.json()["items"][0]["timeline"]] == ["inquiry_created"]
 
     assert business_client.get("/api/inquiries/2").json()["detail"] == "没有权限访问"
     assert business_client.get("/api/inquiries/2").status_code == 403
@@ -316,17 +319,17 @@ def test_sales_reads_only_assigned_inquiry_and_notification(business_client):
     assert messages.status_code == 200
     # Message has no inquiry/conversation relation yet, so sales must not
     # receive account-wide messages through an assigned inquiry.
-    assert messages.json() == []
+    assert messages.json()["items"] == []
     assert business_client.get("/api/messages/1").status_code == 403
     assert business_client.get("/api/messages/999").status_code == 403
 
     inquiries = business_client.get("/api/inquiries")
     assert inquiries.status_code == 200
-    assert [inquiry["id"] for inquiry in inquiries.json()] == [3]
-    assert inquiries.json()[0]["attachments"][0]["media_type"] == "image/png"
-    assert "storage_reference" not in inquiries.json()[0]["attachments"][0]
-    assert inquiries.json()[0]["timeline_complete"] is True
-    assert [event["event_type"] for event in inquiries.json()[0]["timeline"]] == [
+    assert [inquiry["id"] for inquiry in inquiries.json()["items"]] == [3]
+    assert inquiries.json()["items"][0]["attachments"][0]["media_type"] == "image/png"
+    assert "storage_reference" not in inquiries.json()["items"][0]["attachments"][0]
+    assert inquiries.json()["items"][0]["timeline_complete"] is True
+    assert [event["event_type"] for event in inquiries.json()["items"][0]["timeline"]] == [
         "inquiry_created",
         "inquiry_transferred",
     ]
@@ -342,7 +345,7 @@ def test_sales_cannot_read_revoked_source_inquiry(business_client):
     inquiries = business_client.get("/api/inquiries")
 
     assert inquiries.status_code == 200
-    assert [item["id"] for item in inquiries.json()] == [3]
+    assert [item["id"] for item in inquiries.json()["items"]] == [3]
     assert business_client.get("/api/inquiries/4").status_code == 403
 
 
@@ -746,7 +749,7 @@ def test_internal_analysis_is_authorized_and_read_only(business_client):
     assert "test_only" in data
 
     inquiries = business_client.get("/api/inquiries")
-    assert [item["status"] for item in inquiries.json()] == ["new"]
+    assert [item["status"] for item in inquiries.json()["items"]] == ["new"]
 
 
 def test_sales_analysis_is_scoped_to_assigned_inquiries(business_client):
@@ -812,3 +815,269 @@ def test_internal_ai_is_read_only_and_returns_operation_guidance(business_client
     assert write.json()["mode"] == "guidance"
     assert write.json()["read_only"] is True
     assert write.json()["page"] == "/inquiries"
+
+
+
+def test_inbox_list_contract_supports_authorized_filters_sorting_and_pagination(business_client):
+    login(business_client, "operator", "operator1")
+
+    messages = business_client.get(
+        "/api/messages",
+        params={
+            "handling_status": "pending",
+            "ingestion_status": "received",
+            "channel_account_id": 1,
+            "sort": "occurred_at",
+            "descending": "true",
+            "page": 1,
+            "page_size": 1,
+        },
+    )
+    inquiries = business_client.get(
+        "/api/inquiries",
+        params={
+            "status": "new",
+            "handling_status": "pending",
+            "channel_account_id": 1,
+            "sort": "updated_at",
+            "descending": "true",
+            "page": 1,
+            "page_size": 1,
+        },
+    )
+
+    assert messages.status_code == inquiries.status_code == 200
+    assert set(messages.json()) == {"items", "page", "page_size", "has_more"}
+    assert set(inquiries.json()) == {"items", "page", "page_size", "has_more"}
+    assert messages.json()["page"] == inquiries.json()["page"] == 1
+    assert messages.json()["page_size"] == inquiries.json()["page_size"] == 1
+    assert [item["external_message_id"] for item in messages.json()["items"]] == ["fixture-gmail-1"]
+    assert [item["id"] for item in inquiries.json()["items"]] == [1]
+    assert messages.json()["items"][0]["ingestion_status"] == "received"
+    assert messages.json()["items"][0]["handling_status"] == "pending"
+    assert inquiries.json()["items"][0]["status"] == "new"
+    assert inquiries.json()["items"][0]["handling_status"] == "pending"
+
+
+def test_inbox_list_empty_result_is_a_valid_authorized_response(business_client):
+    login(business_client, "operator", "operator1")
+
+    response = business_client.get(
+        "/api/inquiries",
+        params={"handling_status": "processed", "channel_account_id": 1},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "items": [],
+        "page": 1,
+        "page_size": 50,
+        "has_more": False,
+    }
+
+
+def test_inbox_filter_cannot_escape_authorized_channel_scope(business_client):
+    login(business_client, "operator", "operator1")
+
+    response = business_client.get(
+        "/api/messages",
+        params={"channel_account_id": 3},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["items"] == []
+
+
+def test_inbox_rejects_invalid_filters_and_paging_before_query_execution(business_client):
+    login(business_client, "operator", "operator1")
+
+    invalid_requests = [
+        ("/api/messages", {"handling_status": "send"}),
+        ("/api/messages", {"ingestion_status": "queued"}),
+        ("/api/messages", {"sort": "raw_content"}),
+        ("/api/messages", {"page": 0}),
+        ("/api/messages", {"page_size": 101}),
+        ("/api/inquiries", {"status": "closed"}),
+        ("/api/inquiries", {"handling_status": "send"}),
+        ("/api/inquiries", {"sort": "id"}),
+        ("/api/inquiries", {"channel_account_id": 0}),
+    ]
+
+    for path, params in invalid_requests:
+        response = business_client.get(path, params=params)
+        assert response.status_code == 422, (path, params, response.text)
+
+
+
+def test_admin_does_not_bypass_object_scope(business_client):
+    login(business_client, "admin", "adminpass1")
+
+    accounts = business_client.get("/api/channel-accounts")
+    messages = business_client.get("/api/messages")
+    inquiries = business_client.get("/api/inquiries")
+
+    assert accounts.status_code == messages.status_code == inquiries.status_code == 200
+    assert accounts.json() == [
+        {"id": 5, "owner_user_id": 6, "channel_type": "gmail", "status": "connected"}
+    ]
+    assert messages.json()["items"] == []
+    assert inquiries.json()["items"] == []
+    assert business_client.get("/api/messages/1").status_code == 403
+    assert business_client.get("/api/inquiries/1").status_code == 403
+
+
+def test_blocked_account_is_in_scope_but_revoked_account_is_not(business_client):
+    login(business_client, "operator", "operator1")
+
+    response = business_client.get("/api/messages", params={"channel_account_id": 2})
+
+    assert response.status_code == 200
+    assert response.json()["items"] == []
+    assert business_client.get("/api/messages", params={"channel_account_id": 4}).json()["items"] == []
+
+
+def test_pagination_boundaries_are_stable_and_empty_pages_do_not_leak(business_client):
+    login(business_client, "operator", "operator1")
+
+    first = business_client.get("/api/messages", params={"page": 1, "page_size": 1, "descending": "false"})
+    second = business_client.get("/api/messages", params={"page": 2, "page_size": 1, "descending": "false"})
+    beyond = business_client.get("/api/messages", params={"page": 3, "page_size": 1, "descending": "false"})
+
+    assert first.status_code == second.status_code == beyond.status_code == 200
+    assert len(first.json()["items"]) == 1
+    assert second.json()["items"] == []
+    assert beyond.json()["items"] == []
+    assert first.json()["page"] == 1
+    assert second.json()["page"] == 2
+    assert beyond.json()["has_more"] is False
+
+
+
+def test_provider_action_uses_scoped_message_and_only_supports_verified_gmail_id(business_client):
+    login(business_client, "operator", "operator1")
+
+    gmail = business_client.get("/api/messages/1/provider-action")
+    cross_account = business_client.get("/api/messages/3/provider-action")
+    revoked = business_client.get("/api/messages/2/provider-action")
+
+    assert gmail.status_code == 200
+    assert gmail.json()["supported"] is True
+    assert gmail.json()["action"] == "open_message"
+    assert gmail.json()["url"].startswith("https://mail.google.com/mail/u/0/#all/")
+    assert "token" not in gmail.json()["url"]
+    assert cross_account.status_code == 403
+    assert revoked.status_code == 403
+
+
+def test_sales_and_cross_account_cannot_get_provider_action(business_client):
+    login(business_client, "sales", "salespass1")
+    assert business_client.get("/api/messages/1/provider-action").status_code == 403
+
+    business_client.post(
+        "/auth/logout",
+        headers={"Origin": "https://testserver", "X-CSRF-Token": business_client.cookies.get("ea_csrf")},
+    )
+    login(business_client, "other-operator", "otherop1")
+    assert business_client.get("/api/messages/1/provider-action").status_code == 403
+
+
+
+def test_human_actions_reject_changing_an_already_completed_terminal_state(business_client):
+    login(business_client, "operator", "operator1")
+    csrf = business_client.cookies.get("ea_csrf")
+    headers = {"Origin": "https://testserver", "X-CSRF-Token": csrf}
+
+    inquiry_done = business_client.post(
+        "/api/inquiries/1/action", json={"action": "processed"}, headers=headers
+    )
+    message_done = business_client.post(
+        "/api/messages/1/action", json={"action": "ignored"}, headers=headers
+    )
+    inquiry_reverse = business_client.post(
+        "/api/inquiries/1/action", json={"action": "ignored"}, headers=headers
+    )
+    message_reverse = business_client.post(
+        "/api/messages/1/action", json={"action": "processed"}, headers=headers
+    )
+
+    assert inquiry_done.status_code == message_done.status_code == 200
+    assert inquiry_reverse.status_code == message_reverse.status_code == 409
+    assert business_client.get("/api/inquiries/1").json()["handling_status"] == "processed"
+    message = business_client.get("/api/messages/1").json()
+    assert message["handling_status"] == "ignored"
+    assert message["ingestion_status"] == "received"
+
+
+def test_repeated_same_terminal_action_is_idempotent_without_extra_inquiry_event(business_client):
+    login(business_client, "operator", "operator1")
+    csrf = business_client.cookies.get("ea_csrf")
+    headers = {"Origin": "https://testserver", "X-CSRF-Token": csrf}
+
+    first = business_client.post(
+        "/api/inquiries/1/action", json={"action": "processed"}, headers=headers
+    )
+    second = business_client.post(
+        "/api/inquiries/1/action", json={"action": "processed"}, headers=headers
+    )
+
+    assert first.status_code == second.status_code == 200
+    assert [event["event_type"] for event in second.json()["timeline"]] == [
+        "inquiry_created", "inquiry_processed"
+    ]
+
+
+
+def test_cross_function_authorization_contract_matches_for_sales_and_operator(business_client):
+    login(business_client, "operator", "operator1")
+
+    operator_analysis = business_client.post("/api/internal-analysis", json={"operation": "read"})
+    operator_ai = business_client.post("/api/internal-ai/query", json={"query": "inquiries"})
+    operator_notifications = business_client.post("/api/internal-ai/query", json={"query": "notifications"})
+
+    assert operator_analysis.status_code == operator_ai.status_code == operator_notifications.status_code == 200
+    assert operator_analysis.json()["inquiries_by_status"] == {"new": 1, "assigned": 0}
+    assert [item["id"] for item in operator_ai.json()["data"]] == [1]
+    assert operator_notifications.json()["data"] == []
+    assert business_client.get("/api/inquiries/2").status_code == 403
+    assert business_client.post(
+        "/api/inquiries/2/action",
+        json={"action": "processed"},
+        headers={"Origin": "https://testserver", "X-CSRF-Token": business_client.cookies.get("ea_csrf")},
+    ).status_code == 403
+
+    csrf = business_client.cookies.get("ea_csrf")
+    business_client.post("/auth/logout", headers={"Origin": "https://testserver", "X-CSRF-Token": csrf})
+    login(business_client, "sales", "salespass1")
+
+    sales_analysis = business_client.post("/api/internal-analysis", json={"operation": "read"})
+    sales_ai = business_client.post("/api/internal-ai/query", json={"query": "inquiries"})
+    sales_notifications = business_client.post("/api/internal-ai/query", json={"query": "notifications"})
+
+    assert sales_analysis.status_code == sales_ai.status_code == sales_notifications.status_code == 200
+    assert sales_analysis.json()["inquiries_by_status"] == {"new": 0, "assigned": 1}
+    assert [item["id"] for item in sales_ai.json()["data"]] == [3]
+    assert sales_notifications.json()["data"] == []
+    assert business_client.get("/api/inquiries/1").status_code == 403
+    assert business_client.post(
+        "/api/inquiries/1/action",
+        json={"action": "processed"},
+        headers={"Origin": "https://testserver", "X-CSRF-Token": business_client.cookies.get("ea_csrf")},
+    ).status_code == 403
+
+
+def test_revoked_assigned_inquiry_is_absent_from_all_sales_reads_and_actions(business_client):
+    login(business_client, "sales", "salespass1")
+
+    assert [item["id"] for item in business_client.get("/api/inquiries").json()["items"]] == [3]
+    for path, payload in [
+        ("/api/inquiries/4/action", {"action": "processed"}),
+        ("/api/inquiries/4/transfer", {"sales_user_id": 3}),
+    ]:
+        csrf = business_client.cookies.get("ea_csrf")
+        response = business_client.post(
+            path,
+            json=payload,
+            headers={"Origin": "https://testserver", "X-CSRF-Token": csrf},
+        )
+        assert response.status_code == 403
+    assert business_client.get("/api/inquiries/4").status_code == 403

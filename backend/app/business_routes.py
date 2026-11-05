@@ -1,12 +1,14 @@
 from typing import Annotated, Literal
+import re
+from urllib.parse import quote
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, selectinload
 
 from app.auth import current_user, require_csrf
-from app.content_security import content_view
+from app.content_security import content_view, legacy_contact_view
 from app.authorization import (
     can_transfer_inquiry,
     get_scoped_inquiry,
@@ -25,12 +27,45 @@ from app.models.business import (
     InternalNotification,
     Message,
 )
+from app.outlook_graph import OutlookGraphError, outlook_graph_client_for_ciphertext
+from app.provider_links import (
+    OUTLOOK_WEB_HOSTS,
+    outlook_account_is_personal,
+    outlook_inbox_url,
+    outlook_web_link,
+)
 from app.models.user import User, UserSession
 
 router = APIRouter(prefix="/api", tags=["business"])
 
 INQUIRY_STATUSES = ("new", "assigned")
 INQUIRY_HANDLING_STATUSES = ("pending", "processed", "ignored")
+
+WHATSAPP_WEB_INBOX = "https://web.whatsapp.com/"
+
+__all__ = ["router", "OUTLOOK_WEB_HOSTS"]
+
+
+def _whatsapp_phone(value: str | None) -> str | None:
+    """Return an E.164-style phone only when it is safe for a desktop deep link.
+
+    Only a personal number (``<phone>@s.whatsapp.net``) can address a chat.
+    Group JIDs (``@g.us``) and privacy-linked ids (``@lid``) are not phone
+    numbers; converting them would open a chat with a stranger, so they are
+    rejected and the caller falls back to the WhatsApp root.
+    """
+    if not value:
+        return None
+    candidate = value.strip()
+    if "@" in candidate:
+        user, _, host = candidate.partition("@")
+        if host.strip().lower() != "s.whatsapp.net":
+            return None
+        candidate = user
+    # A JID may carry a device suffix: 8613812345678:12@s.whatsapp.net
+    candidate = candidate.split(":", 1)[0]
+    candidate = re.sub(r"[\s().+-]", "", candidate)
+    return candidate if candidate.isdigit() and 6 <= len(candidate) <= 15 else None
 
 
 class TransferBody(BaseModel):
@@ -104,12 +139,18 @@ def _event_view(event: InquiryEvent) -> dict[str, object]:
 
 def _message_view(message: Message) -> dict[str, object]:
     account = message.channel_account
+    contact = message.customer_contact
+    nickname = message.customer_nickname
+    if not contact and not nickname:
+        contact, nickname = legacy_contact_view(message.raw_content, message.provider)
     return {
         "id": message.id,
         "channel_account_id": message.channel_account_id,
         "channel_type": account.channel_type,
         "provider": message.provider,
         "external_message_id": message.external_message_id,
+        "customer_contact": contact,
+        "customer_nickname": nickname,
         "direction": message.direction,
         "ingestion_status": message.status,
         "handling_status": message.handling_status,
@@ -137,13 +178,36 @@ def list_channel_accounts(
 def list_messages(
     user: Annotated[User, Depends(current_user)],
     db: Session = Depends(get_db),
-) -> list[dict[str, object]]:
+    handling_status: Literal["pending", "processed", "ignored"] | None = Query(default=None),
+    ingestion_status: Literal["received", "processed", "failed"] | None = Query(default=None),
+    channel_account_id: int | None = Query(default=None, gt=0),
+    sort: Literal["occurred_at", "created_at"] = Query(default="occurred_at"),
+    descending: bool = Query(default=True),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=50, ge=1, le=100),
+) -> dict[str, object]:
+    query = scoped_messages(user)
+    if handling_status is not None:
+        query = query.where(Message.handling_status == handling_status)
+    if ingestion_status is not None:
+        query = query.where(Message.status == ingestion_status)
+    if channel_account_id is not None:
+        query = query.where(Message.channel_account_id == channel_account_id)
+    sort_column = Message.occurred_at if sort == "occurred_at" else Message.created_at
+    ordering = sort_column.desc() if descending else sort_column.asc()
+    offset = (page - 1) * page_size
     messages = db.scalars(
-        scoped_messages(user)
-        .options(selectinload(Message.channel_account), selectinload(Message.attachments))
-        .order_by(Message.occurred_at, Message.id)
+        query.options(selectinload(Message.channel_account), selectinload(Message.attachments))
+        .order_by(ordering, Message.id.desc() if descending else Message.id.asc())
+        .offset(offset)
+        .limit(page_size)
     ).all()
-    return [_message_view(message) for message in messages]
+    return {
+        "items": [_message_view(message) for message in messages],
+        "page": page,
+        "page_size": page_size,
+        "has_more": len(messages) == page_size,
+    }
 
 
 @router.get("/messages/{message_id}")
@@ -158,18 +222,157 @@ def get_message(
     return _message_view(message)
 
 
+def _resolve_outlook_web_link(db: Session, message: Message, account: ChannelAccount) -> str | None:
+    """Repair a stored Outlook message that has no provider link yet.
+
+    Rows ingested before the link column existed (or before the read stopped
+    filtering on unread state) carry no link, which used to degrade every click
+    to a generic inbox. The stored refresh token lets the backend ask Graph for
+    the authoritative link once, and the result is persisted so the next click
+    is local.
+    """
+    if not account.outlook_credential_ciphertext:
+        return None
+    identity = (message.external_message_id or "").strip()
+    if not identity:
+        return None
+    try:
+        client = outlook_graph_client_for_ciphertext(account.outlook_credential_ciphertext)
+        link = outlook_web_link(client.message_web_link(identity))
+    except OutlookGraphError:
+        return None
+    if link is None:
+        return None
+    message.provider_web_link = link
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+    return link
+
+
+@router.get("/messages/{message_id}/provider-action")
+def get_message_provider_action(
+    message_id: int,
+    user: Annotated[User, Depends(current_user)],
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    message = get_scoped_message(db, user, message_id)
+    account = message.channel_account
+    base = {
+        "supported": False,
+        "channel_type": account.channel_type,
+        "action": "none",
+        "url": None,
+        "web_url": None,
+        "reason": "当前消息没有可验证的渠道处理入口",
+    }
+    if account.status in {"blocked", "system_error"}:
+        base["reason"] = "当前渠道账号不可用"
+        return base
+    if account.channel_type == "gmail" and message.external_message_id.strip():
+        # The message ID is provider-issued and stored under the authorized
+        # account. No token, OAuth state, or client secret is placed in URL.
+        url = f"https://mail.google.com/mail/u/0/#all/{quote(message.external_message_id, safe='')}"
+        return {
+            "supported": True,
+            "channel_type": "gmail",
+            "action": "open_message",
+            "url": url,
+            "web_url": url,
+            "reason": None,
+        }
+    if account.channel_type == "outlook":
+        link = outlook_web_link(message.provider_web_link)
+        if link is None:
+            link = _resolve_outlook_web_link(db, message, account)
+        if link is not None:
+            return {
+                "supported": True,
+                "channel_type": "outlook",
+                "action": "open_message",
+                "url": link,
+                "web_url": link,
+                "reason": None,
+            }
+        # No per-message link is available. Open the mailbox that can actually
+        # serve this account instead of a host that forces a Microsoft sign-in.
+        personal = outlook_account_is_personal(
+            external_account_id=account.external_account_id,
+        )
+        return {
+            "supported": True,
+            "channel_type": "outlook",
+            "action": "open_inbox",
+            "url": outlook_inbox_url(personal=personal),
+            "web_url": None,
+            "reason": "当前邮件没有可用的邮件链接，已打开对应 Outlook 网页收件箱",
+        }
+    elif account.channel_type == "whatsapp":
+        contact = _whatsapp_phone(message.customer_contact)
+        if contact is None:
+            # Older WhatsApp rows may not have customer_contact populated, but
+            # the adapter's scoped external id starts with the remote JID.
+            remote_jid = message.external_message_id.split(":", 1)[0].strip()
+            contact = _whatsapp_phone(remote_jid)
+        if contact is not None:
+            return {
+                "supported": True,
+                "channel_type": "whatsapp",
+                "action": "open_chat",
+                "url": f"whatsapp://send?phone={quote(contact, safe='')}",
+                # WhatsApp Desktop is not installed on every workstation, and
+                # a browser cannot report that failure. Keep a web fallback.
+                "web_url": f"https://wa.me/{quote(contact, safe='')}",
+                "reason": None,
+            }
+        return {
+            "supported": True,
+            "channel_type": "whatsapp",
+            "action": "open_inbox",
+            "url": "whatsapp://",
+            "web_url": WHATSAPP_WEB_INBOX,
+            "reason": "当前消息没有可验证的客户手机号（群聊或 LID 联系人），已打开 WhatsApp",
+        }
+    return base
+
+
 @router.get("/inquiries")
 def list_inquiries(
     user: Annotated[User, Depends(current_user)],
     db: Session = Depends(get_db),
-) -> list[dict[str, object]]:
+    status: Literal["new", "assigned"] | None = Query(default=None),
+    handling_status: Literal["pending", "processed", "ignored"] | None = Query(default=None),
+    channel_account_id: int | None = Query(default=None, gt=0),
+    sort: Literal["created_at", "updated_at"] = Query(default="updated_at"),
+    descending: bool = Query(default=True),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=50, ge=1, le=100),
+) -> dict[str, object]:
+    query = scoped_inquiries(user)
+    if status is not None:
+        query = query.where(Inquiry.status == status)
+    if handling_status is not None:
+        query = query.where(Inquiry.handling_status == handling_status)
+    if channel_account_id is not None:
+        query = query.where(Inquiry.source_channel_account_id == channel_account_id)
+    sort_column = Inquiry.created_at if sort == "created_at" else Inquiry.updated_at
+    ordering = sort_column.desc() if descending else sort_column.asc()
+    offset = (page - 1) * page_size
     inquiries = db.scalars(
-        scoped_inquiries(user).options(
+        query.options(
             selectinload(Inquiry.attachments),
             selectinload(Inquiry.events),
-        ).order_by(Inquiry.id)
+        ).order_by(ordering, Inquiry.id.desc() if descending else Inquiry.id.asc())
+        .offset(offset)
+        .limit(page_size)
     ).all()
-    return [_inquiry_view(inquiry) for inquiry in inquiries]
+    return {
+        "items": [_inquiry_view(inquiry) for inquiry in inquiries],
+        "page": page,
+        "page_size": page_size,
+        "has_more": len(inquiries) == page_size,
+    }
 
 
 @router.get("/inquiries/{inquiry_id}")
@@ -190,11 +393,13 @@ def inquiry_action(
     db: Session = Depends(get_db),
 ) -> dict[str, object]:
     user, _ = pair
-    inquiry = get_scoped_inquiry(db, user, inquiry_id)
+    inquiry = get_scoped_inquiry(db, user, inquiry_id, for_update=True)
     if user.role == "sales":
         raise HTTPException(status_code=403, detail="没有权限访问")
     if inquiry.handling_status == body.action:
         return _inquiry_view(inquiry)
+    if inquiry.handling_status in {"processed", "ignored"}:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="该询盘已完成处理，不能重复改变终态")
     previous_handling_status = inquiry.handling_status
     event_type = f"inquiry_{body.action}"
     try:
@@ -224,12 +429,14 @@ def message_action(
     db: Session = Depends(get_db),
 ) -> dict[str, object]:
     user, _ = pair
-    message = get_scoped_message(db, user, message_id)
+    message = get_scoped_message(db, user, message_id, for_update=True)
     if user.role == "sales":
         raise HTTPException(status_code=403, detail="没有权限访问")
 
     if message.handling_status == body.action:
         return _message_view(message)
+    if message.handling_status in {"processed", "ignored"}:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="该消息已完成处理，不能重复改变终态")
     try:
         message.handling_status = body.action
         db.commit()
@@ -498,7 +705,11 @@ def internal_ai_query(
         result = db.scalars(
             select(InternalNotification)
             .join(Inquiry, InternalNotification.inquiry_id == Inquiry.id)
-            .where(Inquiry.assigned_sales_user_id == user.id)
+            .join(ChannelAccount, ChannelAccount.id == Inquiry.source_channel_account_id)
+            .where(
+                Inquiry.assigned_sales_user_id == user.id,
+                ChannelAccount.status != "revoked",
+            )
             .order_by(InternalNotification.id)
         ).all()
         data = [

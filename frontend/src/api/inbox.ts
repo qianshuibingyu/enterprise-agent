@@ -109,6 +109,8 @@ export type Message = {
   channel_type: string
   provider: string
   external_message_id: string
+  customer_contact: string | null
+  customer_nickname: string | null
   direction: string
   ingestion_status: string
   handling_status: 'pending' | 'processed' | 'ignored'
@@ -120,6 +122,13 @@ export type Message = {
   content_sanitized: boolean
   content_truncated: boolean
   attachments: AttachmentMetadata[]
+}
+
+export type PagedResponse<T> = {
+  items: T[]
+  page: number
+  page_size: number
+  has_more: boolean
 }
 
 export class ApiError extends Error {
@@ -159,15 +168,25 @@ async function getJson<T>(path: string, init?: RequestInit): Promise<T> {
 export const inboxApi = {
   getCurrentUser: () => getJson<CurrentUser>('/auth/me'),
   getAccounts: () => getJson<ChannelAccount[]>('/api/channel-accounts'),
-  getMessages: () => getJson<Message[]>('/api/messages'),
-  getInquiries: () => getJson<Inquiry[]>('/api/inquiries'),
+  getMessages: (params = '') => getJson<PagedResponse<Message>>(`/api/messages${params}`),
+  getInquiries: (params = '') => getJson<PagedResponse<Inquiry>>(`/api/inquiries${params}`),
   getInquiry: (id: number) => getJson<Inquiry>(`/api/inquiries/${id}`),
+  getMessageProviderAction: (id: number) => getJson<{
+    supported: boolean
+    channel_type: string
+    action: 'open_message' | 'open_chat' | 'open_inbox' | 'none'
+    url: string | null
+    /** HTTP fallback when the app scheme cannot be launched on this machine. */
+    web_url: string | null
+    reason: string | null
+  }>(`/api/messages/${id}/provider-action`),
   getOutlookMessages: (accountId: number, count = 50) =>
     getJson<{
       messages: Array<{ id: number; created: boolean }>
       total: number
       created: number
       duplicates: number
+      links_repaired?: number
     } | Array<{ id: number; created: boolean }>>(`/api/integrations/outlook/accounts/${accountId}/messages?count=${count}`),
   getInternalAnalysis: () => getJson<InternalAnalysis>('/api/internal-analysis', {
     method: 'POST',
