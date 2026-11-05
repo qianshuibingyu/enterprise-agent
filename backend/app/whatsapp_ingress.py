@@ -24,6 +24,8 @@ class WhatsAppInboundEvent(BaseModel):
     status: str
     occurred_at: datetime
     raw_content: str
+    customer_contact: str | None = Field(default=None, max_length=255)
+    customer_nickname: str | None = Field(default=None, max_length=255)
     attachments: list[dict[str, Any]] = Field(default_factory=list)
 
 

@@ -86,6 +86,21 @@ class HttpWhatsAppAdapterClient:
             detail=data.get("detail"),
         )
 
+    def resolve_lid_phone(self, *, channel_account_id: int, lid: str) -> str | None:
+        """Ask the adapter which phone number a LID chat belongs to.
+
+        WhatsApp delivers direct chats under a privacy ``<id>@lid`` JID. Only the
+        linked device can map that id back to a phone number, and only a phone
+        number can open a chat, so historical rows are repaired through here.
+        """
+        data = self._request(
+            "POST",
+            f"/internal/whatsapp/accounts/{channel_account_id}/lid-phone",
+            json={"lid": lid},
+        )
+        phone = data.get("phone")
+        return phone if isinstance(phone, str) and phone.isdigit() else None
+
 
 class WhatsAppAdapterClient(Protocol):
     def start_pairing(self, *, channel_account_id: int) -> PairingResponse:
@@ -95,6 +110,9 @@ class WhatsAppAdapterClient(Protocol):
         ...
 
     def disconnect(self, *, channel_account_id: int) -> AdapterStatus:
+        ...
+
+    def resolve_lid_phone(self, *, channel_account_id: int, lid: str) -> str | None:
         ...
 
     def receive(self, *, channel_account_id: int) -> list[Mapping[str, Any]]:

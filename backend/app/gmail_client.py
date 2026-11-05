@@ -2,6 +2,7 @@ from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 import base64
 import os
+import re
 from typing import Any, Mapping
 
 import httpx
@@ -100,6 +101,7 @@ class GmailApiClient:
             str(item.get("name", "")).lower(): str(item.get("value", ""))
             for item in data.get("payload", {}).get("headers", [])
         }
+        customer_contact, customer_nickname = _parse_sender(headers.get("from"))
         raw_content = _extract_text(data.get("payload", {}))
         occurred_at = _parse_date(headers.get("date"))
         return {
@@ -108,7 +110,19 @@ class GmailApiClient:
             "status": "received",
             "occurred_at": occurred_at,
             "raw_content": raw_content,
+            "customer_contact": customer_contact,
+            "customer_nickname": customer_nickname,
         }
+
+
+def _parse_sender(value: str | None) -> tuple[str | None, str | None]:
+    if not value:
+        return None, None
+    match = re.match(r"^\\s*(.*?)\\s*<([^<>\\s]+)>\\s*$", value)
+    if match:
+        nickname = match.group(1).strip().strip('"') or None
+        return match.group(2), nickname
+    return value.strip() or None, None
 
 
 def _parse_date(value: str | None) -> datetime:

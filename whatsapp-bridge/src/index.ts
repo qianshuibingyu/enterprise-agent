@@ -5,6 +5,7 @@ import makeWASocket, { DisconnectReason, useMultiFileAuthState, type WAMessage }
 import QRCode from "qrcode";
 import { DurableInbox, type InboundRecord } from "./durable-inbox.js";
 import { captureWhatsAppBatch } from "./event-handler.js";
+import { phoneFromWhatsAppJid, isLidJid } from "./whatsapp-message.js";
 
 type Metrics = {
   socketConnected: boolean;
@@ -93,6 +94,8 @@ async function deliver(runtime: RuntimeState, record: InboundRecord): Promise<vo
         status: "received",
         occurred_at: record.occurredAt,
         raw_content: record.rawContent,
+        customer_contact: record.customerContact,
+        customer_nickname: record.customerNickname,
         attachments: [],
       }),
       signal: AbortSignal.timeout(15_000),
@@ -138,6 +141,11 @@ async function captureBatch(runtime: RuntimeState, messages: WAMessage[], type: 
       metrics: runtime.metrics,
       setError: (message) => { runtime.error = message; },
       drain: () => drainPending(runtime),
+      resolvePhone: async (lidJid) => {
+        const mapping = (runtime.socket as any)?.signalRepository?.lidMapping;
+        if (!mapping?.getPNForLID) return undefined;
+        return phoneFromWhatsAppJid(await mapping.getPNForLID(lidJid));
+      },
     },
     messages,
     type,
@@ -363,6 +371,25 @@ app.post("/internal/whatsapp/accounts/:channelAccountId/disconnect", async (requ
     response.json({ state: runtime.connectionState, external_account_id: runtime.externalAccountId ?? null, detail: null });
   } catch {
     response.status(503).json({ detail: "WhatsApp disconnect unavailable" });
+  }
+});
+
+app.post("/internal/whatsapp/accounts/:channelAccountId/lid-phone", async (request, response) => {
+  if (!requireToken(request, response)) return;
+  const lid = typeof request.body?.lid === "string" ? request.body.lid.trim() : "";
+  if (!isLidJid(lid)) {
+    response.status(400).json({ detail: "lid is not a WhatsApp LID JID" });
+    return;
+  }
+  try {
+    const runtime = await getRuntime(accountId(request));
+    const mapping = (runtime.socket as any)?.signalRepository?.lidMapping;
+    const pn = mapping?.getPNForLID ? await mapping.getPNForLID(lid) : null;
+    // Only a phone number can address a chat; an unresolved LID stays null so
+    // the console keeps the WhatsApp root instead of opening a stranger.
+    response.json({ lid, phone: phoneFromWhatsAppJid(pn) ?? null });
+  } catch {
+    response.status(503).json({ detail: "WhatsApp LID mapping unavailable" });
   }
 });
 

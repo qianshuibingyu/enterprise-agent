@@ -34,6 +34,9 @@ class InboundMessageInput:
     status: str
     occurred_at: datetime
     raw_content: str
+    customer_contact: str | None = None
+    customer_nickname: str | None = None
+    provider_web_link: str | None = None
     attachments: tuple[AttachmentInput, ...] = ()
 
 
@@ -102,6 +105,18 @@ def map_provider_message(
         status=str(message["status"]),
         occurred_at=message["occurred_at"],
         raw_content=str(message["raw_content"]),
+        customer_contact=(
+            str(message["customer_contact"])
+            if message.get("customer_contact") is not None else None
+        ),
+        customer_nickname=(
+            str(message["customer_nickname"])
+            if message.get("customer_nickname") is not None else None
+        ),
+        provider_web_link=(
+            str(message["provider_web_link"])
+            if message.get("provider_web_link") is not None else None
+        ),
         attachments=tuple(attachment_inputs),
     )
 
@@ -169,6 +184,15 @@ def ingest_message(db: Session, payload: InboundMessageInput) -> IngestResult:
 
     existing = _find_existing(db, payload)
     if existing is not None:
+        # Provider re-reads can contain metadata that was unavailable when an
+        # older row was first ingested. Backfill only missing presentation
+        # fields; the provider identity and message body remain immutable.
+        if existing.customer_contact is None and payload.customer_contact:
+            existing.customer_contact = payload.customer_contact
+        if existing.customer_nickname is None and payload.customer_nickname:
+            existing.customer_nickname = payload.customer_nickname
+        if existing.provider_web_link is None and payload.provider_web_link:
+            existing.provider_web_link = payload.provider_web_link
         return IngestResult(message=existing, created=False)
 
     message = Message(
@@ -179,6 +203,9 @@ def ingest_message(db: Session, payload: InboundMessageInput) -> IngestResult:
         status=payload.status,
         occurred_at=payload.occurred_at,
         raw_content=payload.raw_content,
+        customer_contact=payload.customer_contact,
+        customer_nickname=payload.customer_nickname,
+        provider_web_link=payload.provider_web_link,
         attachments=[
             MessageAttachment(
                 original_filename=attachment.original_filename,

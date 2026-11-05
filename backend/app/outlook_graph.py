@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
@@ -65,6 +66,15 @@ class OutlookGraphClient:
         return payload
 
     def list_emails(self, *, external_account_id: str, count: int = 50) -> list[dict[str, Any]]:
+        """Read new (unread) messages from the account's Inbox and Junk folders.
+
+        The unread window decides which mail enters the operations queue, which
+        is why it cannot also be the only source of per-message metadata: once a
+        user opens a message it leaves this window, so a row ingested earlier
+        could never receive a field added to the contract later. ``webLink`` is
+        repaired by :meth:`message_web_link` instead of by widening this read
+        into "every message ever received".
+        """
         identity = self._get("/me", {"$select": "id,mail,userPrincipalName"})
         if identity.get("id") != external_account_id:
             raise OutlookGraphError("Outlook account mapping failed")
@@ -76,12 +86,29 @@ class OutlookGraphClient:
                     "$top": str(count),
                     "$filter": "receivedDateTime ge 1970-01-01T00:00:00Z and isRead eq false",
                     "$orderby": "receivedDateTime desc",
-                    "$select": "id,receivedDateTime,isRead,bodyPreview,body,hasAttachments",
+                    "$select": "id,receivedDateTime,isRead,bodyPreview,body,from,webLink,hasAttachments",
                 },
             )
             values = payload.get("value", [])
             messages.extend(item for item in values if isinstance(item, dict))
         return messages
+
+    def message_web_link(self, message_id: str) -> str | None:
+        """Return the provider-issued web link for one stored message.
+
+        Used to repair rows that were ingested before the link was persisted;
+        Graph is the only authority for the link, so no URL shape is invented.
+        """
+        response = self.http.get(
+            f"https://graph.microsoft.com/v1.0/me/messages/{quote(message_id.strip(), safe='')}",
+            headers={"Authorization": f"Bearer {self._token()}"},
+            params={"$select": "webLink"},
+        )
+        if response.status_code >= 400:
+            return None
+        payload = response.json()
+        link = payload.get("webLink") if isinstance(payload, dict) else None
+        return link if isinstance(link, str) and link else None
 
 
 def outlook_graph_client_for_ciphertext(ciphertext: str) -> OutlookGraphClient:

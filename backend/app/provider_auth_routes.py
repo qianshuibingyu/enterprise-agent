@@ -1,8 +1,10 @@
 from datetime import datetime, timezone
 import os
 from typing import Annotated, Protocol
+from urllib.parse import urlencode
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi.responses import RedirectResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -26,6 +28,17 @@ from app.outlook_mcp import OutlookMcpClient, OutlookMcpConfigurationError, requ
 
 router = APIRouter(prefix="/api/integrations", tags=["provider-authorization"])
 _oauth_states = OAuthStateStore()
+
+
+def _outlook_frontend_redirect(result: str, message: str | None = None) -> RedirectResponse:
+    origin = os.environ.get("AUTH_ORIGIN", "").rstrip("/") or "/"
+    params = {"outlook": result}
+    if message:
+        params["message"] = message
+    return RedirectResponse(
+        url=f"{origin}/?{urlencode(params)}",
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
 
 
 def _watch_expiration(value: str | None) -> datetime | None:
@@ -164,13 +177,13 @@ def outlook_authorize_callback(
     user: Annotated[User, Depends(current_user)] = None,
     db: Session = Depends(get_db),
     client: OutlookOAuthClient = Depends(get_outlook_oauth_client),
-) -> dict[str, int | str]:
+) -> RedirectResponse:
     pending = _oauth_states.validate_any(state)
     if pending is None:
-        raise HTTPException(status_code=400, detail="OAuth state 无效或已过期")
+        return _outlook_frontend_redirect("error", "Outlook 授权状态无效或已过期。")
     consumed = _oauth_states.consume_any(state)
     if consumed is None:
-        raise HTTPException(status_code=400, detail="OAuth state 无效或已过期")
+        return _outlook_frontend_redirect("error", "Outlook 授权状态无效或已过期。")
     account = _scoped_account(db, user, consumed.channel_account_id, "outlook")
     try:
         authorization = client.exchange_code(code=code)
@@ -184,21 +197,13 @@ def outlook_authorize_callback(
     except OutlookCredentialError as exc:
         account.status = "system_error"
         db.commit()
-        raise HTTPException(status_code=503, detail="Outlook OAuth 凭据无法安全保存") from exc
+        return _outlook_frontend_redirect("error", "Outlook 授权凭据无法安全保存。")
     except OutlookOAuthProviderError as exc:
         account.status = "system_error"
         db.commit()
-        detail = f"Outlook OAuth {exc.stage} failed"
-        if exc.provider_code:
-            detail += f" ({exc.provider_code})"
-        raise HTTPException(status_code=502, detail=detail) from exc
+        return _outlook_frontend_redirect("error", "Outlook 授权失败，请检查 Microsoft 应用配置。")
     except Exception as exc:
         account.status = "system_error"
         db.commit()
-        # Keep the browser response non-sensitive while making the failing
-        # provider stage distinguishable in server logs.
-        detail = "Outlook OAuth 授权失败"
-        if isinstance(exc, OutlookMcpConfigurationError):
-            detail = "Outlook OAuth provider exchange failed"
-        raise HTTPException(status_code=502, detail=detail) from exc
-    return {"channel_account_id": account.id, "status": account.status}
+        return _outlook_frontend_redirect("error", "Outlook 授权失败，请稍后重试。")
+    return _outlook_frontend_redirect("connected")

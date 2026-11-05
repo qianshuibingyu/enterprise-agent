@@ -10,6 +10,8 @@ export type InboundRecord = {
   externalMessageId: string;
   occurredAt: string;
   rawContent: string;
+  customerContact?: string;
+  customerNickname?: string;
 };
 
 type StoredRecord =
