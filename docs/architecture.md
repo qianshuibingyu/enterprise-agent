@@ -117,18 +117,18 @@ flowchart LR
 - 回复 AI 与内部 AI 职责分离：前者生成需运营审核的客户回复建议；后者只做授权范围内查询、分析及操作指引，不执行写操作。内部 AI 的操作类意图可给出页面入口和步骤，由员工自行操作。
 - 询盘转交由运营手动触发，转交数据保留联系人、联系方式、客户原始内容和来源渠道；售后在转交业务或运营标记已处理后进入静默期。静默期长度、新消息到达后的处理与恢复规则仍待实现前确认。
 - 首期不建设部门内部作业系统、合同管理/OCR、统计报表或自动发送。业务员查看转交客户的必要原始信息和链路状态，不等于建设其完整作业工作台。
-- **尚未实现或尚待环境验收（按当前仓库与用户环境分层核对）：** 真实 `whatsapp_web_baileys` 独立 Node adapter、真实 Gmail OAuth/Pub/Sub、真实 Outlook MCP/Graph/Entra 连接、完整凭据生命周期、生产调度、完整前端登录/工作台生产部署、SSE、完整审计保留生命周期、附件实际存储、目标 PostgreSQL 上人工状态字段/约束和跨进程并发验收。当前工作区已实现认证与会话、首期用户/渠道/询盘对象授权、消息/询盘事件、provider-neutral 目录/状态 API、fake adapter、统一消息入库 service、错误分类、Gmail 入站 seam、只读收件箱/询盘查询、询盘最小时间线、手动转交 UI/API、人工状态和最小前端渠道/链路页面；用户核对的运行 backend 镜像和目标数据库 revision 为 `0005_channel_external_account`，与工作区人工状态增量的一致性仍待核验。这些代码和隔离测试不代表真实 provider 已授权或真实入站已验收。图中的逻辑连线不是接口或调用合同。
+- **尚未实现或尚待环境验收（按当前仓库与用户环境分层核对）：** 三渠道真实入站主链路已按 Day 6 分渠道记录；仍待真实 provider 重放、撤销/断开恢复、附件和长期运行专项。知识资料上传/ACL/持久化 chunk、embedding、pgvector、关键词/向量检索、RAG、回复建议、人工审批/出站发送、生产调度、SSE、完整审计保留生命周期、附件实际存储和跨进程专项仍未完成。当前工作区已实现认证与会话、首期对象授权、渠道状态与三渠道入站路径、统一消息入库、中文概要代码闭环、原文安全回源、运营收件箱、询盘时间线、手动转交、人工状态、内存资料清洗/切片和前端“我的”/运营工作台；目标 PostgreSQL 最新用户记录为 `0012_message_overviews`，具体运行版本以最新 handoff 为准。代码、隔离测试和目标 schema 证据需与真实 provider/浏览器证据分层表达。图中的逻辑连线不是接口或调用合同。
 
 ### 当前骨架与目标能力差距
 
 | 领域 | 当前仓库证据 | 当前状态 |
 |---|---|---|
-| 前端 | [frontend/src/main.ts](../frontend/src/main.ts)、[frontend/src/App.vue](../frontend/src/App.vue)、[frontend/src/api/channels.ts](../frontend/src/api/channels.ts)、[frontend/src/api/inbox.ts](../frontend/src/api/inbox.ts) | Vue/Vite 渠道中心、收件箱/客户链路详情、最小 timeline、手动转交入口和只读分析卡片；用户构建成功；生产 frontend 容器/浏览器最新 bundle 仍需最后确认 |
-| 后端 API | [backend/app/main.py](../backend/app/main.py)、[backend/app/channel_routes.py](../backend/app/channel_routes.py)、[backend/app/business_routes.py](../backend/app/business_routes.py) | 认证、首期对象授权、渠道目录/账号状态、收件箱/询盘查询、timeline、转交和内部只读分析 API；真实 OAuth/adapter 尚未实现 |
-| 数据库连接 | [backend/app/database.py](../backend/app/database.py)、[compose.yaml](../compose.yaml) | SQLAlchemy PostgreSQL/Compose PostgreSQL 16；用户已核验目标库 revision 为 `0004_inquiry_events`，真实并发和 provider 数据验收仍待完成 |
-| 业务模型与迁移 | [backend/app/models/user.py](../backend/app/models/user.py)、[backend/app/models/business.py](../backend/app/models/business.py)、[backend/migrations/env.py](../backend/migrations/env.py)、[backend/migrations/versions/](../backend/migrations/versions/) | 工作区 ORM/迁移代码包含认证、渠道账号/授权、询盘/附件/通知、消息/消息附件、InquiryEvent、人工处理状态和外部账号映射；用户后续核对的运行 backend 镜像与目标数据库 revision 为 `0005_channel_external_account`，工作区与运行镜像一致性及人工状态字段的目标 schema 仍待核验 |
-| 认证与授权 | [backend/app/auth.py](../backend/app/auth.py)、[backend/app/authorization.py](../backend/app/authorization.py) | 服务端 session/CSRF/Argon2、首期对象授权、消息/询盘/timeline/转交范围测试通过；完整 RBAC、部门/经理权限未实现 |
-| 渠道与消息处理 | [backend/app/channels/](../backend/app/channels/)、[backend/app/channel_routes.py](../backend/app/channel_routes.py)、[backend/app/channels/inbound.py](../backend/app/channels/inbound.py)、[backend/app/message_ingestion.py](../backend/app/message_ingestion.py) | provider-neutral contract、能力目录、fake 状态、统一消息幂等入库、收件箱查询和渠道入站 seam 已实现并经隔离测试；真实 adapter、收发、Webhook/轮询和后台调度未实现 |
+| 前端 | [frontend/src/main.ts](../frontend/src/main.ts)、[frontend/src/App.vue](../frontend/src/App.vue)、[frontend/src/api/channels.ts](../frontend/src/api/channels.ts)、[frontend/src/api/inbox.ts](../frontend/src/api/inbox.ts) | Vue/Vite “我的”渠道管理、收件箱/客户链路详情、原文预览/展开、人工状态和只读分析；前端单元测试/生产构建已有 Day 8 证据，目标浏览器异常路径按 handoff 保留 |
+| 后端 API | [backend/app/main.py](../backend/app/main.py)、[backend/app/channel_routes.py](../backend/app/channel_routes.py)、[backend/app/business_routes.py](../backend/app/business_routes.py) | 认证、首期对象授权、渠道目录/账号状态、三渠道入站、收件箱/询盘查询、原文回源、中文概要和内部只读分析 API；回复建议、RAG 和出站未实现 |
+| 数据库连接 | [backend/app/database.py](../backend/app/database.py)、[compose.yaml](../compose.yaml) | SQLAlchemy PostgreSQL/Compose PostgreSQL；用户最新 Day 8 记录核验目标库已到 `0012_message_overviews`，真实 provider 补充专项和并发证据仍分开记录 |
+| 业务模型与迁移 | [backend/app/models/user.py](../backend/app/models/user.py)、[backend/app/models/business.py](../backend/app/models/business.py)、[backend/migrations/env.py](../backend/migrations/env.py)、[backend/migrations/versions/](../backend/migrations/versions/) | ORM/迁移包含认证、渠道账号/授权、询盘/附件/通知、消息/消息附件、InquiryEvent、人工状态、外部账号映射和 `message_overviews`；目标 schema 以最新用户 handoff 为准 |
+| 认证与授权 | [backend/app/auth.py](../backend/app/auth.py)、[backend/app/authorization.py](../backend/app/authorization.py) | 服务端 session/CSRF/Argon2、首期对象授权、消息/询盘/timeline/转交/原文/概要范围测试；完整 RBAC、部门/经理权限未实现 |
+| 渠道与消息处理 | [backend/app/channels/](../backend/app/channels/)、[backend/app/channel_routes.py](../backend/app/channel_routes.py)、[backend/app/channels/inbound.py](../backend/app/channels/inbound.py)、[backend/app/message_ingestion.py](../backend/app/message_ingestion.py) | provider-specific/provider-neutral 入站、统一消息幂等、原文安全回源和失败回退已实现；真实 provider 重放、撤销恢复、附件、长期运行和出站仍待专项验收 |
 | Agent、知识检索与报价 | backend 源码及依赖清单 | 未发现 Agent、RAG、产品/报价工具实现 |
 | 队列、调度与 SSE | backend 源码及依赖清单 | 未发现 worker、定时抓取、重试队列或 SSE 端点 |
 | 审计、提醒与生命周期 | backend 源码 | 未发现业务审计事件、提醒、归档或清理任务 |

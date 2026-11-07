@@ -11,6 +11,34 @@ def client_for(handler):
     )
 
 
+def test_graph_fetches_one_message_after_validating_account_identity(monkeypatch):
+    monkeypatch.setenv("OUTLOOK_CLIENT_ID", "fixture-client")
+    monkeypatch.setenv("OUTLOOK_CLIENT_SECRET", "fixture-secret")
+    monkeypatch.setenv("OUTLOOK_REDIRECT_URI", "https://testserver/callback")
+    calls = []
+
+    def handler(request: httpx.Request):
+        calls.append(str(request.url))
+        if request.url.path.endswith("/token"):
+            return httpx.Response(200, json={"access_token": "fixture-access"})
+        if request.url.path == "/v1.0/me":
+            return httpx.Response(200, json={"id": "ms-subject-1"})
+        return httpx.Response(200, json={
+            "id": "message-1",
+            "body": {"content": "<p>Provider body</p>"},
+        })
+
+    result = client_for(handler).fetch_message(
+        external_account_id="ms-subject-1",
+        message_id="message-1",
+    )
+
+    assert result["id"] == "message-1"
+    assert result["body"]["content"] == "<p>Provider body</p>"
+    assert calls[-1].startswith("https://graph.microsoft.com/v1.0/me/messages/message-1?")
+    assert "%24select=id%2CreceivedDateTime%2CbodyPreview%2Cbody%2Cfrom%2CwebLink%2ChasAttachments" in calls[-1]
+
+
 def test_graph_reads_inbox_and_junk_email_after_account_identity_matches(monkeypatch):
     monkeypatch.setenv("OUTLOOK_CLIENT_ID", "fixture-client")
     monkeypatch.setenv("OUTLOOK_CLIENT_SECRET", "fixture-secret")
@@ -172,3 +200,24 @@ def test_outlook_normalized_body_uses_content_not_structured_body_repr():
 
     assert normalized["raw_content"] == "<p>fixture body</p>"
     assert "contentType" not in normalized["raw_content"]
+
+
+def test_outlook_normalized_body_unwraps_mcp_structured_body_literal_safely():
+    from app.outlook_routes import _normalized_message
+
+    normalized = _normalized_message({
+        "id": "mcp-message-1",
+        "receivedDateTime": "2026-11-02T10:00:00Z",
+        "body": "{'contentType': 'html', 'content': '<p>MCP body</p>'}",
+    })
+
+    assert normalized["raw_content"] == "<p>MCP body</p>"
+
+
+def test_outlook_normalized_body_does_not_execute_or_unpack_arbitrary_literals():
+    from app.outlook_routes import _normalized_message
+
+    payload = "__import__('os').system('touch /tmp/should-not-exist')"
+    normalized = _normalized_message({"id": "unsafe", "body": payload})
+
+    assert normalized["raw_content"] == payload

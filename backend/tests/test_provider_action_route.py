@@ -98,6 +98,19 @@ def login(client):
     assert response.status_code == 200
 
 
+def test_outlook_content_falls_back_to_cached_safe_text_without_credentials(personal_outlook_client):
+    login(personal_outlook_client)
+
+    response = personal_outlook_client.get("/api/messages/1/content")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["source"]["live_refetch"] is False
+    assert body["source"]["fallback_reason"] == "provider_refetch_unavailable"
+    assert body["full_text"] == "has link"
+    assert body["raw_content_exposed"] is False
+
+
 def test_outlook_action_opens_the_stored_provider_message_link(personal_outlook_client):
     login(personal_outlook_client)
 

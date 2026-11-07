@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, Header, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, status
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -10,6 +10,7 @@ from app.channels.registry import provider_descriptor
 from app.database import get_db
 from app.external_events import ingest_external_event, verify_ingress_token
 from app.models.business import ChannelAccount
+from app.overview_service import schedule_message_overview
 
 router = APIRouter(prefix="/api/integrations", tags=["external-integrations"])
 
@@ -51,6 +52,7 @@ def receive_external_event(
     channel_type: str,
     account_id: int,
     event: NormalizedExternalEvent,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     ingress_token: Annotated[str | None, Header(alias="X-External-Ingress-Token")] = None,
 ) -> dict[str, int | str | bool]:
@@ -73,6 +75,8 @@ def receive_external_event(
         event=event.model_dump(),
     )
     db.commit()
+    if result.created:
+        background_tasks.add_task(schedule_message_overview, result.message.id)
     return {
         "accepted": True,
         "created": result.created,

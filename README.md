@@ -4,17 +4,19 @@
 
 ## 当前实现范围
 
-- `backend/app/`：FastAPI 应用、内部用户认证、基于服务端会话的登录/登出、首次登录强制修改密码、首期对象授权和 provider-neutral 渠道连接中心 API。
-- `backend/app/models/`、`backend/migrations/`：SQLAlchemy 用户/会话、渠道账号/授权、询盘/附件/内部通知、统一消息/消息附件模型与 Alembic 迁移（当前 head 为 `0003_messages`）。
-- `backend/app/message_ingestion.py`：provider-neutral 消息 mapping、fake/provider batch 接入、账号/provider/external ID 幂等和附件 metadata 保存服务；已由用户运行相关回归测试。
-- `backend/app/channels/`：provider 合同、能力目录、fake 测试 provider、入站 seam 和凭据引用安全边界；真实 provider 尚未配置。
+- `backend/app/`：FastAPI 应用、内部用户认证、基于服务端会话的登录/登出、首次登录强制修改密码、首期对象授权、三渠道连接/入站路径、运营收件箱和内容处理 API。
+- `backend/app/models/`、`backend/migrations/`：SQLAlchemy 用户/会话、渠道账号/授权、询盘/附件/内部通知、统一消息/消息附件、消息概要模型与 Alembic 迁移；工作区 head 为 `0012_message_overviews`，目标环境以用户最新核验为准。
+- `backend/app/message_ingestion.py`：provider-specific/provider-neutral 消息 mapping、批量入站、账号/provider/external ID 幂等和附件 metadata 保存服务；已由用户运行相关回归测试。
+- `backend/app/channels/`：provider 合同、能力目录、fake 测试 provider、入站 seam 和凭据引用安全边界；三渠道真实入站主链路已有 Day 6 证据，补充重放/撤销/附件/长期运行专项仍待验收。
 - `backend/scripts/create_admin.py`：管理员初始化脚本。
 - `backend/tests/`：健康检查、数据库配置、认证、迁移、首期对象授权和渠道连接中心测试。
-- `frontend/`：Vue 3 + TypeScript + Vite 渠道连接中心最小页面和 API client；已验证构建，尚未完成生产部署/真实 API 联调。
-- `compose.yaml`、`backend/Dockerfile`：开发环境服务和后端镜像配置。
+- `frontend/`：Vue 3 + TypeScript + Vite 渠道账号“我的”页、运营收件箱、消息详情、原文预览/展开和人工状态操作；前端单元测试与生产构建已有 Day 8 证据，目标浏览器异常路径仍按 handoff 记录。
+- `backend/app/document_processing.py`：provider-neutral、纯内存、确定性资料清洗与切片；不上传、不持久化、不生成 embedding、不执行检索。
+- `backend/app/overview_service.py`、`backend/app/models/overview.py`：中文概要异步生成、状态/失败回退和概要持久化边界；生产目标环境自动生成仍待完整浏览器证据。
+- `compose.yaml`、`backend/Dockerfile`、`frontend/Dockerfile`、`whatsapp-bridge/`：开发/验收服务和镜像配置。
 - `PROJECT_SPEC.md`、`docs/`、`plan/`：项目范围、架构、交接记录及开发指南。
 
-渠道连接中心的 provider-neutral 内部目录、账号状态 API、fake 状态测试、最小前端页面和三渠道入站 seam 已实现并由用户实际测试验证；Gmail/Outlook/WhatsApp 真实 adapter、授权与真实消息处理、运营收件箱及完整业务工作流尚未实现。设计资料、代码测试和前端构建成功不代表数据库迁移已在目标环境应用、真实渠道已连接或生产部署已验收。当前 Day 3 状态为“已实现，待真实环境验收”，不是整体完成。
+三渠道真实入站主链路、授权收件箱、原文回源代码、中文概要代码闭环和内存资料清洗/切片基础已有 Day 6–Day 8 证据。知识资料上传/持久化、embedding、pgvector、检索/RAG、回复建议、人工审批和真实出站仍未实现。代码、隔离测试、目标环境 schema 和镜像构建不自动代表所有生产/真实 provider 补充验收已完成。
 
 ## 开发环境
 

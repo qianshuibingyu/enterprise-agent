@@ -101,6 +101,13 @@ class HttpWhatsAppAdapterClient:
         phone = data.get("phone")
         return phone if isinstance(phone, str) and phone.isdigit() else None
 
+    def fetch_message(self, *, channel_account_id: int, message_id: str) -> dict[str, Any]:
+        """Fetch one message from the paired WhatsApp session by opaque ID."""
+        return self._request(
+            "GET",
+            f"/internal/whatsapp/accounts/{channel_account_id}/messages/{message_id}",
+        )
+
 
 class WhatsAppAdapterClient(Protocol):
     def start_pairing(self, *, channel_account_id: int) -> PairingResponse:
@@ -113,6 +120,9 @@ class WhatsAppAdapterClient(Protocol):
         ...
 
     def resolve_lid_phone(self, *, channel_account_id: int, lid: str) -> str | None:
+        ...
+
+    def fetch_message(self, *, channel_account_id: int, message_id: str) -> Mapping[str, Any]:
         ...
 
     def receive(self, *, channel_account_id: int) -> list[Mapping[str, Any]]:

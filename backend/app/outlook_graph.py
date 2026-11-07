@@ -93,6 +93,26 @@ class OutlookGraphClient:
             messages.extend(item for item in values if isinstance(item, dict))
         return messages
 
+    def fetch_message(
+        self,
+        *,
+        external_account_id: str,
+        message_id: str,
+    ) -> dict[str, Any]:
+        """Fetch one message after verifying the delegated account mapping."""
+        identity = self._get("/me", {"$select": "id,mail,userPrincipalName"})
+        if identity.get("id") != external_account_id:
+            raise OutlookGraphError("Outlook account mapping failed")
+        message = self._get(
+            f"/me/messages/{quote(message_id.strip(), safe='')}",
+            {
+                "$select": "id,receivedDateTime,bodyPreview,body,from,webLink,hasAttachments",
+            },
+        )
+        if message.get("id") != message_id:
+            raise OutlookGraphError("Outlook message identity failed")
+        return message
+
     def message_web_link(self, message_id: str) -> str | None:
         """Return the provider-issued web link for one stored message.
 

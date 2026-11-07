@@ -2,6 +2,7 @@ from typing import Annotated, Literal
 import re
 from urllib.parse import quote
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
@@ -20,6 +21,8 @@ from app.authorization import (
     validate_read_query,
 )
 from app.database import get_db
+from app.gmail_client import GmailApiClient, GmailConfigurationError
+from app.gmail_credentials import GmailCredentialError, decrypt_refresh_token
 from app.models.business import (
     ChannelAccount,
     Inquiry,
@@ -27,7 +30,15 @@ from app.models.business import (
     InternalNotification,
     Message,
 )
+from app.models.overview import MessageOverview
+from app.overview_service import ensure_message_overview, schedule_message_overview
 from app.outlook_graph import OutlookGraphError, outlook_graph_client_for_ciphertext
+from app.whatsapp_adapter import (
+    HttpWhatsAppAdapterClient,
+    WhatsAppAdapterConfigurationError,
+    WhatsAppAdapterUnavailableError,
+)
+from app.channels.inbound import ProviderAuthorizationFailure, ProviderPermanentFailure, ProviderRateLimited, ProviderTemporaryFailure
 from app.provider_links import (
     OUTLOOK_WEB_HOSTS,
     outlook_account_is_personal,
@@ -157,6 +168,19 @@ def _message_view(message: Message) -> dict[str, object]:
         "occurred_at": message.occurred_at,
         "created_at": message.created_at,
         **content_view(message.raw_content),
+        "overview": (
+            {
+                "status": message.overview.status,
+                "text": message.overview.overview_text,
+                "failure_code": message.overview.failure_code,
+                "retry_count": message.overview.retry_count,
+                "provider_name": message.overview.provider_name,
+                "model_name": message.overview.model_name,
+                "prompt_version": message.overview.prompt_version,
+            }
+            if message.overview is not None
+            else None
+        ),
         "attachments": [_attachment_view(attachment) for attachment in message.attachments],
     }
 
@@ -178,7 +202,7 @@ def list_channel_accounts(
 def list_messages(
     user: Annotated[User, Depends(current_user)],
     db: Session = Depends(get_db),
-    handling_status: Literal["pending", "processed", "ignored"] | None = Query(default=None),
+    handling_status: Literal["pending", "processed", "ignored"] | None = Query(default="pending"),
     ingestion_status: Literal["received", "processed", "failed"] | None = Query(default=None),
     channel_account_id: int | None = Query(default=None, gt=0),
     sort: Literal["occurred_at", "created_at"] = Query(default="occurred_at"),
@@ -197,7 +221,11 @@ def list_messages(
     ordering = sort_column.desc() if descending else sort_column.asc()
     offset = (page - 1) * page_size
     messages = db.scalars(
-        query.options(selectinload(Message.channel_account), selectinload(Message.attachments))
+        query.options(
+            selectinload(Message.channel_account),
+            selectinload(Message.attachments),
+            selectinload(Message.overview),
+        )
         .order_by(ordering, Message.id.desc() if descending else Message.id.asc())
         .offset(offset)
         .limit(page_size)
@@ -249,6 +277,90 @@ def _resolve_outlook_web_link(db: Session, message: Message, account: ChannelAcc
     except Exception:
         db.rollback()
     return link
+
+
+def _safe_provider_content(message: Message) -> tuple[dict[str, object], str | None]:
+    """Try a server-side provider refresh without exposing provider payloads."""
+    account = message.channel_account
+    identity = message.external_message_id.strip()
+    if not identity:
+        return content_view(message.raw_content), "provider_message_id_missing"
+
+    try:
+        if message.provider == "gmail_api_pubsub" and account.gmail_credential_ciphertext:
+            client = GmailApiClient(
+                refresh_token=decrypt_refresh_token(account.gmail_credential_ciphertext)
+            )
+            fetched = client.fetch_message(account_id=account.id, message_id=identity)
+            return content_view(fetched.get("raw_content")), None
+        if message.provider == "outlook_mcp_graph" and account.outlook_credential_ciphertext:
+            client = outlook_graph_client_for_ciphertext(account.outlook_credential_ciphertext)
+            fetched = client.fetch_message(
+                external_account_id=account.external_account_id or "",
+                message_id=identity,
+            )
+            body = fetched.get("body")
+            raw_content = body.get("content") if isinstance(body, dict) else None
+            if not isinstance(raw_content, str):
+                raw_content = fetched.get("bodyPreview") or fetched.get("body_preview") or ""
+            return content_view(raw_content), None
+        if message.provider == "whatsapp_web_baileys":
+            fetched = HttpWhatsAppAdapterClient().fetch_message(
+                channel_account_id=account.id,
+                message_id=identity,
+            )
+            return content_view(fetched.get("raw_content")), None
+        return content_view(message.raw_content), "provider_refetch_unavailable"
+    except (
+        GmailConfigurationError,
+        GmailCredentialError,
+        OutlookGraphError,
+        ProviderAuthorizationFailure,
+        ProviderPermanentFailure,
+        ProviderRateLimited,
+        ProviderTemporaryFailure,
+        WhatsAppAdapterConfigurationError,
+        WhatsAppAdapterUnavailableError,
+        httpx.HTTPError,
+        OSError,
+        ValueError,
+    ):
+        return content_view(message.raw_content), "provider_refetch_failed"
+
+
+@router.get("/messages/{message_id}/content")
+def get_message_content(
+    message_id: int,
+    user: Annotated[User, Depends(current_user)],
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    """Return authorized provider content with safe cached fallback."""
+    # Scope must be resolved before selecting a provider or attempting a fetch.
+    message = get_scoped_message(db, user, message_id)
+    content, refetch_error = _safe_provider_content(message)
+    lines = content["display_text"].splitlines()
+    preview = "\\n".join(lines[:3])
+    return {
+        "message_id": message.id,
+        "channel_type": message.channel_account.channel_type,
+        "provider": message.provider,
+        "external_message_id": message.external_message_id,
+        "direction": message.direction,
+        "occurred_at": message.occurred_at,
+        "source": {
+            "kind": "provider_refetch" if refetch_error is None else "cached_safe_text",
+            "provider": message.provider,
+            "external_message_id": message.external_message_id,
+            "live_refetch": refetch_error is None,
+            "fallback_reason": refetch_error,
+        },
+        "raw_content_exposed": False,
+        "parsed_content": content,
+        "preview_text": preview,
+        "full_text": content["display_text"],
+        "can_expand": preview != content["display_text"],
+        "attachments": [_attachment_view(attachment) for attachment in message.attachments],
+    }
 
 
 @router.get("/messages/{message_id}/provider-action")
@@ -421,6 +533,53 @@ def inquiry_action(
     return _inquiry_view(inquiry)
 
 
+@router.post("/messages/{message_id}/overview/retry")
+def retry_message_overview(
+    message_id: int,
+    pair: Annotated[tuple[User, UserSession], Depends(require_csrf)],
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    user, _ = pair
+    message = get_scoped_message(db, user, message_id, for_update=True)
+    if user.role == "sales" or message.handling_status != "pending":
+        raise HTTPException(status_code=409, detail="该消息不在待处理范围内")
+    ensure_message_overview(db, message, force=True)
+    db.commit()
+    return _message_view(message)
+
+
+@router.post("/messages/{message_id}/archive/restore")
+def restore_message(
+    message_id: int,
+    pair: Annotated[tuple[User, UserSession], Depends(require_csrf)],
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    user, _ = pair
+    message = get_scoped_message(db, user, message_id, for_update=True)
+    if user.role == "sales" or message.handling_status not in {"processed", "ignored"}:
+        raise HTTPException(status_code=409, detail="该消息不在可恢复归档范围内")
+    message.handling_status = "pending"
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    db.refresh(message)
+    return _message_view(message)
+
+
+@router.get("/messages/{message_id}/overview")
+def get_message_overview(
+    message_id: int,
+    user: Annotated[User, Depends(current_user)],
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    message = get_scoped_message(db, user, message_id)
+    if message.overview is None:
+        return {"message_id": message.id, "overview": None}
+    return {"message_id": message.id, "overview": _message_view(message)["overview"]}
+
+
 @router.post("/messages/{message_id}/action")
 def message_action(
     message_id: int,
@@ -439,6 +598,8 @@ def message_action(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="该消息已完成处理，不能重复改变终态")
     try:
         message.handling_status = body.action
+        if message.overview is not None:
+            db.delete(message.overview)
         db.commit()
     except Exception:
         db.rollback()

@@ -276,6 +276,43 @@ def test_revoked_channel_is_not_readable_but_history_is_retained(business_client
     assert business_client.get("/api/inquiries/2").status_code == 403
 
 
+def test_operator_reads_authorized_safe_message_content_only(business_client):
+    login(business_client, "operator", "operator1")
+
+    response = business_client.get("/api/messages/1/content")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["source"] == {
+        "kind": "cached_safe_text",
+        "provider": "gmail_api_pubsub",
+        "external_message_id": "fixture-gmail-1",
+        "live_refetch": False,
+        "fallback_reason": "provider_refetch_unavailable",
+    }
+    assert body["raw_content_exposed"] is False
+    assert body["parsed_content"]["content_format"] == "text/plain"
+    assert body["parsed_content"]["content_sanitized"] is True
+    assert body["full_text"] == "Fake fixture message"
+    assert body["preview_text"] == "Fake fixture message"
+    assert body["attachments"] == [{
+        "id": body["attachments"][0]["id"],
+        "original_filename": "fixture.pdf",
+        "media_type": "application/pdf",
+        "size_bytes": 42,
+    }]
+    assert "storage_reference" not in body["attachments"][0]
+    assert "raw_content" not in body
+
+
+def test_message_content_rejects_cross_account_and_revoked_messages(business_client):
+    login(business_client, "operator", "operator1")
+
+    assert business_client.get("/api/messages/3/content").status_code == 403
+    assert business_client.get("/api/messages/2/content").status_code == 403
+    assert business_client.get("/api/messages/999/content").status_code == 403
+
+
 def test_operator_reads_only_granted_owned_channel_and_inquiries(business_client):
     login(business_client, "operator", "operator1")
 

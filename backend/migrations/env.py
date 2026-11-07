@@ -13,6 +13,7 @@ from app.models.business import (  # noqa: F401
     Message,
     MessageAttachment,
 )
+from app.models.overview import MessageOverview  # noqa: F401
 
 config = context.config
 target_metadata = Base.metadata

@@ -121,6 +121,15 @@ export type Message = {
   content_format: 'text/plain'
   content_sanitized: boolean
   content_truncated: boolean
+  overview: {
+    status: 'pending' | 'ready' | 'failed'
+    text: string | null
+    failure_code: string | null
+    retry_count: number
+    provider_name: string | null
+    model_name: string | null
+    prompt_version: string
+  } | null
   attachments: AttachmentMetadata[]
 }
 
@@ -171,6 +180,33 @@ export const inboxApi = {
   getMessages: (params = '') => getJson<PagedResponse<Message>>(`/api/messages${params}`),
   getInquiries: (params = '') => getJson<PagedResponse<Inquiry>>(`/api/inquiries${params}`),
   getInquiry: (id: number) => getJson<Inquiry>(`/api/inquiries/${id}`),
+  getMessageContent: (id: number) => getJson<{
+    message_id: number
+    channel_type: string
+    provider: string
+    external_message_id: string
+    direction: string
+    occurred_at: string
+    source: {
+      kind: 'cached_safe_text'
+      provider: string
+      external_message_id: string
+      live_refetch: boolean
+      fallback_reason: string | null
+    }
+    raw_content_exposed: false
+    parsed_content: {
+      display_text: string
+      display_excerpt: string
+      content_format: 'text/plain'
+      content_sanitized: boolean
+      content_truncated: boolean
+    }
+    preview_text: string
+    full_text: string
+    can_expand: boolean
+    attachments: AttachmentMetadata[]
+  }>(`/api/messages/${id}/content`),
   getMessageProviderAction: (id: number) => getJson<{
     supported: boolean
     channel_type: string
@@ -228,6 +264,24 @@ export const inboxApi = {
         'X-CSRF-Token': csrfToken,
       },
       body: JSON.stringify({ action }),
+    }),
+  retryMessageOverview: (messageId: number, csrfToken: string) =>
+    getJson<Message>(`/api/messages/${messageId}/overview/retry`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Origin: window.location.origin,
+        'X-CSRF-Token': csrfToken,
+      },
+    }),
+  restoreMessage: (messageId: number, csrfToken: string) =>
+    getJson<Message>(`/api/messages/${messageId}/archive/restore`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Origin: window.location.origin,
+        'X-CSRF-Token': csrfToken,
+      },
     }),
   updateMessageHandling: (messageId: number, action: 'processed' | 'ignored', csrfToken: string) =>
     getJson<Message>(`/api/messages/${messageId}/action`, {

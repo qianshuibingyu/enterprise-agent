@@ -1,4 +1,5 @@
 from datetime import datetime
+from typing import TYPE_CHECKING
 
 from sqlalchemy import (
     CheckConstraint,
@@ -15,6 +16,9 @@ from sqlalchemy import (
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import Base
+
+if TYPE_CHECKING:
+    from app.models.overview import MessageOverview
 
 
 class ChannelAccount(Base):
@@ -191,6 +195,7 @@ class Message(Base):
     customer_contact: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
     customer_nickname: Mapped[str | None] = mapped_column(String(255), nullable=True)
     provider_web_link: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    test_only: Mapped[bool] = mapped_column(default=False, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
@@ -199,6 +204,9 @@ class Message(Base):
     channel_account: Mapped[ChannelAccount] = relationship()
     attachments: Mapped[list["MessageAttachment"]] = relationship(
         back_populates="message", cascade="all, delete-orphan"
+    )
+    overview: Mapped["MessageOverview | None"] = relationship(
+        back_populates="message", uselist=False, cascade="all, delete-orphan"
     )
 
 
@@ -216,3 +224,7 @@ class MessageAttachment(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     message: Mapped[Message] = relationship(back_populates="attachments")
+
+
+# Register the one-to-one derived overview model whenever business models load.
+from app.models.overview import MessageOverview  # noqa: E402,F401

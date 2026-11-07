@@ -7,7 +7,7 @@ from email.utils import parsedate_to_datetime
 from hmac import compare_digest
 from typing import Any, Mapping, Protocol
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -22,6 +22,7 @@ from app.database import get_db
 from app.gmail_client import GmailApiClient, GmailConfigurationError
 from app.gmail_credentials import GmailCredentialError, decrypt_refresh_token
 from app.models.business import ChannelAccount, ChannelGrant
+from app.overview_service import schedule_message_overview
 
 router = APIRouter(prefix="/api/integrations/gmail", tags=["gmail"])
 
@@ -124,6 +125,7 @@ def _connected_gmail_account(db: Session, account_id: int) -> ChannelAccount:
 def gmail_pubsub(
     channel_account_id: int,
     envelope: PubSubEnvelope,
+    background_tasks: BackgroundTasks,
     request: Request,
     query_token: str | None = Query(default=None, alias="token"),
     db: Session = Depends(get_db),
@@ -165,6 +167,9 @@ def gmail_pubsub(
         account.status = "verified_inbound"
     if result.cursor is not None or result.results:
         db.commit()
+        for item in result.results:
+            if item.created and item.message.direction == "inbound" and not item.message.test_only:
+                background_tasks.add_task(schedule_message_overview, item.message.id)
     return {
         "accepted": len(result.results),
         "created": sum(item.created for item in result.results),

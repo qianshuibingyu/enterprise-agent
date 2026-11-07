@@ -1,6 +1,7 @@
 from typing import Annotated
+import ast
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -11,6 +12,7 @@ from app.message_ingestion import ingest_provider_message
 from app.models.business import ChannelAccount, Message
 from app.models.user import User
 from app.outlook_graph import OutlookGraphError, OutlookGraphClient, outlook_graph_client_for_ciphertext
+from app.overview_service import schedule_message_overview
 from app.provider_links import outlook_web_link
 
 router = APIRouter(prefix="/api/integrations/outlook", tags=["outlook"])
@@ -71,6 +73,15 @@ def _outlook_body_text(item: dict[str, object]) -> str:
         if isinstance(content, str):
             return content
     if isinstance(body, str):
+        # Some Outlook MCP responses serialize the Graph body object as a
+        # Python-literal-looking string. Parse only literals; never eval provider
+        # content, and only accept the expected body/content shape.
+        try:
+            structured = ast.literal_eval(body)
+        except (SyntaxError, ValueError):
+            structured = None
+        if isinstance(structured, dict) and isinstance(structured.get("content"), str):
+            return structured["content"]
         return body
     preview = item.get("body_preview") or item.get("bodyPreview")
     return preview if isinstance(preview, str) else ""
@@ -127,6 +138,7 @@ def _backfill_provider_links(
 @router.get("/accounts/{account_id}/messages")
 def list_outlook_messages(
     account_id: int,
+    background_tasks: BackgroundTasks,
     user: Annotated[User, Depends(current_user)],
     db: Session = Depends(get_db),
     client: OutlookGraphClient = Depends(get_outlook_client),
@@ -166,6 +178,9 @@ def list_outlook_messages(
     except Exception:
         db.rollback()
         raise
+    for item in output:
+        if item["created"] is True:
+            background_tasks.add_task(schedule_message_overview, int(item["id"]))
     return {
         "messages": output,
         "total": len(output),

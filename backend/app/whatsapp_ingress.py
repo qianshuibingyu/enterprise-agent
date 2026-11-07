@@ -3,7 +3,7 @@
 from datetime import datetime
 from typing import Any
 
-from fastapi import APIRouter, Depends, Header, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, status
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app.external_events import ingest_external_event, verify_ingress_token
 from app.models.business import ChannelAccount
+from app.overview_service import schedule_message_overview
 
 router = APIRouter(prefix="/api/integrations/whatsapp", tags=["whatsapp-inbound"])
 
@@ -33,6 +34,7 @@ class WhatsAppInboundEvent(BaseModel):
 def receive_whatsapp_event(
     account_id: int,
     event: WhatsAppInboundEvent,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     ingress_token: str | None = Header(default=None, alias="X-WhatsApp-Adapter-Token"),
 ) -> dict[str, int | str | bool]:
@@ -62,6 +64,8 @@ def receive_whatsapp_event(
     except Exception:
         db.rollback()
         raise
+    if result.created:
+        background_tasks.add_task(schedule_message_overview, result.message.id)
     return {
         "accepted": True,
         "created": result.created,

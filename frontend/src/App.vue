@@ -25,9 +25,15 @@ const messages = ref<Message[]>([])
 const messagePage = ref(1)
 const messageHasMore = ref(false)
 const messageLoadingMore = ref(false)
+const canLoadMoreMessages = computed(() => messageHasMore.value && messages.value.length >= 20)
 const expandedMessageIds = ref<Set<number>>(new Set())
-const messageHandlingFilter = ref('')
+const fullMessageContentIds = ref<Set<number>>(new Set())
+const contentLoadingMessageIds = ref<Set<number>>(new Set())
+const messageContent = ref<Record<number, Awaited<ReturnType<typeof inboxApi.getMessageContent>>>>({})
+const messageHandlingFilter = ref('pending')
 const messageIngestionFilter = ref('')
+const archiveMessages = ref<Message[]>([])
+const archiveOpen = ref(false)
 const messageChannelAccountFilter = ref('')
 const inquiryStatusFilter = ref('')
 const inquiryHandlingFilter = ref('')
@@ -185,8 +191,85 @@ function toggleMessageExpanded(messageId: number) {
   expandedMessageIds.value = next
 }
 
+function messageContentFor(messageId: number) {
+  return messageContent.value[messageId]
+}
+
+function toggleFullMessageContent(messageId: number) {
+  const next = new Set(fullMessageContentIds.value)
+  if (next.has(messageId)) next.delete(messageId)
+  else next.add(messageId)
+  fullMessageContentIds.value = next
+}
+
+async function loadArchive() {
+  try {
+    const [processed, ignored] = await Promise.all([
+      inboxApi.getMessages(queryString({ handling_status: 'processed', page: '1', page_size: '100', sort: 'occurred_at', descending: 'true' })),
+      inboxApi.getMessages(queryString({ handling_status: 'ignored', page: '1', page_size: '100', sort: 'occurred_at', descending: 'true' })),
+    ])
+    archiveMessages.value = [...processed.items, ...ignored.items]
+      .sort((left, right) => Date.parse(right.occurred_at) - Date.parse(left.occurred_at))
+  } catch (cause) {
+    actionError.value = cause instanceof Error ? cause.message : '归档箱加载失败，请稍后重试。'
+  }
+}
+
+async function retryMessageOverview(messageId: number) {
+  handlingSubmitting.value = true
+  actionError.value = ''
+  try {
+    const csrf = await inboxApi.getCsrf()
+    await inboxApi.retryMessageOverview(messageId, csrf.csrf_token)
+    actionMessage.value = '中文概要已提交重新生成。'
+    await loadWorkspace()
+  } catch (cause) {
+    actionError.value = cause instanceof Error ? cause.message : '中文概要重试失败。'
+  } finally {
+    handlingSubmitting.value = false
+  }
+}
+
+async function restoreArchivedMessage(messageId: number) {
+  handlingSubmitting.value = true
+  actionError.value = ''
+  try {
+    const csrf = await inboxApi.getCsrf()
+    await inboxApi.restoreMessage(messageId, csrf.csrf_token)
+    actionMessage.value = '消息已恢复到待处理栏。'
+    await loadWorkspace()
+    await loadArchive()
+  } catch (cause) {
+    actionError.value = cause instanceof Error ? cause.message : '消息恢复失败。'
+  } finally {
+    handlingSubmitting.value = false
+  }
+}
+
+async function viewMessageContent(messageId: number) {
+  actionError.value = ''
+  const nextLoading = new Set(contentLoadingMessageIds.value)
+  nextLoading.add(messageId)
+  contentLoadingMessageIds.value = nextLoading
+  try {
+    messageContent.value = {
+      ...messageContent.value,
+      [messageId]: await inboxApi.getMessageContent(messageId),
+    }
+    const nextExpanded = new Set(expandedMessageIds.value)
+    nextExpanded.add(messageId)
+    expandedMessageIds.value = nextExpanded
+  } catch (cause) {
+    actionError.value = cause instanceof Error ? cause.message : '原文查看失败，请稍后重试。'
+  } finally {
+    const remaining = new Set(contentLoadingMessageIds.value)
+    remaining.delete(messageId)
+    contentLoadingMessageIds.value = remaining
+  }
+}
+
 async function loadMoreMessages() {
-  if (messageLoadingMore.value || !messageHasMore.value) return
+  if (messageLoadingMore.value || !canLoadMoreMessages.value) return
   messageLoadingMore.value = true
   actionError.value = ''
   try {
@@ -342,6 +425,10 @@ async function loadWorkspace() {
     messagePage.value = nextMessages.page
     messageHasMore.value = nextMessages.has_more
     expandedMessageIds.value = new Set()
+    fullMessageContentIds.value = new Set()
+    messageContent.value = {}
+    contentLoadingMessageIds.value = new Set()
+    if (archiveOpen.value) await loadArchive()
     inquiries.value = nextInquiries.items
     analysis.value = nextAnalysis
     transferTargets.value = nextTargets
@@ -913,11 +1000,29 @@ onMounted(() => {
               </select>
             </div>
           </div>
+          <div class="archive-toolbar">
+            <button class="secondary" type="button" @click="archiveOpen = !archiveOpen; archiveOpen ? loadArchive() : undefined">
+              {{ archiveOpen ? '收起归档箱' : '打开归档箱' }}
+            </button>
+            <span class="muted">已处理/已忽略消息不会出现在当前处理栏</span>
+          </div>
           <p v-if="actionMessage" class="inline-feedback success" role="status">{{ actionMessage }}</p>
           <p v-if="providerFallback" class="inline-feedback success">
             <a :href="providerFallback.url" target="_blank" rel="noopener noreferrer">{{ providerFallback.label }}</a>
           </p>
           <p v-if="actionError" class="inline-feedback error" role="alert">{{ actionError }}</p>
+          <section v-if="archiveOpen" class="archive-box">
+            <h3>统一归档箱</h3>
+            <p v-if="archiveMessages.length === 0" class="empty">当前没有已处理或已忽略消息。</p>
+            <article v-for="archived in archiveMessages" :key="archived.id" class="archive-row">
+              <div>
+                <strong>{{ messageContactLabel(archived) }}</strong>
+                <span>{{ handlingStatusLabel(archived.handling_status) }} · {{ formatTime(archived.occurred_at) }}</span>
+                <p v-if="archived.overview?.status === 'ready'">中文概要：{{ archived.overview.text }}</p>
+              </div>
+              <button class="secondary" type="button" :disabled="handlingSubmitting" @click="restoreArchivedMessage(archived.id)">恢复到待处理</button>
+            </article>
+          </section>
           <p v-if="messages.length === 0" class="empty">当前授权范围内没有符合条件的消息。</p>
           <div v-for="message in messages" :key="message.id" class="message-row">
             <div class="message-meta">
@@ -927,12 +1032,61 @@ onMounted(() => {
               <span class="meta-time">{{ formatTime(message.occurred_at) }}</span>
               <span class="state-label ingestion-state">入站：{{ ingestionStatusLabel(message.ingestion_status) }}</span>
               <span class="state-label">人工：{{ handlingStatusLabel(message.handling_status) }}</span>
+              <span v-if="message.overview?.status === 'pending'" class="state-label">中文概要：生成中</span>
+              <span v-else-if="message.overview?.status === 'failed'" class="status-warning">中文概要：规则摘录，非 AI 概要</span>
               <span v-if="accountStatus(message.channel_account_id) === 'blocked'" class="status-warning">渠道阻塞</span><span v-if="accountStatus(message.channel_account_id) === 'revoked'" class="status-warning">渠道已撤销</span>
             </div>
-            <p :class="{ 'message-preview': !expandedMessageIds.has(message.id) }">{{ expandedMessageIds.has(message.id) ? (message.display_text || '（无正文）') : (message.display_excerpt || '（无正文）') }}</p>
+            <template v-if="!expandedMessageIds.has(message.id)">
+              <p v-if="message.overview?.status === 'ready'" class="message-overview">中文概要：{{ message.overview.text }}</p>
+              <p v-else-if="message.overview?.status === 'failed'" class="message-overview fallback">规则摘录，非 AI 概要：{{ message.display_excerpt || '（无正文）' }}</p>
+              <p v-else class="message-preview">{{ message.display_excerpt || '（无正文）' }}</p>
+            </template>
+            <div v-else class="message-content-view">
+              <p v-if="messageContentFor(message.id)" class="message-original-preview">
+                <span class="content-label">安全原文预览</span>
+                {{ messageContentFor(message.id)?.preview_text || '（无正文）' }}
+              </p>
+              <p v-else class="message-preview">{{ message.display_excerpt || '（无正文）' }}</p>
+              <p v-if="messageContentFor(message.id)?.can_expand && fullMessageContentIds.has(message.id)" class="message-full-content">
+                {{ messageContentFor(message.id)?.full_text }}
+              </p>
+              <button
+                v-if="messageContentFor(message.id)?.can_expand"
+                class="link-button content-expand-link"
+                type="button"
+                @click="toggleFullMessageContent(message.id)"
+              >
+                {{ fullMessageContentIds.has(message.id) ? '收起全文' : '展示全文' }}
+              </button>
+              <p v-if="messageContentFor(message.id)" class="content-source-note">
+                <template v-if="messageContentFor(message.id)?.source.live_refetch">
+                  来源：已从 {{ messageContentFor(message.id)?.provider }} 回源并安全解析；未展示 provider 原始载荷
+                </template>
+                <template v-else>
+                  来源：数据库安全纯文本（provider 回源失败或不可用）；未展示 provider 原始载荷
+                </template>
+              </p>
+              <p v-if="messageContentFor(message.id) && !messageContentFor(message.id)?.source.live_refetch" class="content-refetch-warning" role="status">
+                原文回源失败或当前渠道不支持回源，已显示数据库安全文本。
+              </p>
+            </div>
             <div class="message-actions">
-              <button class="action-button action-secondary" type="button" @click="toggleMessageExpanded(message.id)">
-                {{ expandedMessageIds.has(message.id) ? '收起正文' : '展开正文' }}
+              <button
+                v-if="message.overview?.status === 'failed' || message.overview?.status === 'ready'"
+                class="action-button action-secondary"
+                type="button"
+                :disabled="handlingSubmitting"
+                @click="retryMessageOverview(message.id)"
+              >
+                重新生成中文概要
+              </button>
+              <button
+                class="action-button action-secondary"
+                type="button"
+                :disabled="contentLoadingMessageIds.has(message.id)"
+                @click="expandedMessageIds.has(message.id) ? toggleMessageExpanded(message.id) : viewMessageContent(message.id)"
+              >
+                {{ contentLoadingMessageIds.has(message.id) ? '正在读取…' : expandedMessageIds.has(message.id) ? '收起正文' : '查看原文' }}
               </button>
               <button
                 class="action-button action-primary"
@@ -961,10 +1115,10 @@ onMounted(() => {
               </button>
             </div>
           </div>
-          <div v-if="messageHasMore || messagePage > 1" class="pagination-bar">
+          <div v-if="canLoadMoreMessages || messagePage > 1" class="pagination-bar">
             <button v-if="messagePage > 1" class="secondary" type="button" :disabled="messageLoadingMore" @click="loadPreviousMessages">上一页</button>
             <span>第 {{ messagePage }} 页 · 每页 20 条</span>
-            <button class="secondary" type="button" :disabled="messageLoadingMore || !messageHasMore" @click="loadMoreMessages">下一页</button>
+            <button v-if="canLoadMoreMessages" class="secondary" type="button" :disabled="messageLoadingMore" @click="loadMoreMessages">下一页</button>
           </div>
         </div>
       </section>
@@ -1467,6 +1621,19 @@ button:focus-visible, select:focus-visible, .inquiry-row:focus-visible {
 .inline-feedback.error { color: #a12e25; background: #fff2f0; }
 .inline-feedback a { color: inherit; font-weight: 700; }
 .action-primary.is-opening { cursor: progress; opacity: .78; }
+.content-expand-link { margin-top: 6px; color: #165d68; font-size: 12px; font-weight: 700; }
+.message-original-preview { white-space: pre-wrap; }
+.message-full-content { white-space: pre-wrap; }
+.content-label { display: block; margin-bottom: 4px; color: #687782; font-size: 12px; font-weight: 700; }
+.content-source-note { color: #687782 !important; font-size: 11px !important; }
+.content-refetch-warning { color: #9a2f3b !important; font-size: 12px !important; }
+.message-overview { grid-column: 2; color: #165d68 !important; font-weight: 700; }
+.message-overview.fallback { color: #9a2f3b !important; font-weight: 500; }
+.archive-toolbar { display: flex; align-items: center; gap: 12px; margin: 12px 0; }
+.archive-box { margin: 12px 0 18px; padding: 14px; background: #f8fbfb; border: 1px solid #d7e5e7; border-radius: 6px; }
+.archive-box h3 { margin-bottom: 10px; }
+.archive-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 0; border-top: 1px solid #e3edef; }
+.archive-row span, .archive-row p { display: block; margin: 4px 0 0; color: #687782; font-size: 12px; }
 .connection-ready { color: #135c44; font-size: 13px; font-weight: 700; }
 @keyframes feedback-in {
   from { opacity: 0; transform: translateY(-3px); }

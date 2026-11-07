@@ -5,7 +5,8 @@ import makeWASocket, { DisconnectReason, useMultiFileAuthState, type WAMessage }
 import QRCode from "qrcode";
 import { DurableInbox, type InboundRecord } from "./durable-inbox.js";
 import { captureWhatsAppBatch } from "./event-handler.js";
-import { phoneFromWhatsAppJid, isLidJid } from "./whatsapp-message.js";
+import { createMessageCache, externalMessageIdForMessage, type MessageCache } from "./message-cache.js";
+import { phoneFromWhatsAppJid, isLidJid, messageContent } from "./whatsapp-message.js";
 
 type Metrics = {
   socketConnected: boolean;
@@ -43,6 +44,7 @@ type RuntimeState = {
   reconnectDelayMs: number;
   inFlight: Set<string>;
   generation: number;
+  messageCache: MessageCache;
 };
 
 const PORT = Number(process.env.PORT ?? "8090");
@@ -76,6 +78,56 @@ function accountId(request: Request): number {
 function externalId(state: any): string | undefined {
   const id = state?.creds?.me?.id;
   return typeof id === "string" && id.length > 0 ? id : undefined;
+}
+
+function parseExternalMessageId(value: string): { remoteJid: string; participant?: string; messageId: string } {
+  const messageSeparator = value.lastIndexOf(":");
+  const participantSeparator = value.lastIndexOf(":", messageSeparator - 1);
+  if (messageSeparator <= 0 || participantSeparator < 0) throw new Error("invalid WhatsApp message identity");
+  const remoteJid = value.slice(0, participantSeparator);
+  const participant = value.slice(participantSeparator + 1, messageSeparator);
+  const messageId = value.slice(messageSeparator + 1);
+  if (!remoteJid || !messageId) throw new Error("invalid WhatsApp message identity");
+  return { remoteJid, participant: participant || undefined, messageId };
+}
+
+function serializedProviderMessage(message: WAMessage) {
+  return {
+    external_message_id: externalMessageIdForMessage(message),
+    raw_content: messageContent(message),
+    customer_contact: phoneFromWhatsAppJid(message.key?.remoteJid) ?? null,
+    customer_nickname: typeof message.pushName === "string" ? message.pushName : null,
+  };
+}
+
+async function fetchProviderMessage(runtime: RuntimeState, externalMessageId: string): Promise<WAMessage> {
+  const cached = runtime.messageCache.get(externalMessageId);
+  if (cached) return cached;
+  const socket = runtime.socket as any;
+  if (!socket?.loadMessages) throw new Error("WhatsApp message history is unavailable");
+  const identity = parseExternalMessageId(externalMessageId);
+  // Baileys point queries are best-effort: try both fromMe variants before
+  // giving up, since the stored identity does not record the sender flag.
+  for (const fromMe of [false, true]) {
+    const messages = await socket.loadMessages(
+      identity.remoteJid,
+      1,
+      {
+        key: {
+          remoteJid: identity.remoteJid,
+          id: identity.messageId,
+          fromMe,
+          ...(identity.participant ? { participant: identity.participant } : {}),
+        },
+        messageTimestamp: 0,
+      },
+    );
+    const match = (messages as WAMessage[]).find(
+      (message) => externalMessageIdForMessage(message) === externalMessageId,
+    );
+    if (match) return match;
+  }
+  throw new Error("WhatsApp message was not found");
 }
 
 async function deliver(runtime: RuntimeState, record: InboundRecord): Promise<void> {
@@ -165,6 +217,7 @@ function startSocket(runtime: RuntimeState): void {
   runtime.socket = socket;
   socket.ev.on("creds.update", runtime.saveCreds);
   socket.ev.on("messages.upsert", ({ messages, type }) => {
+    runtime.messageCache.remember(messages);
     void captureBatch(runtime, messages, type).catch((error) => {
       runtime.error = error instanceof Error ? error.message : "WhatsApp event capture failed";
     });
@@ -251,6 +304,7 @@ async function createRuntime(channelAccountId: number): Promise<RuntimeState> {
     reconnectDelayMs: 1_000,
     inFlight: new Set(),
     generation: 0,
+    messageCache: createMessageCache(),
   };
   startSocket(runtime);
   void drainPending(runtime);
@@ -374,6 +428,28 @@ app.post("/internal/whatsapp/accounts/:channelAccountId/disconnect", async (requ
   }
 });
 
+app.get("/internal/whatsapp/accounts/:channelAccountId/messages/:messageId", async (request, response) => {
+  if (!requireToken(request, response)) return;
+  try {
+    const runtime = await getRuntime(accountId(request));
+    // Cached messages are served even when the session is down: the content
+    // contract only needs a consistent, sanitized snapshot, not a live socket.
+    const cached = runtime.messageCache.get(request.params.messageId);
+    if (cached) {
+      response.json(serializedProviderMessage(cached));
+      return;
+    }
+    if (!runtime.metrics.socketConnected) {
+      response.status(503).json({ detail: "WhatsApp session is not connected" });
+      return;
+    }
+    const message = await fetchProviderMessage(runtime, request.params.messageId);
+    runtime.messageCache.remember([message]);
+    response.json(serializedProviderMessage(message));
+  } catch (error) {
+    response.status(502).json({ detail: error instanceof Error ? error.message : "WhatsApp message fetch failed" });
+  }
+});
 app.post("/internal/whatsapp/accounts/:channelAccountId/lid-phone", async (request, response) => {
   if (!requireToken(request, response)) return;
   const lid = typeof request.body?.lid === "string" ? request.body.lid.trim() : "";

@@ -52,7 +52,27 @@ def test_whatsapp_adapter_status_preserves_qr(monkeypatch):
     assert result.expires_at == "2026-11-02T03:30:00.000Z"
 
 
-def test_whatsapp_adapter_classifies_bridge_unavailable_and_token_mismatch(monkeypatch):
+def test_whatsapp_adapter_fetch_message_contract(monkeypatch):
+    monkeypatch.setenv("WHATSAPP_ADAPTER_URL", "http://adapter.test")
+    monkeypatch.setenv("WHATSAPP_ADAPTER_TOKEN", "fixture-token")
+
+    def handler(request: httpx.Request):
+        assert request.method == "GET"
+        assert request.url.path == "/internal/whatsapp/accounts/7/messages/chat@s.whatsapp.net::msg-1"
+        assert request.headers["authorization"] == "Bearer fixture-token"
+        return httpx.Response(200, json={"raw_content": "provider message"})
+
+    client = HttpWhatsAppAdapterClient(
+        http=httpx.Client(transport=httpx.MockTransport(handler))
+    )
+    result = client.fetch_message(
+        channel_account_id=7,
+        message_id="chat@s.whatsapp.net::msg-1",
+    )
+
+    assert result["raw_content"] == "provider message"
+
+
     monkeypatch.setenv("WHATSAPP_ADAPTER_URL", "http://adapter.test")
     monkeypatch.setenv("WHATSAPP_ADAPTER_TOKEN", "fixture-token")
 

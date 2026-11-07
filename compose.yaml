@@ -59,6 +59,11 @@ services:
       OUTLOOK_SCOPES: ${OUTLOOK_SCOPES:-openid profile email offline_access User.Read Mail.Read}
       OUTLOOK_TIMEOUT_SECONDS: ${OUTLOOK_TIMEOUT_SECONDS:-20}
       OUTLOOK_CREDENTIAL_ENCRYPTION_KEY: ${OUTLOOK_CREDENTIAL_ENCRYPTION_KEY:-}
+      LLM_BASE_URL: ${LLM_BASE_URL:-}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:-}
+      LLM_TIMEOUT_SECONDS: ${LLM_TIMEOUT_SECONDS:-20}
+
 
   whatsapp-inbox-permissions:
     image: busybox:1.37.0

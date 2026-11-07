@@ -80,7 +80,7 @@ def content_view(value: Any) -> dict[str, object]:
     display_text = text[:MAX_DISPLAY_TEXT].rstrip()
     excerpt = display_text[:MAX_DISPLAY_EXCERPT].rstrip()
     if len(display_text) > MAX_DISPLAY_EXCERPT:
-        excerpt = excerpt.rstrip() + "…"
+        excerpt = display_text[: max(0, MAX_DISPLAY_EXCERPT - 1)].rstrip() + "…"
     return {
         "display_text": display_text,
         "display_excerpt": excerpt,
