@@ -276,3 +276,36 @@ def test_restore_refuses_to_reactivate_chain_with_unauthorized_sibling(client):
     with factory() as db:
         assert db.get(Inquiry, 3).handling_status == "ignored"
         assert db.get(Message, 4).handling_status == "ignored"
+
+
+def test_restore_rolls_back_every_write_on_commit_failure(client, monkeypatch):
+    from sqlalchemy.orm import Session
+
+    http, factory = client
+    headers = login(http)
+    ignored = http.post("/api/inquiries/1/action", json={"action": "ignored"}, headers=headers)
+    assert ignored.status_code == 200, ignored.text
+
+    original_commit = Session.commit
+
+    def fail_commit(self):
+        raise RuntimeError("fixture restore commit failure")
+
+    monkeypatch.setattr(Session, "commit", fail_commit)
+    response = http.post("/api/messages/1/archive/restore", headers=headers)
+    monkeypatch.setattr(Session, "commit", original_commit)
+    assert response.status_code == 500, response.text
+
+    with factory() as db:
+        assert db.get(Inquiry, 1).handling_status == "ignored"
+        assert db.get(Message, 1).handling_status == "ignored"
+        assert db.scalar(
+            select(func.count()).select_from(InquiryEvent).where(
+                InquiryEvent.event_type == "inquiry_reactivated"
+            )
+        ) == 0
+        assert db.scalar(
+            select(func.count()).select_from(OperationLog).where(
+                OperationLog.operation_name.in_(["恢复消息", "恢复链路"])
+            )
+        ) == 0
