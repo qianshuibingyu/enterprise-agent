@@ -4,9 +4,11 @@ import path from "node:path";
 import makeWASocket, { DisconnectReason, useMultiFileAuthState, type WAMessage } from "baileys";
 import QRCode from "qrcode";
 import { DurableInbox, type InboundRecord } from "./durable-inbox.js";
+import { MessageArchive, type ArchivedMessage } from "./message-archive.js";
 import { captureWhatsAppBatch } from "./event-handler.js";
 import { createMessageCache, externalMessageIdForMessage, type MessageCache } from "./message-cache.js";
 import { phoneFromWhatsAppJid, isLidJid, messageContent } from "./whatsapp-message.js";
+import { parseExternalMessageId } from "./message-identity.js";
 
 type Metrics = {
   socketConnected: boolean;
@@ -38,6 +40,7 @@ type RuntimeState = {
   error?: string;
   metrics: Metrics;
   inbox: DurableInbox;
+  messageArchive: MessageArchive;
   retryTimer?: NodeJS.Timeout;
   retryDelayMs: number;
   reconnectTimer?: NodeJS.Timeout;
@@ -80,23 +83,34 @@ function externalId(state: any): string | undefined {
   return typeof id === "string" && id.length > 0 ? id : undefined;
 }
 
-function parseExternalMessageId(value: string): { remoteJid: string; participant?: string; messageId: string } {
-  const messageSeparator = value.lastIndexOf(":");
-  const participantSeparator = value.lastIndexOf(":", messageSeparator - 1);
-  if (messageSeparator <= 0 || participantSeparator < 0) throw new Error("invalid WhatsApp message identity");
-  const remoteJid = value.slice(0, participantSeparator);
-  const participant = value.slice(participantSeparator + 1, messageSeparator);
-  const messageId = value.slice(messageSeparator + 1);
-  if (!remoteJid || !messageId) throw new Error("invalid WhatsApp message identity");
-  return { remoteJid, participant: participant || undefined, messageId };
-}
-
 function serializedProviderMessage(message: WAMessage) {
   return {
     external_message_id: externalMessageIdForMessage(message),
     raw_content: messageContent(message),
     customer_contact: phoneFromWhatsAppJid(message.key?.remoteJid) ?? null,
     customer_nickname: typeof message.pushName === "string" ? message.pushName : null,
+  };
+}
+
+/** Convert a provider message into the minimal durable snapshot stored on disk. */
+function archivedMessage(message: WAMessage): ArchivedMessage | undefined {
+  const snapshot = serializedProviderMessage(message);
+  if (!snapshot.external_message_id) return undefined;
+  return {
+    external_message_id: snapshot.external_message_id,
+    raw_content: snapshot.raw_content,
+    customer_contact: snapshot.customer_contact,
+    customer_nickname: snapshot.customer_nickname,
+    archived_at: new Date().toISOString(),
+  };
+}
+
+function archivedSnapshotMessage(record: ArchivedMessage) {
+  return {
+    external_message_id: record.external_message_id,
+    raw_content: record.raw_content,
+    customer_contact: record.customer_contact,
+    customer_nickname: record.customer_nickname,
   };
 }
 
@@ -218,6 +232,14 @@ function startSocket(runtime: RuntimeState): void {
   socket.ev.on("creds.update", runtime.saveCreds);
   socket.ev.on("messages.upsert", ({ messages, type }) => {
     runtime.messageCache.remember(messages);
+    // Persist the sanitized snapshot at capture time. The in-memory cache is
+    // lost on restart and the durable inbox drops bodies after delivery, so
+    // this archive is what keeps the refetch chain reproducible.
+    void runtime.messageArchive.remember(
+      messages.map(archivedMessage).filter((value): value is ArchivedMessage => value !== undefined),
+    ).catch((error) => {
+      runtime.error = error instanceof Error ? error.message : "WhatsApp message archive failed";
+    });
     void captureBatch(runtime, messages, type).catch((error) => {
       runtime.error = error instanceof Error ? error.message : "WhatsApp event capture failed";
     });
@@ -279,6 +301,10 @@ async function createRuntime(channelAccountId: number): Promise<RuntimeState> {
   await mkdir(authPath, { recursive: true, mode: 0o700 });
   const auth = await useMultiFileAuthState(authPath);
   const inbox = await DurableInbox.open(inboxPath, INBOX_KEY);
+  const messageArchive = await MessageArchive.open(
+    path.join(INBOX_ROOT, `${channelAccountId}.messages`),
+    INBOX_KEY,
+  );
   const pending = inbox.pending();
   const runtime: RuntimeState = {
     channelAccountId,
@@ -300,6 +326,7 @@ async function createRuntime(channelAccountId: number): Promise<RuntimeState> {
       recoveryWindowEnd: pending.length ? new Date().toISOString() : undefined,
     },
     inbox,
+    messageArchive,
     retryDelayMs: 1_000,
     reconnectDelayMs: 1_000,
     inFlight: new Set(),
@@ -432,11 +459,16 @@ app.get("/internal/whatsapp/accounts/:channelAccountId/messages/:messageId", asy
   if (!requireToken(request, response)) return;
   try {
     const runtime = await getRuntime(accountId(request));
-    // Cached messages are served even when the session is down: the content
-    // contract only needs a consistent, sanitized snapshot, not a live socket.
+    // Memory cache, then the durable archive: both work while the session is
+    // down, so a restart no longer makes historical originals unrefetchable.
     const cached = runtime.messageCache.get(request.params.messageId);
     if (cached) {
       response.json(serializedProviderMessage(cached));
+      return;
+    }
+    const archived = runtime.messageArchive.get(request.params.messageId);
+    if (archived) {
+      response.json(archivedSnapshotMessage(archived));
       return;
     }
     if (!runtime.metrics.socketConnected) {
@@ -445,6 +477,8 @@ app.get("/internal/whatsapp/accounts/:channelAccountId/messages/:messageId", asy
     }
     const message = await fetchProviderMessage(runtime, request.params.messageId);
     runtime.messageCache.remember([message]);
+    const snapshot = archivedMessage(message);
+    if (snapshot) await runtime.messageArchive.remember([snapshot]).catch(() => undefined);
     response.json(serializedProviderMessage(message));
   } catch (error) {
     response.status(502).json({ detail: error instanceof Error ? error.message : "WhatsApp message fetch failed" });

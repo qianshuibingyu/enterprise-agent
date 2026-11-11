@@ -34,6 +34,11 @@ class OAuthStateStore:
             return None
         return self._consume_valid(value, state)
 
+    def invalidate_account(self, channel_account_id: int) -> None:
+        for value, state in list(self._states.items()):
+            if state.channel_account_id == channel_account_id:
+                self._states.pop(value, None)
+
     def validate_any(self, value: str) -> OAuthState | None:
         state = self._states.get(value)
         if state is None:

@@ -226,7 +226,7 @@ def ensure_message_overview(
     return overview
 
 
-def schedule_message_overview(message_id: int) -> None:
+def schedule_message_overview(message_id: int, *, actor_user_id: int | None = None) -> None:
     """Run one process-local task with a fresh DB session.
 
     The caller is responsible for scheduling this function after the ingest
@@ -234,13 +234,31 @@ def schedule_message_overview(message_id: int) -> None:
     the overview contract.
     """
     from app.database import SessionLocal
-    from app.models.business import Message as MessageModel
+    from app.models.business import Message as MessageModel, OperationLog
+    from app.models.user import User
 
     db = SessionLocal()
     try:
         message = db.get(MessageModel, message_id)
         if message is not None:
             ensure_message_overview(db, message)
+            if actor_user_id is not None and message.overview is not None:
+                actor = db.get(User, actor_user_id)
+                if actor is not None:
+                    result = (
+                        "success" if message.overview.status == "ready"
+                        else "timeout" if message.overview.failure_code == "timeout"
+                        else "failure"
+                    )
+                    db.add(OperationLog(
+                        actor_user_id=actor.id,
+                        actor_name=actor.username,
+                        operation_name="生成中文概要",
+                        object_type="message",
+                        object_id=message.id,
+                        result=result,
+                        detail=None if result == "success" else "生成超时" if result == "timeout" else "概要生成失败",
+                    ))
             db.commit()
     except Exception:
         db.rollback()

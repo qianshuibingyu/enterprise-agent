@@ -381,7 +381,7 @@ Warning：
 
 ## 9. Day 8 最终状态表达
 
-> Day 8 已完成授权安全正文查看、Gmail/Outlook/WhatsApp 回源代码、安全失败回退、前端正文交互、中文概要代码和真实入站展示闭环、真实 LLM 连通性、内存资料清洗/确定性切片和未来向量方案记录。用户提供的目标环境输出证明 backend 192 passed、frontend 8 passed 和 frontend build passed；目标数据库已升级到 `0012_message_overviews` 并完成 schema/health 核验。安全纯文本展示、回源成功路径和中文概要成功路径已有实际证据；LLM/provider 失败现场演练和新入站写入前统一安全纯文本持久化仍属于后续边界。资料库、持久化 chunk、embedding、pgvector、检索和 RAG 尚未实现，不能将 fake 或内存结果表述为生产 RAG。
+> Day 8 handoff 记录了授权安全正文查看、三渠道回源代码、安全失败回退、前端正文交互、中文概要代码、真实 LLM 连通性及内存资料清洗/切片等结果；当时用户提供 backend 192 passed、frontend 8 passed/build passed 和目标库 0012 的证据，仅适用于该记录时点。后续源码增量见 §11.5，当前工作区测试/构建与 0014–0017 目标 schema 未在本轮验证。资料库、持久化 chunk、embedding、pgvector、检索和 RAG 尚未形成实现。
 
 ## 10. PROJECT_SPEC 十天路线完成情况
 
@@ -413,3 +413,117 @@ Warning：
 7. Day 9 只读 AI 的查询对象、字段和页面入口。
 
 在这些边界确认前，可以继续做只读盘点和测试设计，但不应把 Day 9 标记为已完成，也不应直接实现不可逆的静默/恢复规则。
+
+## 11. Day 8–Day 9 当前代码事实与交接清单
+
+本节是 Day 9 起点的只读核对摘要。它区分代码结构、仓库测试源码、交接文档记载的目标环境证据和待确认业务规则；不把计划或测试源码本身表述为本轮执行结果。
+
+### 11.1 当前代码事实
+
+| 范围 | 当前事实 | 证据边界 |
+|---|---|---|
+| Inquiry | 有客户联系方式/身份状态、原始消息、来源账号、业务状态 `new/assigned`、人工处理状态 `pending/processed/ignored`、可空 `business_type`（`inquiry/after_sales`）、销售负责人、`last_activity_at`；关联附件、通知、事件及消息关联。 | `backend/app/models/business.py`；business_type 来自 `0014`，消息关系来自 `0013`。类型字段存在不代表分类政策完整或静默状态机完成。 |
+| InquiryEvent | 保存询盘事件类型、操作者、变更前后状态、目标用户、可选关联 Message 和发生时间；源码事件类型包括创建、转交、处理、忽略、恢复、消息关联和人工关联。 | `backend/app/models/business.py`。没有独立静默期限字段；恢复事件不等同于已实现完整售后静默策略。 |
+| Message | 有账号/provider/外部消息 ID、方向、接入状态、人工处理状态、发生时间、内容、客户/规范化身份、provider 链接、官网表单标记、`test_only`、归链状态和时间戳；关联附件、一对一 overview 及可选 InquiryMessage。 | `backend/app/models/business.py`；官网表单标记由 `0015` 加入，关联由 `0013` 加入。模型定义不代表附件正文存储已实现。 |
+| MessageOverview | 与 Message 一对一；状态为 `pending/ready/failed`，保存概要文本、失败码、重试次数、provider/model/prompt 元数据、`test_only` 和生成/更新时间。 | `backend/app/models/overview.py`。概要状态不是询盘或售后状态。 |
+| 人工处理与归档箱 | Message 和 Inquiry 的人工处理状态为 `pending/processed/ignored`。Message 的 `POST /api/messages/{id}/archive/restore` 仅把 `processed/ignored` 改回 `pending`。前端归档箱根据处理状态筛选。 | `backend/app/business_routes.py`、`frontend/src/App.vue`。没有独立 archive 字段/实体/生命周期；这不是售后静默/恢复状态机。 |
+| 转交 | Inquiry 转交会更新负责人/业务状态，并写内部通知和 `inquiry_transferred` 事件；当前业务服务要求指定业务类型。 | `backend/app/business_service.py`、`backend/app/business_routes.py`。与消息关系/后续消息可见性分别按关联和授权规则处理，完整通知收件箱仍未实现。 |
+| 只读分析 | `POST /api/internal-analysis` 的 `operation=read` 在授权范围内汇总 Inquiry 生命周期/处理状态、Message 归链/身份状态、候选人工判断、可见事件和渠道阻塞；非 read 操作返回指引而不执行写操作。 | `backend/app/business_routes.py`、`backend/app/authorization.py`、`frontend/src/api/inbox.ts`、`frontend/src/App.vue`。属于确定性只读汇总，不代表完整 BI/LLM 对话或售后静默状态机。 |
+| Day 8 正文/Provider | 已实现授权安全正文查看及 Gmail、Outlook、WhatsApp 回源代码与安全回退。 | 本记录第 2–3 节：Gmail/Outlook 有用户提供的目标环境浏览器成功证据；WhatsApp 有代码/隔离测试证据，但没有目标浏览器成功证据。 |
+
+### 11.2 模型 / API / 前端 / 迁移缺口矩阵
+
+| 层 | 当前已具备 | Day 9 缺口 |
+|---|---|---|
+| 模型 | Inquiry（含可空 `business_type`/`last_activity_at`/身份字段）、InquiryEvent、InquiryMessage、Message（含 link/identity/website-form 字段）、MessageOverview、通知、OperationLog、人工处理状态。 | 售后静默专属状态/期限/新消息策略；独立归档实体；完整审计 lifecycle。 |
+| API | Inquiry/Message 列表详情、人工处理、Inquiry 转交/处理/恢复、概要读/重试、消息候选归链与人工关联、内容回源、授权范围只读分析及操作记录读取。 | 正式类型判定政策/修订、售后静默期限及期间新消息策略、提醒/实际归档清理调度；Message restore 仍为处理状态恢复，不等同完整售后恢复状态机。 |
+| 授权 | 账号授权范围、Inquiry 分配范围；关联候选/写入分别校验 inquiry、message 来源账号及关联消息 scope，详情按可见关联消息裁剪。 | 管理员完整全域权限矩阵、部门/经理 RBAC 与所有生产账号配置/浏览器行为仍待完整验证。 |
+| 前端 | 收件箱/处理箱、客户链路/逐条关联消息、待判断候选人工关联、概要/原文、状态动作、转交、授权范围只读分析及操作记录面板。 | 完整询盘/售后分类政策交互、静默/提醒工作流、全角色浏览器联调；当前工作区前端测试/build 未在本轮执行。 |
+| 迁移 | 当前工作区迁移链为 `0001`–`0017`：含 `0012_message_overviews`、`0013_inquiry_messages`、`0014_inquiry_business_type`、`0015_website_form_messages`、`0016_operation_logs`、`0017_message_feed_indexes`。 | 迁移源码存在不等于目标 PostgreSQL 已应用；0014–0017 的目标环境 revision/schema 本轮未核验。迁移测试源码也不替代在线数据库验证。 |
+| 测试 | 当前有业务授权、Inquiry—Message links/routes、身份规范化/人工确认、内容安全、渠道回源、概要、迁移等测试源码。 | 测试源码存在不代表通过；当前工作区未运行回归。本记录第 7 节 Day 8 数字仅为用户当时提供的历史输出，不能覆盖后续代码。 |
+
+### 11.3 Day 9 业务规则确认清单
+
+开始实现 Day 9 状态/归链行为前，需确认并形成可测试的业务合同：
+
+- [ ] **询盘/售后分类**：判定来源、判断依据、自动/人工边界、修改权限及纠错流程。
+- [ ] **业务状态集合**：询盘和售后各自的状态、合法迁移、完成/关闭定义，以及是否共享状态。
+- [ ] **消息归链规则**：Inquiry 与 Message 的基数、匹配依据、人工纠错方式、重复/冲突处理和未能匹配时的待处理策略。
+- [ ] **售后静默期**：时长、起算事件/时间、是否按业务类型或渠道区分、延长规则。
+- [ ] **静默期间新消息**：延长静默、重新激活、追加链路、生成待办或其他策略；需要明确去重与优先级。
+- [ ] **恢复条件与授权**：自动/人工恢复条件、可操作角色、是否需要原因及审计要求。
+- [ ] **处理终态关系**：`processed`/`ignored` 与归档、售后静默、业务关闭之间的定义；关闭后新消息是否重开。
+- [ ] **转交后的可见性**：原负责人、当前负责人和运营角色对 Inquiry 及后续关联 Message 的读取/操作权限。
+- [ ] **提醒/调度**：是否需要静默到期或超时提醒；接收人、频率、抑制、失败重试、取消和进程/部署恢复要求。
+- [ ] **只读工作台范围**：查询对象、过滤条件、聚合指标、链路历史、test-only 数据处理口径及权限边界。
+- [ ] **数据治理**：审计保留、客户隐私、删除/纠错语义，以及历史 Inquiry/Message 的分类和关联回填规则。
+
+### 11.4 不可直接实现的风险
+
+| 未确认项 | 直接实现的风险 |
+|---|---|
+| 分类规则/状态集合 | 把售后误判为询盘、过早关闭业务，或造成后续状态迁移不兼容。 |
+| 消息归链与授权 | 错误合并不同客户/会话；关联错误可能扩大可见范围，造成跨用户数据泄露。 |
+| 静默时长/期间新消息策略 | 漏掉客户新消息、过早重开、重复提醒或长期隐藏待办。 |
+| 恢复条件/权限 | 无权用户解除静默，或业务无法及时恢复；自动与人工操作可能互相覆盖。 |
+| `processed`/`ignored` 语义 | 把人工处理误当售后完成/静默，或阻止后续消息重开。 |
+| 转交后可见性 | 源码已有 Inquiry—Message 关联并按消息来源账号 scope 裁剪；仍须以最新测试和角色浏览器验收确认，不应只凭 Inquiry 负责人推断所有关联消息均可见。 |
+| 归档含义 | 把现有 restore 按钮误用为正式归档流程，遗漏状态生命周期、审计和恢复策略。 |
+| 提醒调度 | 将 overview 进程内后台任务当可靠调度器，可能在重启后丢任务、重复提醒或无法取消。 |
+| 分析口径 | 在业务分类、静默和 test-only 口径未定义时呈现误导性指标，或越过授权边界。 |
+| 历史数据迁移 | 缺少分类/关联回填和回滚策略会造成错误归链、不可逆数据变更或部署不兼容。 |
+
+**交接结论：**可继续进行规则确认、状态/关系建模和测试设计；确认前不应把 Day 9 标为完成，也不应将 `processed/ignored`、归档按钮、转交记录或 handoff 计划表称为售后状态机。Day 8 目标数据库、测试和 provider 证据仍按本记录前文的证据来源和边界表述；本节不构成新的目标环境验证。
+
+### 11.5 归链与只读工作台实现状态（历史增量；本次文档同步时未执行验证）
+
+工作区已有 Inquiry—Message 关联、身份规范化和确定性只读工作台实现；以下描述记录该增量代码合同，不代表后续所有改动或当前工作区的测试、构建、部署及目标环境验证已通过。
+
+- `InquiryMessage` 关联表以 `(inquiry_id, message_id)` 为主键，另有 `message_id` 唯一约束和 Inquiry 内 position 唯一约束；关联行不存正文、概要或凭据。
+- 确定性只读分析聚合 Inquiry 状态/处理状态/lifecycle、Message link_state/contact identity state、授权内未关联/待人工判断列表、最近可见事件和渠道阻塞；写意图仅返回页面指引，响应标记 `mutation_performed=false`、`write_operations_performed=0`。
+- Admin 没有隐式全域穿透；只读查询和列表沿用账号 grant/Inquiry assignment 过滤。Blocked 账号按现有授权 scope 保持可见并标阻塞；revoked 消息排除。未关联列表不输出联系方式、正文或概要。
+- 入站候选按规范化邮箱精确相等跨 Gmail/Outlook 匹配；WhatsApp 只认合法个人 `@s.whatsapp.net` 手机号，不与邮箱合并。身份不支持时不归链。
+- 一个唯一候选可续接；多候选保持 Message 未关联并写 `manual_review`；无候选建新 Inquiry；重放未关联消息会重新评估，不改写已存正文。
+- `messages.link_state` 的计划状态为 `pending`、`linked`、`unmatched`、`manual_review`、`not_linkable`。候选查询是只读的；运营从候选入口显式选择后才写关联，并在 Inquiry 时间线记录 `inquiry_message_linked`。
+- 候选查询按当前用户授权过滤；写关联时必须分别授权目标 Inquiry、源 Message 及目标 Inquiry 中已有的全部来源账号。跨账号 Gmail/Outlook 同邮箱仅在操作者具备两端权限时允许；任何用户不能通过候选响应探测无权 Inquiry。
+- Inquiry 详情按关联顺序逐条返回各自 provider、external message ID、正文安全视图、附件 metadata 和各自 overview；不聚合或覆盖 Message 原始数据。
+- 测试源码覆盖唯一/多候选、错误身份、跨账号、越权、重复链接、事件/事务回滚及删除 Inquiry 时保留独立 Message/Overview；只读工作台测试源码比较请求前后业务表快照并覆盖 roles/scope/operation guidance。**这些测试本轮未运行；前端测试/build 也未运行。**
+- 截至该增量，migration `0013_inquiry_messages.py` 曾记为源码草案；这不是当前工作区 head。当前代码迁移链继续包含 `0014_inquiry_business_type`、`0015_website_form_messages`、`0016_operation_logs` 和 `0017_message_feed_indexes`，head 为 `0017_message_feed_indexes`。本轮未核验目标 PostgreSQL 是否应用 0014–0017；须由用户提供最新在线 revision/schema 输出，不能沿用 0013 的历史目标库证据推定后续已应用。
+
+**归链规则已确认并纳入当前实现草案：**邮箱匹配保存 raw 与 normalized 两值；normalized 邮箱仅 trim、取 display name 中地址部分、casefold，不折叠 `+tag`、点号或供应商别名。WhatsApp 手机号码使用 `phonenumbers` 规范化为 E.164；没有明确国际码或号码无效时保留人工核验，不猜国家码。WhatsApp 只按个人手机号身份匹配，LID/群组/未知 JID 不自动合并邮箱/手机号。
+
+转发邮件优先使用 provider 可靠原始发件人头。Gmail 当前读取 `X-Original-From` / `Resent-From`，Outlook 当前读取 Graph `originalSender`；provider 明确标记转发但没有可信 original sender 时标 `identity_uncertain`，消息留在待人工判断，不自动归链。raw 联系人仍保留实际 sender，original sender 单独保存；本轮未实现修改 provider 扩展权限或读取真实 provider。
+
+**人工关联合同：**运营/管理员必须同时有权访问目标 Inquiry 和 Message 来源账号；sales 不能跨授权范围人工关联。成功关联记 `manual_link` 事件，含 actor、Inquiry、message_id、原/新处理状态和时间；关联不改变 Inquiry 处理状态，不恢复静默、不发送客户消息。普通关联 API 拒绝身份不确定/转发记录；别名映射或身份确认专用流程尚未实现，不能用现有关联按钮绕过。
+
+**授权可见性：**继续按关联消息逐条执行当前 Message scope；被撤权消息及其正文、概要、附件、联系方式、渠道和时间细节不序列化。Inquiry 仅在当前用户至少有一条可见关联消息时可见；候选查询只返回当前可见 Inquiry。关联撤权不删除 Inquiry 或仍有效的关联边。
+
+**当前限制/验收边界：**migration 0013 已扩展 normalized/raw sender/identity state、`Message.link_state` 及 InquiryEvent `message_id` 外键；旧记录默认 needs_manual_review 且不回填，不据历史 raw 字符串推断身份。新增 `phonenumbers` 依赖已纳入代码，但运行环境安装/部署状态需以用户环境为准。候选冲突使用现有 Inbox 留待人工选择，尚无独立待办模型；别名映射、身份确认动作、通知队列未实现。目标 PostgreSQL 专项约束核验已由用户于 2026-11-10 提供 SQL 输出并确认 revision/schema/主要约束；浏览器角色/工作台联调和联调账号/渠道授权配置仍待补。
+
+**Day 9 自动化验证记录（用户于 2026-11-09 提供的命令输出；后续代码改动后需重跑）：**
+
+```text
+后端定向：pytest -q tests/test_business_authorization.py tests/test_inquiry_message_links.py tests/test_inquiry_link_routes.py tests/test_contact_identity.py tests/test_migrations.py
+75 passed, 2 warnings in 39.24s
+
+后端全量：pytest -q
+214 passed, 2 warnings in 45.85s
+
+前端单测：npm run test:unit
+8 passed, 0 failed
+
+前端构建：npm run build
+vite build 成功（18 modules transformed）
+```
+
+该输出是用户提供的实际执行结果，不是本轮助手执行。记录的 warning 为 Starlette/httpx `TestClient` 弃用提示，以及 Alembic `path_separator` 配置弃用提示。用户同时确认目标数据库当时 revision 已到 `0013_inquiry_messages`；此为历史时点事实，不证明当前库已应用 0014–0017，也不能代替后续目标库在线核验。
+
+**Day 9 相关源码增量（关联、身份、只读工作台及后续字段/索引）已进入当前工作区；历史自动化回归早于后续改动，当前工作区版本回归待重跑。目标 PostgreSQL 的历史专项核验截至 0013；0014–0017 和当前 schema 未核验。浏览器角色/工作台联调待补。不得写成 Day 9 或整体全部验收完成。**
+
+目标 PostgreSQL 核验记录（用户于 2026-11-10 提供）：`alembic_version=0013_inquiry_messages`；`inquiries`、`inquiry_events`、`inquiry_messages`、`message_overviews`、`messages` 表均存在；身份列、`link_state`、`inquiry_events.message_id` 和关联表约束/外键与 0013 设计相符。该核验是用户在目标服务器执行的只读 SQL 输出，不代表本助手连接或执行 migration；数据级重复/孤儿行、级联删除实测和浏览器权限行为仍待验收。
+
+用户于 2026-11-09 提供过后端定向 75 passed、后端全量 214 passed、前端 8 passed、build 成功；这些结果早于之后的身份规范化、撤权部分视图和只读工作台改动，不能作为当前工作区回归通过证据。当前工作区需由用户重跑后端定向/全量、前端测试/build。联调账号及渠道授权映射尚未配置；待配置后需完成运营、sales、admin、跨账号、revoked/blocked、空范围、manual_review、只读不变更的浏览器角色联调。
+
+**工作台只读边界/业务口径：**指标与列表均先使用当前用户 scoped Inquiry/Message/ChannelAccount 查询；sales pending message count 是其已分配 Inquiry 下当前可见的关联 Message 行数，不能和 Inquiry 数混为一谈。`pending_contact_count` 只按 identity_state=certain 的 normalized 联系人分组；未确认身份不计入联系人组但可进入人工核验列表。`unlinked_messages` 限于可见、入站、pending、未关联且 link_state=unmatched 的最近 100 条；manual_review 和 identity_uncertain 独立列出最多 100 条。最近事件只从 `_visible_inquiry_events` 取当前可见事件；blocked account 可见并标异常，revoked account 消息不进入结果。Read 响应标记未执行写操作；create/update/delete/assign/send 返回 guidance。测试源码断言 read/guidance 前后业务表快照相同，但本轮未运行测试，不能表述为已通过。
+
+提醒调度、真实 provider/出站和备份恢复仍按各自范围待验收，不由以上代码状态推定完成。

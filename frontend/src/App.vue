@@ -1,12 +1,15 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, nextTick, onMounted, ref } from 'vue'
 import {
   ApiError,
   inboxApi,
   type ChannelAccount,
   type Inquiry,
+  type InquiryLinkCandidates,
   type InternalAnalysis,
   type Message,
+  type OperationLog,
+  type RefetchCheck,
   type TransferTarget,
 } from './api/inbox'
 import { channelsApi } from './api/channels'
@@ -20,6 +23,9 @@ import {
   type FakeChannel,
 } from './channelCenter'
 
+type MessageContent = Awaited<ReturnType<typeof inboxApi.getMessageContent>>
+const INQUIRY_PAGE_SIZE = 12
+
 const accounts = ref<ChannelAccount[]>([])
 const messages = ref<Message[]>([])
 const messagePage = ref(1)
@@ -28,21 +34,40 @@ const messageLoadingMore = ref(false)
 const canLoadMoreMessages = computed(() => messageHasMore.value && messages.value.length >= 20)
 const expandedMessageIds = ref<Set<number>>(new Set())
 const fullMessageContentIds = ref<Set<number>>(new Set())
+const collapsedGroupKeys = ref<Set<string>>(new Set())
 const contentLoadingMessageIds = ref<Set<number>>(new Set())
-const messageContent = ref<Record<number, Awaited<ReturnType<typeof inboxApi.getMessageContent>>>>({})
+const messageContent = ref<Record<number, MessageContent>>({})
 const messageHandlingFilter = ref('pending')
 const messageIngestionFilter = ref('')
-const archiveMessages = ref<Message[]>([])
+const messageAssignmentFilter = ref('all')
+const processedMessages = ref<Message[]>([])
+const ignoredMessages = ref<Message[]>([])
+const processedBoxOpen = ref(false)
 const archiveOpen = ref(false)
+const actionToast = ref<{ text: string; kind: 'processed' | 'ignored' } | null>(null)
+let actionToastTimer: number | undefined
+const messageFeedback = ref<Record<number, { text: string; kind: 'success' | 'error' }>>({})
+const messageFeedbackTimers = new Map<number, number>()
+const operationLogOpen = ref(false)
+const operationLogs = ref<OperationLog[]>([])
+const operationLogLoading = ref(false)
+const operationLogInquiryId = ref<number | null>(null)
 const messageChannelAccountFilter = ref('')
 const inquiryStatusFilter = ref('')
 const inquiryHandlingFilter = ref('')
 const filterLoading = ref(false)
 const inquiries = ref<Inquiry[]>([])
+const workspaceView = ref<'messages' | 'review' | 'customers' | 'customerMessages'>('messages')
+const inquiryPage = ref(1)
+const inquiryHasMore = ref(false)
+const inquiryTotalCount = ref(0)
+const inquiryTotalPages = computed(() => Math.max(1, Math.ceil(inquiryTotalCount.value / INQUIRY_PAGE_SIZE)))
 const analysis = ref<InternalAnalysis | null>(null)
 const transferTargets = ref<TransferTarget[]>([])
 const selectedInquiryId = ref<number | null>(null)
 const selectedSalesUserId = ref<number | null>(null)
+const selectedBusinessType = ref<'inquiry' | 'after_sales' | null>(null)
+const selectedMessageId = ref<number | null>(null)
 const loading = ref(true)
 const transferSubmitting = ref(false)
 const outlookReading = ref(false)
@@ -57,6 +82,11 @@ const actionError = ref('')
 const handlingSubmitting = ref(false)
 const providerOpeningMessageId = ref<number | null>(null)
 const providerFallback = ref<{ label: string; url: string } | null>(null)
+const linkReviewMessageId = ref<number | null>(null)
+const linkReviewCandidates = ref<InquiryLinkCandidates | null>(null)
+const linkReviewLoading = ref(false)
+const linkReviewError = ref('')
+let linkReviewRequestId = 0
 const unauthorized = ref(false)
 const unauthorizedStatus = ref<401 | 403 | null>(null)
 const gmailMessage = ref('')
@@ -68,6 +98,8 @@ const whatsappQrExpiresAt = ref('')
 const profileOpen = ref(false)
 const currentUser = ref<{ username: string; role: string } | null>(null)
 const logoutError = ref('')
+const refetchChecks = ref<Record<number, RefetchCheck>>({})
+const refetchCheckingAccountIds = ref<Set<number>>(new Set())
 let whatsappPollTimer: number | undefined
 
 const channelDetails: Record<ChannelType, { name: string; provider: string; description: string; next: string }> = {
@@ -166,6 +198,70 @@ async function disconnectChannel(channelType: ChannelType) {
 const selectedInquiry = computed(() =>
   inquiries.value.find((inquiry) => inquiry.id === selectedInquiryId.value) ?? null,
 )
+const linkReviewMessage = computed(() => messages.value.find((message) => message.id === linkReviewMessageId.value) ?? null)
+const selectedInquiryIndex = computed(() => inquiries.value.findIndex((item) => item.id === selectedInquiryId.value))
+const isInquiryView = computed(() => workspaceView.value === 'review' || workspaceView.value === 'customers')
+
+async function switchWorkspaceView(view: 'messages' | 'review' | 'customers' | 'customerMessages') {
+  workspaceView.value = view
+  inquiryPage.value = 1
+  inquiryHandlingFilter.value = view === 'review' ? 'pending' : ''
+  selectedMessageId.value = null
+  if (view === 'messages' || view === 'customerMessages') {
+    messageAssignmentFilter.value = view === 'customerMessages' ? 'assigned' : 'all'
+    messageHandlingFilter.value = 'pending'
+    messageIngestionFilter.value = ''
+    messageChannelAccountFilter.value = ''
+  }
+  selectedInquiryId.value = null
+  await loadWorkspace()
+}
+
+async function openCustomerMessage(messageId: number) {
+  await switchWorkspaceView('customerMessages')
+  try {
+    const message = await inboxApi.getMessage(messageId)
+    if (!messages.value.some((item) => item.id === messageId)) messages.value = [message, ...messages.value]
+    const groupKey = messageGroupKey(message)
+    const expandedGroups = new Set(collapsedGroupKeys.value)
+    expandedGroups.delete(groupKey)
+    collapsedGroupKeys.value = expandedGroups
+    selectedMessageId.value = messageId
+    await nextTick()
+    document.getElementById(`message-${messageId}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+  } catch (cause) {
+    actionError.value = cause instanceof Error ? cause.message : '客户消息加载失败。'
+  }
+}
+
+async function goToInquiryPage(page: number, preferredIndex?: number) {
+  const targetPage = Math.max(1, Math.min(page, inquiryTotalPages.value))
+  if (targetPage === inquiryPage.value || filterLoading.value) return
+  const keepDetailOpen = selectedInquiryId.value !== null
+  const targetIndex = preferredIndex ?? Math.max(0, selectedInquiryIndex.value)
+  inquiryPage.value = targetPage
+  const loaded = await loadWorkspace()
+  if (loaded && keepDetailOpen) {
+    selectedInquiryId.value = inquiries.value[Math.min(targetIndex, inquiries.value.length - 1)]?.id ?? null
+  }
+}
+
+function resetInquiryFilters() {
+  inquiryPage.value = 1
+  selectedInquiryId.value = null
+  void loadWorkspace()
+}
+
+async function moveInquiry(delta: number) {
+  const index = selectedInquiryIndex.value + delta
+  if (index >= 0 && index < inquiries.value.length) {
+    selectInquiry(inquiries.value[index].id)
+  } else if (delta > 0 && inquiryHasMore.value) {
+    await goToInquiryPage(inquiryPage.value + 1, 0)
+  } else if (delta < 0 && inquiryPage.value > 1) {
+    await goToInquiryPage(inquiryPage.value - 1, INQUIRY_PAGE_SIZE - 1)
+  }
+}
 
 const accountById = computed(() =>
   new Map(accounts.value.map((account) => [account.id, account])),
@@ -174,6 +270,8 @@ const accountById = computed(() =>
 const timeline = computed(() => {
   if (!selectedInquiry.value) return []
   const inquiry = selectedInquiry.value
+  // The aggregate hides global timestamps when some channel sources are not
+  // visible; only display timestamps returned under that visibility contract.
   return [
     { label: '询盘创建', value: inquiry.created_at },
     { label: '最近更新时间', value: inquiry.updated_at },
@@ -195,11 +293,132 @@ function messageContentFor(messageId: number) {
   return messageContent.value[messageId]
 }
 
+function providerDisplayName(provider: string | null | undefined) {
+  const value = provider || ''
+  if (value.includes('gmail')) return 'Gmail'
+  if (value.includes('outlook')) return 'Outlook'
+  if (value.includes('whatsapp')) return 'WhatsApp'
+  return 'provider'
+}
+
+type ContentSourceState = { text: string; tone: 'ok' | 'info' | 'warn' }
+
+/** 明确区分实时回源成功、持久化快照回放，以及每一种可诊断的回源失败。 */
+function contentSourceState(payload: MessageContent | null | undefined): ContentSourceState {
+  if (!payload) return { text: '', tone: 'info' }
+  const name = providerDisplayName(payload.provider)
+  const savedAt = payload.source.snapshot_at ? formatTime(payload.source.snapshot_at) : '入库时'
+  if (payload.source.live_refetch) {
+    return { text: `已从 ${name} 实时回源校验；展示安全解析后的原文（${savedAt} 存证）`, tone: 'ok' }
+  }
+  switch (payload.source.fallback_reason) {
+    case 'persisted_snapshot_replayed':
+      return { text: `已从持久化入站快照回溯原文（${savedAt} 存证）；${name} 会话离线或缓存未命中，回源链路已降级`, tone: 'info' }
+    case 'provider_configuration_missing':
+      return { text: `${name} 回源未配置：请检查服务端 OAuth 配置。当前展示入库存证原文（${savedAt}）`, tone: 'warn' }
+    case 'provider_credentials_unavailable':
+      return { text: `${name} 凭据不可用或无法解密：请核对凭据加密密钥，必要时重新授权。当前展示入库存证原文（${savedAt}）`, tone: 'warn' }
+    case 'provider_authorization_failed':
+      return { text: `${name} 授权已失效：请在「我的 / 接入账号」重新授权该渠道。当前展示入库存证原文（${savedAt}）`, tone: 'warn' }
+    case 'provider_content_empty':
+    case 'provider_content_unrenderable':
+      return { text: `${name} 未返回可展示正文，当前展示入库存证原文（${savedAt}）`, tone: 'info' }
+    case 'provider_refetch_failed':
+      return { text: `${name} 实时回源失败（网络或 provider 不可用），请查看 backend 日志；当前展示入库存证原文（${savedAt}）`, tone: 'warn' }
+    case 'provider_refetch_unavailable':
+      return { text: `当前渠道未配置实时回源，展示入库存证原文（${savedAt}）`, tone: 'info' }
+    case 'provider_message_id_missing':
+    case 'channel_account_unavailable':
+      return { text: `消息缺少回源所需的 provider 标识，展示入库存证原文（${savedAt}）`, tone: 'info' }
+    default:
+      return { text: `已从持久化入站快照回溯原文（${savedAt} 存证）；${name} 实时校验未执行`, tone: 'info' }
+  }
+}
+
 function toggleFullMessageContent(messageId: number) {
   const next = new Set(fullMessageContentIds.value)
   if (next.has(messageId)) next.delete(messageId)
   else next.add(messageId)
   fullMessageContentIds.value = next
+}
+
+/** 展开正文时按收起全文的初始状态展示，避免下次查看原文直接落到展开全文。 */
+function toggleOriginalView(messageId: number) {
+  if (expandedMessageIds.value.has(messageId)) {
+    const next = new Set(expandedMessageIds.value)
+    next.delete(messageId)
+    expandedMessageIds.value = next
+    const nextFull = new Set(fullMessageContentIds.value)
+    nextFull.delete(messageId)
+    fullMessageContentIds.value = nextFull
+  } else {
+    void viewMessageContent(messageId)
+  }
+}
+
+function toggleMessageGroup(groupKey: string) {
+  const next = new Set(collapsedGroupKeys.value)
+  if (next.has(groupKey)) next.delete(groupKey)
+  else next.add(groupKey)
+  collapsedGroupKeys.value = next
+}
+
+async function refreshAnalysisCounts() {
+  try {
+    analysis.value = await inboxApi.getInternalAnalysis()
+  } catch {
+    // 计数刷新失败不影响当前操作结果展示。
+  }
+}
+
+function showActionToast(text: string, kind: 'processed' | 'ignored') {
+  if (actionToastTimer !== undefined) window.clearTimeout(actionToastTimer)
+  actionToast.value = { text, kind }
+  actionToastTimer = window.setTimeout(() => {
+    actionToast.value = null
+    actionToastTimer = undefined
+  }, 2000)
+}
+
+function showMessageFeedback(messageId: number, text: string, kind: 'success' | 'error' = 'success') {
+  const previous = messageFeedbackTimers.get(messageId)
+  if (previous !== undefined) window.clearTimeout(previous)
+  messageFeedback.value = { ...messageFeedback.value, [messageId]: { text, kind } }
+  const timer = window.setTimeout(() => {
+    const next = { ...messageFeedback.value }
+    delete next[messageId]
+    messageFeedback.value = next
+    messageFeedbackTimers.delete(messageId)
+  }, 2000)
+  messageFeedbackTimers.set(messageId, timer)
+}
+
+async function openOperationLogs(inquiryId?: number) {
+  operationLogOpen.value = true
+  operationLogInquiryId.value = inquiryId ?? null
+  operationLogLoading.value = true
+  try {
+    operationLogs.value = await inboxApi.getOperationLogs(inquiryId)
+  } catch (cause) {
+    actionError.value = cause instanceof Error ? cause.message : '操作记录加载失败。'
+  } finally {
+    operationLogLoading.value = false
+  }
+}
+
+async function openOperationLogObject(record: OperationLog) {
+  if (record.object_type !== 'message' || record.object_id === null) return
+  operationLogOpen.value = false
+  await openCustomerMessage(record.object_id)
+}
+
+function moveMessageToBox(updated: Message) {
+  messages.value = messages.value.filter((item) => item.id !== updated.id)
+  if (updated.handling_status === 'processed') {
+    processedMessages.value = [updated, ...processedMessages.value.filter((item) => item.id !== updated.id)]
+  } else if (updated.handling_status === 'ignored') {
+    ignoredMessages.value = [updated, ...ignoredMessages.value.filter((item) => item.id !== updated.id)]
+  }
 }
 
 async function loadArchive() {
@@ -208,10 +427,70 @@ async function loadArchive() {
       inboxApi.getMessages(queryString({ handling_status: 'processed', page: '1', page_size: '100', sort: 'occurred_at', descending: 'true' })),
       inboxApi.getMessages(queryString({ handling_status: 'ignored', page: '1', page_size: '100', sort: 'occurred_at', descending: 'true' })),
     ])
-    archiveMessages.value = [...processed.items, ...ignored.items]
-      .sort((left, right) => Date.parse(right.occurred_at) - Date.parse(left.occurred_at))
+    processedMessages.value = processed.items
+    ignoredMessages.value = ignored.items
   } catch (cause) {
     actionError.value = cause instanceof Error ? cause.message : '归档箱加载失败，请稍后重试。'
+  }
+}
+
+async function openLinkReview(messageId: number) {
+  const requestId = ++linkReviewRequestId
+  linkReviewMessageId.value = messageId
+  linkReviewCandidates.value = null
+  linkReviewLoading.value = true
+  linkReviewError.value = ''
+  actionError.value = ''
+  try {
+    const candidates = await inboxApi.getMessageInquiryCandidates(messageId)
+    if (requestId === linkReviewRequestId) linkReviewCandidates.value = candidates
+  } catch (cause) {
+    if (requestId === linkReviewRequestId) {
+      linkReviewError.value = cause instanceof DOMException && cause.name === 'TimeoutError'
+        ? '查询超过 15 秒仍未完成，请重试。'
+        : cause instanceof Error ? cause.message : '加载归链候选失败，请重试。'
+    }
+  } finally {
+    if (requestId === linkReviewRequestId) linkReviewLoading.value = false
+  }
+}
+
+function toggleLinkReview(messageId: number) {
+  if (linkReviewMessageId.value === messageId && linkReviewCandidates.value && !linkReviewLoading.value) {
+    closeLinkReview()
+    return
+  }
+  void openLinkReview(messageId)
+}
+
+function retryLinkReview() {
+  if (linkReviewMessageId.value !== null) void openLinkReview(linkReviewMessageId.value)
+}
+
+function closeLinkReview() {
+  linkReviewRequestId += 1
+  linkReviewMessageId.value = null
+  linkReviewCandidates.value = null
+  linkReviewError.value = ''
+  linkReviewLoading.value = false
+}
+
+async function confirmMessageLink(inquiryId: number, confirmIdentity = false) {
+  if (linkReviewMessageId.value === null) return
+  handlingSubmitting.value = true
+  actionError.value = ''
+  try {
+    const csrf = await inboxApi.getCsrf()
+    await inboxApi.linkMessageToInquiry(inquiryId, linkReviewMessageId.value, csrf.csrf_token, confirmIdentity)
+    actionMessage.value = confirmIdentity
+      ? '已人工确认联系人身份并关联到所选链路。'
+      : '消息已关联到所选链路。'
+    closeLinkReview()
+    await loadWorkspace()
+  } catch (cause) {
+    actionError.value = cause instanceof Error ? cause.message : '消息关联失败。'
+  } finally {
+    handlingSubmitting.value = false
   }
 }
 
@@ -220,13 +499,26 @@ async function retryMessageOverview(messageId: number) {
   actionError.value = ''
   try {
     const csrf = await inboxApi.getCsrf()
-    await inboxApi.retryMessageOverview(messageId, csrf.csrf_token)
-    actionMessage.value = '中文概要已提交重新生成。'
-    await loadWorkspace()
+    const updated = await inboxApi.retryMessageOverview(messageId, csrf.csrf_token)
+    messages.value = messages.value.map((item) => item.id === messageId ? updated : item)
+    showMessageFeedback(messageId, '已提交重新生成。')
+    if (updated.overview?.status === 'pending') void pollMessageOverview(messageId)
   } catch (cause) {
-    actionError.value = cause instanceof Error ? cause.message : '中文概要重试失败。'
+    showMessageFeedback(messageId, cause instanceof Error ? cause.message : '中文概要重试失败。', 'error')
   } finally {
     handlingSubmitting.value = false
+  }
+}
+
+async function pollMessageOverview(messageId: number, attempt = 0): Promise<void> {
+  if (attempt >= 12 || !messages.value.some((item) => item.id === messageId)) return
+  await new Promise((resolve) => window.setTimeout(resolve, 1500))
+  try {
+    const updated = await inboxApi.getMessage(messageId)
+    messages.value = messages.value.map((item) => item.id === messageId ? updated : item)
+    if (updated.overview?.status === 'pending') void pollMessageOverview(messageId, attempt + 1)
+  } catch {
+    // A transient poll failure must not remove or alter the current message.
   }
 }
 
@@ -275,12 +567,13 @@ async function loadMoreMessages() {
   try {
     const next = await inboxApi.getMessages(queryString({
       handling_status: messageHandlingFilter.value,
+      assignment_status: workspaceView.value === 'customerMessages' ? 'assigned' : messageAssignmentFilter.value,
       ingestion_status: messageIngestionFilter.value,
-      channel_account_id: messageChannelAccountFilter.value,
+      ...messageChannelFilterParams(),
       page: String(messagePage.value + 1),
       page_size: '20',
       sort: 'occurred_at',
-      descending: 'false',
+      descending: 'true',
     }))
     messages.value = next.items
     messagePage.value = next.page
@@ -299,12 +592,13 @@ async function loadPreviousMessages() {
   try {
     const previous = await inboxApi.getMessages(queryString({
       handling_status: messageHandlingFilter.value,
+      assignment_status: workspaceView.value === 'customerMessages' ? 'assigned' : messageAssignmentFilter.value,
       ingestion_status: messageIngestionFilter.value,
-      channel_account_id: messageChannelAccountFilter.value,
+      ...messageChannelFilterParams(),
       page: String(messagePage.value - 1),
       page_size: '20',
       sort: 'occurred_at',
-      descending: 'false',
+      descending: 'true',
     }))
     messages.value = previous.items
     messagePage.value = previous.page
@@ -323,18 +617,57 @@ function formatTime(value: string | null | undefined) {
 
 function accountLabel(accountId: number) {
   const account = accountById.value.get(accountId)
-  return account ? `${account.channel_type} #${account.id}` : `账号 #${accountId}`
+  return account?.external_account_id || (account ? `${channelLabel(account.channel_type)} #${account.id}` : `账号 #${accountId}`)
 }
 
 function accountStatus(accountId: number) {
   return accountById.value.get(accountId)?.status
 }
 
+function whatsappGroupShortLabel(jid: string) {
+  const raw = jid.replace(/@g\.us$/, '')
+  return raw.length > 12 ? `${raw.slice(0, 6)}…${raw.slice(-4)}` : raw
+}
+
+/**
+ * 从 external_message_id 还原 WhatsApp 群聊 JID。
+ * ID 规范格式为 `remoteJid:participant:messageId`（与 bridge 的 parseExternalMessageId 一致），
+ * 群聊 remoteJid 以 @g.us 结尾。后端目前没有独立的会话/群组字段，
+ * 因此只在展示层解析，用于把同一群的消息聚成一条链，不改变任何数据结构。
+ */
+function whatsappGroupJid(message: Message): string | null {
+  if (message.channel_type !== 'whatsapp' || message.is_website_form) return null
+  const externalId = message.external_message_id || ''
+  const messageSeparator = externalId.lastIndexOf(':')
+  const prefix = messageSeparator > 0 ? externalId.slice(0, messageSeparator) : ''
+  const participantSeparator = prefix.lastIndexOf(':')
+  let remoteJid = participantSeparator > 0 ? prefix.slice(0, participantSeparator) : ''
+  if (!remoteJid.endsWith('@g.us')) {
+    // 历史 ID 或 participant 内含冒号时，退回按 @g.us 结尾直接截取首段
+    const marker = externalId.indexOf('@g.us:')
+    remoteJid = marker > 0 ? externalId.slice(0, marker + '@g.us'.length) : ''
+  }
+  return remoteJid.endsWith('@g.us') ? remoteJid : null
+}
+
+/** 展示分组键：群聊优先按群 JID 聚合，避免无联系人身份时退化成「一条消息一组」。 */
+function messageGroupKey(message: Message): string {
+  if (message.is_website_form) return `website-form:${message.id}`
+  if (message.inquiry_id !== null) return `inquiry:${message.inquiry_id}`
+  const groupJid = whatsappGroupJid(message)
+  if (groupJid) return `group:${message.channel_type}:${groupJid}`
+  const identity = message.normalized_customer_contact || message.customer_contact || `#${message.id}`
+  return `contact:${message.channel_type}:${identity}`
+}
+
 function messageContactLabel(message: Message) {
+  if (message.is_website_form) return `官网表单提交 #${message.id}`
   if (message.channel_type !== 'whatsapp') {
     return message.customer_contact || message.customer_nickname || '联系方式未提供'
   }
   const externalId = message.external_message_id || ''
+  const groupJid = whatsappGroupJid(message)
+  if (groupJid) return `群聊 ${whatsappGroupShortLabel(groupJid)}`
   if (externalId.includes('@g.us')) return '群聊'
   if (message.customer_contact && /^\d{6,15}$/.test(message.customer_contact)) {
     return `+${message.customer_contact}`
@@ -344,14 +677,95 @@ function messageContactLabel(message: Message) {
 }
 
 function messageSenderLabel(message: Message) {
+  if (message.is_website_form) return '官网表单'
   if (message.channel_type === 'whatsapp') return message.customer_nickname || '发送人未提供'
   return message.customer_nickname || ''
+}
+
+type MessageGroupScope = 'inquiry' | 'group' | 'contact'
+
+type MessageGroup = {
+  key: string
+  scope: MessageGroupScope
+  inquiryId: number | null
+  contactLabel: string
+  messages: Message[]
+}
+
+/** 同一询盘 / 同一群聊 / 同一联系人身份的消息合并为一条链，仅做展示合并，不做数据归并。 */
+const groupedMessageItems = computed<MessageGroup[]>(() => {
+  const groups: MessageGroup[] = []
+  const index = new Map<string, MessageGroup>()
+  for (const message of messages.value) {
+    const key = messageGroupKey(message)
+    let group = index.get(key)
+    if (!group) {
+      group = {
+        key,
+        scope: key.startsWith('inquiry:') ? 'inquiry' : key.startsWith('group:') ? 'group' : 'contact',
+        inquiryId: message.inquiry_id,
+        contactLabel: messageContactLabel(message),
+        messages: [],
+      }
+      index.set(key, group)
+      groups.push(group)
+    }
+    group.messages.push(message)
+  }
+  return groups
+})
+
+function messagesForGroup(group: MessageGroup) {
+  if (group.messages.length <= 1 || !collapsedGroupKeys.value.has(group.key)) return group.messages
+  // 组内按 occurred_at 倒序，[0] 才是最新一条；折叠时应保留最新消息。
+  return [group.messages[0]]
+}
+
+function messageGroupLabel(group: MessageGroup) {
+  if (group.scope === 'inquiry') return `询盘 #${group.inquiryId} 会话 · ${group.messages.length} 条消息`
+  if (group.scope === 'group') return `同一群聊会话 · ${group.messages.length} 条消息`
+  return `同一联系人会话 · ${group.messages.length} 条消息`
+}
+
+/** 行内组别徽标：无论组展开还是折叠，都能看出该消息属于哪个会话组。 */
+function groupBadgeLabel(group: MessageGroup, message: Message) {
+  const scope = group.scope === 'inquiry'
+    ? `询盘 #${group.inquiryId} 会话`
+    : group.scope === 'group' ? '群聊会话' : '联系人会话'
+  if (collapsedGroupKeys.value.has(group.key)) {
+    return `${scope} · 共 ${group.messages.length} 条（已折叠，仅显示最新 1 条）`
+  }
+  const position = group.messages.indexOf(message) + 1
+  return `${scope} · 组内第 ${position}/${group.messages.length} 条`
+}
+
+function channelLabel(channelType: string | null | undefined) {
+  if (channelType === 'website_form') return '官网表单'
+  if (channelType === 'whatsapp') return 'WhatsApp'
+  if (channelType === 'outlook') return 'Outlook'
+  if (channelType === 'gmail') return 'Gmail'
+  return channelType || '未知渠道'
+}
+
+function messageChannelFilterParams() {
+  const websiteForm = messageChannelAccountFilter.value === 'website_form'
+  return {
+    channel_account_id: websiteForm ? '' : messageChannelAccountFilter.value,
+    channel_type: websiteForm ? 'website_form' : '',
+  }
 }
 
 function queryString(values: Record<string, string>) {
   const params = new URLSearchParams()
   Object.entries(values).forEach(([key, value]) => { if (value) params.set(key, value) })
   return params.toString() ? `?${params.toString()}` : ''
+}
+
+function lifecycleStageLabel(stage: Inquiry['lifecycle_stage']) {
+  if (stage === 'active') return '活跃'
+  if (stage === 'archived_silent') return '归档静默（可恢复）'
+  if (stage === 'purge_due') return '超过90天（待清理；未自动删除）'
+  return '期限未知'
 }
 
 function statusLabel(status: string) {
@@ -367,11 +781,44 @@ function ingestionStatusLabel(status: string) {
   return status
 }
 
+function contactIdentityLabel(state: Message['contact_identity_state']) {
+  if (state === 'certain') return '身份已确认'
+  if (state === 'forwarded') return '转发来源：需人工确认后关联'
+  if (state === 'identity_uncertain') return '身份不确定'
+  if (state === 'needs_manual_review') return '待人工核验身份'
+  return '不支持的身份'
+}
+
+function linkStateLabel(state: Message['link_state']) {
+  if (state === 'linked') return '已关联'
+  if (state === 'manual_review') return '待人工判断'
+  if (state === 'unmatched') return '未匹配'
+  return '不适用'
+}
+
 function handlingStatusLabel(status: string) {
   if (status === 'pending') return '待处理'
   if (status === 'processed') return '已处理'
   if (status === 'ignored') return '已忽略'
   return status
+}
+
+async function runRefetchCheck(accountId: number) {
+  if (!accountId) return
+  const checking = new Set(refetchCheckingAccountIds.value)
+  checking.add(accountId)
+  refetchCheckingAccountIds.value = checking
+  actionError.value = ''
+  try {
+    const result = await inboxApi.checkChannelRefetch(accountId)
+    refetchChecks.value = { ...refetchChecks.value, [accountId]: result }
+  } catch (cause) {
+    actionError.value = cause instanceof Error ? cause.message : '回源自检失败，请稍后重试。'
+  } finally {
+    const remaining = new Set(refetchCheckingAccountIds.value)
+    remaining.delete(accountId)
+    refetchCheckingAccountIds.value = remaining
+  }
 }
 
 async function logoutSystemAccount() {
@@ -385,7 +832,7 @@ async function logoutSystemAccount() {
   }
 }
 
-async function loadWorkspace() {
+async function loadWorkspace(): Promise<boolean> {
   const initialLoad = accounts.value.length === 0 && messages.value.length === 0 && inquiries.value.length === 0 && analysis.value === null
   if (initialLoad) loading.value = true
   filterLoading.value = true
@@ -394,33 +841,31 @@ async function loadWorkspace() {
   unauthorized.value = false
 
   try {
-    const [nextAccounts, nextChannelAccounts, nextMessages, nextInquiries, nextAnalysis, nextTargets] = await Promise.all([
-      inboxApi.getAccounts(),
+    const emptyMessagePage = { items: [] as Message[], page: 1, page_size: 20, has_more: false }
+    const emptyInquiryPage = { items: [] as Inquiry[], page: 1, page_size: INQUIRY_PAGE_SIZE, has_more: false, total_count: 0 }
+    const [nextChannelAccounts, nextMessages, nextInquiries, nextTargets, nextUser] = await Promise.all([
       channelsApi.accounts(),
-      inboxApi.getMessages(queryString({
+      isInquiryView.value ? Promise.resolve(emptyMessagePage) : inboxApi.getMessages(queryString({
         handling_status: messageHandlingFilter.value,
+        assignment_status: workspaceView.value === 'customerMessages' ? 'assigned' : messageAssignmentFilter.value,
         ingestion_status: messageIngestionFilter.value,
-        channel_account_id: messageChannelAccountFilter.value,
-        page: '1', page_size: '20', sort: 'occurred_at', descending: 'false',
+        ...messageChannelFilterParams(),
+        needs_review: '',
+        page: '1', page_size: '20', sort: 'occurred_at', descending: 'true',
       })),
-      inboxApi.getInquiries(queryString({
-        status: inquiryStatusFilter.value,
+      isInquiryView.value ? inboxApi.getInquiries(queryString({
+        status: workspaceView.value === 'customers' ? 'assigned' : workspaceView.value === 'review' ? 'new' : '',
         handling_status: inquiryHandlingFilter.value,
-        page: '1', page_size: '50', sort: 'updated_at', descending: 'true',
-      })),
-      inboxApi.getInternalAnalysis(),
-      inboxApi.getTransferTargets().catch((cause) => {
+        page: String(inquiryPage.value), page_size: String(INQUIRY_PAGE_SIZE), sort: 'updated_at', descending: 'true',
+      })) : Promise.resolve(emptyInquiryPage),
+      isInquiryView.value ? inboxApi.getTransferTargets().catch((cause) => {
         if (cause instanceof ApiError && cause.status === 403) return []
         throw cause
-      }),
+      }) : Promise.resolve([] as TransferTarget[]),
+      inboxApi.getCurrentUser(),
     ])
-    currentUser.value = await inboxApi.getCurrentUser()
-    accounts.value = nextAccounts.map((account) => {
-      const channelAccount = nextChannelAccounts.find((item) => item.id === account.id)
-      return channelAccount
-        ? { ...account, status: channelAccount.status, external_account_id: channelAccount.external_account_id }
-        : account
-    })
+    currentUser.value = nextUser
+    accounts.value = nextChannelAccounts
     messages.value = nextMessages.items
     messagePage.value = nextMessages.page
     messageHasMore.value = nextMessages.has_more
@@ -428,14 +873,16 @@ async function loadWorkspace() {
     fullMessageContentIds.value = new Set()
     messageContent.value = {}
     contentLoadingMessageIds.value = new Set()
-    if (archiveOpen.value) await loadArchive()
+    if (archiveOpen.value || processedBoxOpen.value) await loadArchive()
     inquiries.value = nextInquiries.items
-    analysis.value = nextAnalysis
+    inquiryHasMore.value = nextInquiries.has_more
+    inquiryTotalCount.value = nextInquiries.total_count ?? (nextInquiries.has_more ? inquiryPage.value * INQUIRY_PAGE_SIZE + 1 : (inquiryPage.value - 1) * INQUIRY_PAGE_SIZE + nextInquiries.items.length)
     transferTargets.value = nextTargets
     if (!nextInquiries.items.some((inquiry) => inquiry.id === selectedInquiryId.value)) {
-      selectedInquiryId.value = nextInquiries.items[0]?.id ?? null
+      selectedInquiryId.value = null
       selectedSalesUserId.value = null
     }
+    return true
   } catch (cause) {
     if (cause instanceof ApiError && (cause.status === 401 || cause.status === 403)) {
       unauthorized.value = true
@@ -446,6 +893,7 @@ async function loadWorkspace() {
     } else {
       error.value = '工作台数据加载失败'
     }
+    return false
   } finally {
     if (initialLoad) loading.value = false
     filterLoading.value = false
@@ -537,14 +985,19 @@ async function startWhatsAppPairing() {
 
 async function startGmailAuthorization() {
   let account = accounts.value.find((item) => item.channel_type === 'gmail')
-  if (!account) {
-    const csrf = await inboxApi.getCsrf()
-    await channelsApi.createGmailAccount(csrf.csrf_token)
-    await loadWorkspace()
-    gmailMessage.value = 'Gmail 账号已初始化，请再次点击开始授权。'
-    return
-  }
+  gmailError.value = ''
+  gmailMessage.value = ''
   try {
+    if (!account || account.status === 'revoked') {
+      const csrf = await inboxApi.getCsrf()
+      await channelsApi.createGmailAccount(csrf.csrf_token)
+      if (!await loadWorkspace()) {
+        gmailError.value = 'Gmail 账号已初始化，但工作台刷新失败，请刷新后重试。'
+        return
+      }
+      account = accounts.value.find((item) => item.channel_type === 'gmail')
+      if (!account) throw new Error('Gmail 账号初始化后不可见，请检查授权范围。')
+    }
     const csrf = await inboxApi.getCsrf()
     const result = await channelsApi.startGmailAuthorization(account.id, csrf.csrf_token)
     window.location.assign(result.authorization_url)
@@ -701,15 +1154,47 @@ async function openMessageProvider(message: Message) {
   }
 }
 
+/** 组内统一处理后，把该会话的消息从待办列表移除并同步归档箱内容。 */
+function archiveGroupMessages(inquiryId: number) {
+  messages.value = messages.value.filter((item) => item.inquiry_id !== inquiryId)
+  if (archiveOpen.value || processedBoxOpen.value) void loadArchive()
+}
+
 async function updateMessageHandling(message: Message, action: 'processed' | 'ignored') {
+  // 已归链消息属于询盘会话：按业务规则必须通过询盘统一处理，单独改消息状态会被后端拒绝。
+  if (message.inquiry_id !== null) {
+    const group = groupedMessageItems.value.find((item) => item.inquiryId === message.inquiry_id)
+    const relatedCount = group?.messages.length ?? 1
+    handlingSubmitting.value = true
+    actionError.value = ''
+    actionMessage.value = ''
+    try {
+      const csrf = await inboxApi.getCsrf()
+      const updated = await inboxApi.updateInquiryHandling(message.inquiry_id, action, csrf.csrf_token)
+      archiveGroupMessages(message.inquiry_id)
+      const messageCount = updated.messages.length || relatedCount
+      showActionToast(
+        `询盘 #${message.inquiry_id} 会话的 ${messageCount} 条消息已${action === 'processed' ? '处理' : '忽略'}`,
+        action,
+      )
+      void refreshAnalysisCounts()
+    } catch (cause) {
+      actionError.value = cause instanceof Error ? cause.message : '状态更新失败，请稍后重试。'
+    } finally {
+      handlingSubmitting.value = false
+    }
+    return
+  }
   handlingSubmitting.value = true
   actionError.value = ''
   actionMessage.value = ''
   try {
     const csrf = await inboxApi.getCsrf()
-    await inboxApi.updateMessageHandling(message.id, action, csrf.csrf_token)
-    actionMessage.value = action === 'processed' ? '消息已标记为已处理。' : '消息已忽略。'
-    await loadWorkspace()
+    const updated = await inboxApi.updateMessageHandling(message.id, action, csrf.csrf_token)
+    moveMessageToBox(updated)
+    showActionToast(action === 'processed' ? '已处理' : '已忽略', action)
+    if (archiveOpen.value || processedBoxOpen.value) await loadArchive()
+    await refreshAnalysisCounts()
   } catch (cause) {
     actionError.value = cause instanceof Error ? cause.message : '消息状态更新失败，请稍后重试。'
   } finally {
@@ -724,9 +1209,18 @@ async function updateSelectedInquiryHandling(action: 'processed' | 'ignored') {
   actionMessage.value = ''
   try {
     const csrf = await inboxApi.getCsrf()
-    await inboxApi.updateInquiryHandling(selectedInquiry.value.id, action, csrf.csrf_token)
+    const updated = await inboxApi.updateInquiryHandling(selectedInquiry.value.id, action, csrf.csrf_token)
     actionMessage.value = action === 'processed' ? '询盘已标记为已处理。' : '询盘已忽略。'
-    await loadWorkspace()
+    // 保持当前页面位置：本地替换或移除该询盘，不整页刷新。
+    const matchesFilter = !inquiryHandlingFilter.value || inquiryHandlingFilter.value === updated.handling_status
+    inquiries.value = matchesFilter
+      ? inquiries.value.map((item) => (item.id === updated.id ? updated : item))
+      : inquiries.value.filter((item) => item.id !== updated.id)
+    if (!inquiries.value.some((inquiry) => inquiry.id === selectedInquiryId.value)) {
+      selectedInquiryId.value = inquiries.value[0]?.id ?? null
+      selectedSalesUserId.value = null
+    }
+    await refreshAnalysisCounts()
   } catch (cause) {
     actionError.value = cause instanceof Error ? cause.message : '状态更新失败，请稍后重试。'
   } finally {
@@ -735,8 +1229,8 @@ async function updateSelectedInquiryHandling(action: 'processed' | 'ignored') {
 }
 
 async function transferSelectedInquiry() {
-  if (!selectedInquiry.value || selectedSalesUserId.value === null) {
-    actionError.value = '请选择有效的业务员。'
+  if (!selectedInquiry.value || selectedSalesUserId.value === null || selectedBusinessType.value === null) {
+    actionError.value = '请选择业务类型和业务员。'
     actionMessage.value = ''
     return
   }
@@ -746,9 +1240,10 @@ async function transferSelectedInquiry() {
   actionMessage.value = ''
   try {
     const csrf = await inboxApi.getCsrf()
-    await inboxApi.transferInquiry(selectedInquiry.value.id, selectedSalesUserId.value, csrf.csrf_token)
-    actionMessage.value = '询盘已转交，正在刷新授权范围内的数据。'
+    await inboxApi.transferInquiry(selectedInquiry.value.id, selectedSalesUserId.value, selectedBusinessType.value, csrf.csrf_token)
+    actionMessage.value = '客户链路已分配，正在刷新授权范围内的数据。'
     selectedSalesUserId.value = null
+    selectedBusinessType.value = null
     await loadWorkspace()
   } catch (cause) {
     if (cause instanceof ApiError) {
@@ -767,16 +1262,59 @@ async function transferSelectedInquiry() {
 
 onMounted(() => {
   readGmailCallbackState()
-  loadWorkspace()
+  void (async () => {
+    const loaded = await loadWorkspace()
+    if (!loaded) return
+    await nextTick()
+    if ('requestIdleCallback' in window) {
+      window.requestIdleCallback(() => void refreshAnalysisCounts(), { timeout: 2500 })
+    } else {
+      window.setTimeout(() => void refreshAnalysisCounts(), 800)
+    }
+  })()
 })
 </script>
 
 <template>
   <main class="workspace">
+    <Transition name="action-toast">
+      <div v-if="actionToast" class="action-toast" :class="`toast-${actionToast.kind}`" role="status" aria-live="polite">
+        <span class="toast-mark" aria-hidden="true">✓</span>
+        <span>{{ actionToast.text }}</span>
+      </div>
+    </Transition>
+    <div v-if="operationLogOpen" class="operation-log-backdrop" @click.self="operationLogOpen = false">
+      <section class="operation-log-dialog" role="dialog" aria-modal="true" aria-labelledby="operation-log-title">
+        <header>
+          <div><p class="eyebrow">操作回溯</p><h2 id="operation-log-title">{{ operationLogInquiryId === null ? '我的操作记录' : `链路 #${operationLogInquiryId} 操作记录` }}</h2></div>
+          <button class="secondary" type="button" aria-label="关闭操作记录" @click="operationLogOpen = false">关闭</button>
+        </header>
+        <p v-if="operationLogLoading" class="empty">正在加载…</p>
+        <p v-else-if="operationLogs.length === 0" class="empty">暂无操作记录。</p>
+        <div v-else class="operation-log-table-wrap">
+          <table class="operation-log-table">
+            <thead><tr><th>操作账号</th><th>操作名称</th><th>对象</th><th>时间</th><th>结果</th></tr></thead>
+            <tbody>
+              <tr v-for="record in operationLogs" :key="record.id">
+                <td>{{ record.actor_name }}</td>
+                <td>{{ record.operation_name }}</td>
+                <td>
+                  <button v-if="record.object_type === 'message' && record.object_id !== null" class="operation-object-link" type="button" @click="openOperationLogObject(record)">消息 #{{ record.object_id }} · 查看概要与处理</button>
+                  <span v-else>{{ record.object_type === 'inquiry' ? '链路' : '消息' }}{{ record.object_id ? ` #${record.object_id}` : '' }}</span>
+                  <small v-if="record.detail">{{ record.detail }}</small>
+                </td>
+                <td>{{ formatTime(record.created_at) }}</td>
+                <td><span class="operation-result" :class="`result-${record.result}`">{{ record.result === 'success' ? '成功' : record.result === 'timeout' ? '超时' : '失败' }}</span></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </div>
     <header class="topbar">
       <div>
         <p class="eyebrow">{{ profileOpen ? '个人设置' : '运营工作台' }}</p>
-        <h1>{{ profileOpen ? '渠道连接' : '客户链路' }}</h1>
+        <h1>{{ profileOpen ? '渠道连接' : '消息与客户' }}</h1>
       </div>
       <div class="topbar-actions">
         <span v-if="currentUser" class="current-user">{{ currentUser.username }}（{{ currentUser.role }}）</span>
@@ -802,6 +1340,10 @@ onMounted(() => {
       </div>
 
       <div class="settings-list">
+        <section class="profile-operations">
+          <div><h3>账号操作记录</h3><p>查看当前账号执行的操作及结果。</p></div>
+          <button class="secondary" type="button" @click="openOperationLogs()">查看操作记录</button>
+        </section>
         <article v-for="channelType in managedChannelTypes" :key="channelType" class="channel-setting">
           <div class="setting-intro">
             <div class="setting-title-row">
@@ -841,12 +1383,34 @@ onMounted(() => {
               </button>
               <button
                 v-if="channelAccount(channelType) && channelAccount(channelType)?.status !== 'revoked'"
+                class="secondary"
+                type="button"
+                :disabled="refetchCheckingAccountIds.has(channelAccount(channelType)?.id || 0)"
+                @click="runRefetchCheck(channelAccount(channelType)?.id || 0)"
+              >
+                {{ refetchCheckingAccountIds.has(channelAccount(channelType)?.id || 0) ? '自检中…' : '回源自检' }}
+              </button>
+              <button
+                v-if="channelAccount(channelType) && channelAccount(channelType)?.status !== 'revoked'"
                 class="link-button danger-link"
                 type="button"
                 @click="disconnectChannel(channelType)"
               >
                 {{ channelType === 'whatsapp' ? '断开关联' : '撤销本地连接' }}
               </button>
+            </div>
+            <div
+              v-if="refetchChecks[channelAccount(channelType)?.id || 0]"
+              class="refetch-check-result"
+              :class="refetchChecks[channelAccount(channelType)?.id || 0]?.ready ? 'ok' : 'warn'"
+            >
+              <strong>{{ refetchChecks[channelAccount(channelType)?.id || 0]?.ready ? '实时回源链路可用' : '实时回源不可用' }}</strong>
+              <p>{{ refetchChecks[channelAccount(channelType)?.id || 0]?.recommended_action }}</p>
+              <ul>
+                <li v-for="step in refetchChecks[channelAccount(channelType)?.id || 0]?.steps" :key="step.name">
+                  {{ step.ok ? '✓' : '✗' }} {{ step.name }}：{{ step.detail }}
+                </li>
+              </ul>
             </div>
             <p v-if="channelType === 'gmail' && gmailMessage" class="action-success">{{ gmailMessage }}</p>
             <p v-if="channelType === 'gmail' && gmailError" class="action-error">{{ gmailError }}</p>
@@ -898,64 +1462,34 @@ onMounted(() => {
       {{ error }}
       <button class="link-button" type="button" @click="loadWorkspace">重试</button>
     </section>
-    <section v-else class="content-grid" data-ui="inbox">
-      <section v-if="analysis" class="analysis-strip">
-        <div class="overview-heading">
-          <div>
-            <p class="eyebrow">今日工作量</p>
-            <h2>先看异常，再处理消息</h2>
-          </div>
-          <span class="overview-note">数据来自当前授权范围</span>
-        </div>
-        <div class="analysis-card">
-          <span>待处理消息</span>
-          <strong>{{ analysis.pending_message_count ?? 0 }}</strong>
-          <small>需要人工查看</small>
-        </div>
-        <div class="analysis-card">
-          <span>询盘状态</span>
-          <strong>{{ Object.entries(analysis.inquiries_by_status ?? {}).map(([status, count]) => `${statusLabel(status)} ${count}`).join(' · ') || '无数据' }}</strong>
-          <small>当前询盘分布</small>
-        </div>
-        <div class="analysis-card">
-          <span>人工处理</span>
-          <strong>{{ Object.entries(analysis.inquiries_by_handling_status ?? {}).map(([status, count]) => `${handlingStatusLabel(status)} ${count}`).join(' · ') || '无数据' }}</strong>
-          <small>处理状态分布</small>
-        </div>
-        <div class="analysis-card">
-          <span>我的转交</span>
-          <strong>{{ analysis.my_transfers?.length ?? 0 }}</strong>
-          <small>本周期转交记录</small>
-        </div>
-        <div class="analysis-card">
-          <span>渠道异常</span>
-          <strong>{{ analysis.channel_statuses?.filter((item) => item.is_abnormal).length ?? 0 }}</strong>
-          <small>{{ analysis.channel_statuses?.filter((item) => item.is_abnormal).map((item) => `${item.channel_type}: ${item.status}`).join(' · ') || '无异常' }}</small>
-        </div>
-      </section>
-
-      <section class="inbox-panel panel" :class="{ 'is-refreshing': filterLoading }">
-        <div class="panel-heading">
+    <section v-else class="content-grid" :class="{ 'has-selected-inquiry': isInquiryView && selectedInquiry }" data-ui="inbox">
+      <nav class="workspace-tabs" aria-label="工作台视图">
+        <button type="button" :class="{ active: workspaceView === 'messages' }" @click="switchWorkspaceView('messages')">消息收件箱</button>
+        <button type="button" :class="{ active: workspaceView === 'review' }" @click="switchWorkspaceView('review')">待分配</button>
+        <button type="button" :class="{ active: workspaceView === 'customers' }" @click="switchWorkspaceView('customers')">客户链路</button>
+        <button type="button" :class="{ active: workspaceView === 'customerMessages' }" @click="switchWorkspaceView('customerMessages')">客户消息</button>
+      </nav>
+      <section class="inbox-panel panel" :class="{ 'is-refreshing': filterLoading, 'inquiry-sidebar': isInquiryView && selectedInquiry }">
+        <div v-if="isInquiryView" class="panel-heading">
           <div>
             <p class="eyebrow">运营收件箱</p>
-            <h2>消息处理队列</h2>
+            <h2>{{ workspaceView === 'review' ? '待分配客户' : '已分配客户链路' }}</h2>
+            <p v-if="workspaceView === 'review'">按已确认的邮箱或手机号汇总客户，选择业务类型与负责人完成分配。</p>
           </div>
-          <span class="count">{{ messages.length }} 条待查</span>
+          <span class="count">{{ selectedInquiry ? `第 ${inquiryPage} / ${inquiryTotalPages} 页` : `共 ${inquiryTotalCount} 条 · 第 ${inquiryPage} / ${inquiryTotalPages} 页` }}</span>
         </div>
 
-        <div class="inbox-filters">
+        <div v-if="isInquiryView" class="inbox-filters">
           <div class="filter-group">
-            <span>询盘</span>
-            <select v-model="inquiryStatusFilter" aria-label="询盘业务状态" @change="loadWorkspace">
-              <option value="">全部阶段</option><option value="new">新询盘</option><option value="assigned">已转交</option>
-            </select>
-            <select v-model="inquiryHandlingFilter" aria-label="询盘人工状态" @change="loadWorkspace">
+            <span>处理状态</span>
+            <select v-model="inquiryHandlingFilter" aria-label="询盘人工状态" @change="resetInquiryFilters">
               <option value="">全部处理状态</option><option value="pending">待处理</option><option value="processed">已处理</option><option value="ignored">已忽略</option>
             </select>
           </div>
         </div>
-        <p v-if="filterLoading" class="refresh-state" role="status">正在刷新当前筛选结果…</p>
-        <p v-if="inquiries.length === 0" class="empty">当前授权范围内没有符合条件的询盘。</p>
+        <p v-if="isInquiryView && filterLoading" class="refresh-state" role="status">正在刷新当前筛选结果…</p>
+        <p v-if="isInquiryView && inquiries.length === 0" class="empty">当前没有符合条件的客户链路。</p>
+        <template v-if="isInquiryView">
         <button
           v-for="inquiry in inquiries"
           :key="inquiry.id"
@@ -965,28 +1499,52 @@ onMounted(() => {
           @click="selectInquiry(inquiry.id)"
         >
           <span class="row-topline">
-            <strong>{{ inquiry.customer_nickname || inquiry.customer_contact }}</strong>
-            <span class="status">{{ statusLabel(inquiry.status) }}</span>
+            <strong>{{ inquiry.contact_sources[0]?.customer_nickname || inquiry.contact_sources[0]?.raw_customer_contact || `链路 #${inquiry.id}` }}</strong>
+            <span class="status">{{ workspaceView === 'review' ? '待分配' : '已分配' }}</span>
           </span>
-          <span class="channel">{{ accountLabel(inquiry.source_channel_account_id) }}</span>
-          <span class="preview">{{ inquiry.display_excerpt || '（无正文）' }}</span>
+          <span class="channel">{{ [...new Set(inquiry.contact_sources.map((source) => source.channel_type).filter(Boolean))].join(' / ') || '来源按授权范围隐藏' }}</span>
+          <span class="preview">{{ inquiry.messages.length }} 条当前授权可见的关联消息</span>
         </button>
+        <div class="pagination-bar inquiry-pagination">
+          <span class="page-progress-label">第 {{ inquiryPage }} / {{ inquiryTotalPages }} 页</span>
+          <nav class="page-dots" aria-label="询盘分页">
+            <button
+              v-for="pageNumber in inquiryTotalPages"
+              :key="pageNumber"
+              class="page-dot"
+              :class="{ active: pageNumber === inquiryPage }"
+              type="button"
+              :aria-label="`第 ${pageNumber} 页`"
+              :aria-current="pageNumber === inquiryPage ? 'page' : undefined"
+              :disabled="filterLoading"
+              @click="goToInquiryPage(pageNumber)"
+            ><span></span></button>
+          </nav>
+        </div>
+        </template>
 
-        <div class="subsection">
+        <div v-if="!isInquiryView" class="subsection">
           <div class="panel-heading compact message-heading">
             <div>
               <p class="eyebrow">逐条处理</p>
-              <h2>消息</h2>
+              <h2>{{ workspaceView === 'customerMessages' ? '已分配客户的消息' : '全部消息' }}</h2>
             </div>
             <span class="count">{{ messages.length }} 条</span>
           </div>
           <div class="inbox-filters">
+            <div v-if="workspaceView === 'messages'" class="filter-group">
+              <span>客户归属</span>
+              <select v-model="messageAssignmentFilter" aria-label="客户归属筛选" @change="loadWorkspace">
+                <option value="all">全部消息</option><option value="assigned">已归属客户</option><option value="unassigned">未归属客户</option>
+              </select>
+            </div>
             <div class="filter-group">
               <span>渠道</span>
               <select v-model="messageChannelAccountFilter" aria-label="消息渠道" @change="loadWorkspace">
                 <option value="">全部渠道</option>
+                <option value="website_form">官网表单</option>
                 <option v-for="account in messageChannelAccounts" :key="account.id" :value="String(account.id)">
-                  {{ account.channel_type === 'whatsapp' ? 'WhatsApp' : account.channel_type === 'outlook' ? 'Outlook' : 'Gmail' }}
+                  {{ channelLabel(account.channel_type) }}
                 </option>
               </select>
             </div>
@@ -996,44 +1554,68 @@ onMounted(() => {
                 <option value="">全部入站</option><option value="received">已接收</option><option value="processed">已处理入站</option><option value="failed">入站失败</option>
               </select>
               <select v-model="messageHandlingFilter" aria-label="消息人工状态" @change="loadWorkspace">
-                <option value="">全部人工</option><option value="pending">待处理</option><option value="processed">已处理</option><option value="ignored">已忽略</option>
+                <option value="all">全部人工</option><option value="pending">待处理</option><option value="processed">已处理</option><option value="ignored">已忽略</option>
               </select>
             </div>
           </div>
           <div class="archive-toolbar">
-            <button class="secondary" type="button" @click="archiveOpen = !archiveOpen; archiveOpen ? loadArchive() : undefined">
-              {{ archiveOpen ? '收起归档箱' : '打开归档箱' }}
+            <button class="secondary" type="button" @click="processedBoxOpen = !processedBoxOpen; (processedBoxOpen || archiveOpen) ? loadArchive() : undefined">
+              {{ processedBoxOpen ? '收起已处理箱' : '已处理箱' }}
             </button>
-            <span class="muted">已处理/已忽略消息不会出现在当前处理栏</span>
+            <button class="secondary" type="button" @click="archiveOpen = !archiveOpen; (processedBoxOpen || archiveOpen) ? loadArchive() : undefined">
+              {{ archiveOpen ? '收起归档箱' : '归档箱' }}
+            </button>
           </div>
-          <p v-if="actionMessage" class="inline-feedback success" role="status">{{ actionMessage }}</p>
           <p v-if="providerFallback" class="inline-feedback success">
             <a :href="providerFallback.url" target="_blank" rel="noopener noreferrer">{{ providerFallback.label }}</a>
           </p>
           <p v-if="actionError" class="inline-feedback error" role="alert">{{ actionError }}</p>
-          <section v-if="archiveOpen" class="archive-box">
-            <h3>统一归档箱</h3>
-            <p v-if="archiveMessages.length === 0" class="empty">当前没有已处理或已忽略消息。</p>
-            <article v-for="archived in archiveMessages" :key="archived.id" class="archive-row">
+          <section v-if="processedBoxOpen" class="archive-box">
+            <h3>已处理</h3>
+            <p v-if="processedMessages.length === 0" class="empty">已处理箱为空。</p>
+            <article v-for="archived in processedMessages" :key="archived.id" class="archive-row">
               <div>
                 <strong>{{ messageContactLabel(archived) }}</strong>
-                <span>{{ handlingStatusLabel(archived.handling_status) }} · {{ formatTime(archived.occurred_at) }}</span>
+                <span>已处理 · {{ formatTime(archived.occurred_at) }}</span>
+                <p v-if="archived.overview?.status === 'ready'">中文概要：{{ archived.overview.text }}</p>
+              </div>
+              <button class="secondary" type="button" :disabled="handlingSubmitting" @click="restoreArchivedMessage(archived.id)">恢复到待处理</button>
+            </article>
+          </section>
+          <section v-if="archiveOpen" class="archive-box">
+            <h3>已忽略归档</h3>
+            <p v-if="ignoredMessages.length === 0" class="empty">归档箱为空。</p>
+            <article v-for="archived in ignoredMessages" :key="archived.id" class="archive-row">
+              <div>
+                <strong>{{ messageContactLabel(archived) }}</strong>
+                <span>已忽略 · {{ formatTime(archived.occurred_at) }}</span>
                 <p v-if="archived.overview?.status === 'ready'">中文概要：{{ archived.overview.text }}</p>
               </div>
               <button class="secondary" type="button" :disabled="handlingSubmitting" @click="restoreArchivedMessage(archived.id)">恢复到待处理</button>
             </article>
           </section>
           <p v-if="messages.length === 0" class="empty">当前授权范围内没有符合条件的消息。</p>
-          <div v-for="message in messages" :key="message.id" class="message-row">
+          <template v-for="group in groupedMessageItems" :key="group.key">
+            <section class="message-group" :class="{ 'has-multiple': group.messages.length > 1 }">
+            <div v-if="group.messages.length > 1" class="message-group-bar">
+              <span class="group-label">{{ messageGroupLabel(group) }} · {{ group.contactLabel }}</span>
+              <button class="link-button" type="button" @click="toggleMessageGroup(group.key)">
+                {{ collapsedGroupKeys.has(group.key) ? `展开组内其他 ${group.messages.length - 1} 条` : '收起组内消息' }}
+              </button>
+            </div>
+            <div v-for="message in messagesForGroup(group)" :id="`message-${message.id}`" :key="message.id" class="message-row" :class="{ 'is-grouped': group.messages.length > 1, 'is-focused-message': selectedMessageId === message.id }">
             <div class="message-meta">
-              <span class="channel-mark" :class="`channel-${message.channel_type}`">{{ message.channel_type === 'whatsapp' ? 'WS' : message.channel_type === 'outlook' ? 'OL' : 'GM' }}</span>
+              <span class="channel-mark" :class="`channel-${message.channel_type}`">{{ message.channel_type === 'website_form' ? 'WF' : message.channel_type === 'whatsapp' ? 'WS' : message.channel_type === 'outlook' ? 'OL' : 'GM' }}</span>
               <strong>{{ messageContactLabel(message) }}</strong>
               <span v-if="messageSenderLabel(message)" class="sender">发送人：{{ messageSenderLabel(message) }}</span>
               <span class="meta-time">{{ formatTime(message.occurred_at) }}</span>
+              <span v-if="group.messages.length > 1" class="state-label group-badge" :title="`属于「${messageGroupLabel(group)}」`">{{ groupBadgeLabel(group, message) }}</span>
               <span class="state-label ingestion-state">入站：{{ ingestionStatusLabel(message.ingestion_status) }}</span>
               <span class="state-label">人工：{{ handlingStatusLabel(message.handling_status) }}</span>
+              <span class="state-label" :class="message.link_state === 'manual_review' || message.contact_identity_state !== 'certain' ? 'status-warning' : ''">身份：{{ contactIdentityLabel(message.contact_identity_state) }}</span>
+              <span class="state-label" :class="message.link_state === 'manual_review' ? 'status-warning' : ''">归链：{{ linkStateLabel(message.link_state) }}</span>
               <span v-if="message.overview?.status === 'pending'" class="state-label">中文概要：生成中</span>
-              <span v-else-if="message.overview?.status === 'failed'" class="status-warning">中文概要：规则摘录，非 AI 概要</span>
+              <span v-else-if="message.overview?.status === 'failed'" class="status-warning">中文概要：待生成</span>
               <span v-if="accountStatus(message.channel_account_id) === 'blocked'" class="status-warning">渠道阻塞</span><span v-if="accountStatus(message.channel_account_id) === 'revoked'" class="status-warning">渠道已撤销</span>
             </div>
             <template v-if="!expandedMessageIds.has(message.id)">
@@ -1058,17 +1640,13 @@ onMounted(() => {
               >
                 {{ fullMessageContentIds.has(message.id) ? '收起全文' : '展示全文' }}
               </button>
-              <p v-if="messageContentFor(message.id)" class="content-source-note">
-                <template v-if="messageContentFor(message.id)?.source.live_refetch">
-                  来源：已从 {{ messageContentFor(message.id)?.provider }} 回源并安全解析；未展示 provider 原始载荷
-                </template>
-                <template v-else>
-                  来源：数据库安全纯文本（provider 回源失败或不可用）；未展示 provider 原始载荷
-                </template>
+              <p v-if="messageContentFor(message.id)" class="content-source-note" :class="`tone-${contentSourceState(messageContentFor(message.id)).tone}`" role="status">
+                {{ contentSourceState(messageContentFor(message.id)).text }}
               </p>
-              <p v-if="messageContentFor(message.id) && !messageContentFor(message.id)?.source.live_refetch" class="content-refetch-warning" role="status">
-                原文回源失败或当前渠道不支持回源，已显示数据库安全文本。
+              <p v-if="messageContentFor(message.id) && contentSourceState(messageContentFor(message.id)).tone === 'warn'" class="content-source-hint">
+                可在「我的 / 接入账号」运行「回源自检」定位并按提示重新授权；恢复后查看原文将走实时回源。
               </p>
+              <span v-if="messageContentFor(message.id)?.can_expand" class="content-clamp-hint">预览最多显示 8 行；完整内容请展开全文。</span>
             </div>
             <div class="message-actions">
               <button
@@ -1080,13 +1658,22 @@ onMounted(() => {
               >
                 重新生成中文概要
               </button>
-              <button
+              <button v-if="workspaceView === 'messages' || workspaceView === 'customerMessages'"
                 class="action-button action-secondary"
                 type="button"
                 :disabled="contentLoadingMessageIds.has(message.id)"
-                @click="expandedMessageIds.has(message.id) ? toggleMessageExpanded(message.id) : viewMessageContent(message.id)"
+                @click="toggleOriginalView(message.id)"
               >
                 {{ contentLoadingMessageIds.has(message.id) ? '正在读取…' : expandedMessageIds.has(message.id) ? '收起正文' : '查看原文' }}
+              </button>
+              <button
+                v-if="message.link_state !== 'linked' && currentUser?.role !== 'sales'"
+                class="action-button action-secondary"
+                type="button"
+                :disabled="linkReviewLoading || handlingSubmitting"
+                @click="toggleLinkReview(message.id)"
+              >
+                {{ linkReviewLoading && linkReviewMessageId === message.id ? '正在查询…' : linkReviewMessageId === message.id && linkReviewCandidates ? '收起归属候选' : '确认客户归属' }}
               </button>
               <button
                 class="action-button action-primary"
@@ -1097,15 +1684,15 @@ onMounted(() => {
               >
                 {{ providerOpeningMessageId === message.id ? '正在打开…' : '去渠道处理' }}
               </button>
-              <button
+              <button v-if="workspaceView === 'messages' || workspaceView === 'customerMessages'"
                 class="action-button action-secondary"
                 type="button"
                 :disabled="handlingSubmitting || message.handling_status === 'processed'"
                 @click="updateMessageHandling(message, 'processed')"
               >
-                {{ message.handling_status === 'processed' ? '已处理' : '标记已处理' }}
+                {{ message.handling_status === 'processed' ? '系统外已处理' : '系统外已处理…' }}
               </button>
-              <button
+              <button v-if="workspaceView === 'messages' || workspaceView === 'customerMessages'"
                 class="action-button action-secondary"
                 type="button"
                 :disabled="handlingSubmitting || message.handling_status === 'ignored'"
@@ -1114,7 +1701,12 @@ onMounted(() => {
                 {{ message.handling_status === 'ignored' ? '已忽略' : '忽略' }}
               </button>
             </div>
-          </div>
+            <p v-if="messageFeedback[message.id]" class="message-inline-feedback" :class="`feedback-${messageFeedback[message.id].kind}`" role="status" aria-live="polite">
+              {{ messageFeedback[message.id].text }}
+            </p>
+            </div>
+            </section>
+          </template>
           <div v-if="canLoadMoreMessages || messagePage > 1" class="pagination-bar">
             <button v-if="messagePage > 1" class="secondary" type="button" :disabled="messageLoadingMore" @click="loadPreviousMessages">上一页</button>
             <span>第 {{ messagePage }} 页 · 每页 20 条</span>
@@ -1123,41 +1715,38 @@ onMounted(() => {
         </div>
       </section>
 
-      <section v-if="selectedInquiry" class="detail-panel panel">
+      <section v-if="isInquiryView && selectedInquiry" class="detail-panel panel">
         <div class="panel-heading">
           <div>
-            <p class="eyebrow">链路详情 · fixture #{{ selectedInquiry.id }}</p>
-            <h2>{{ selectedInquiry.customer_nickname || selectedInquiry.customer_contact }}</h2>
+            <p class="eyebrow">记录 #{{ selectedInquiry.id }}</p>
+            <h2>{{ selectedInquiry.contact_sources[0]?.customer_nickname || selectedInquiry.contact_sources[0]?.raw_customer_contact || `链路 #${selectedInquiry.id}` }}</h2>
           </div>
-          <span class="status-pill" :class="connectionStatusClass(accountStatus(selectedInquiry.source_channel_account_id))">{{ connectionStatusLabel(accountStatus(selectedInquiry.source_channel_account_id)) }}</span>
+          <span v-if="selectedInquiry.contact_sources.length > 0" class="status-pill">{{ [...new Set(selectedInquiry.contact_sources.map((source) => source.channel_type).filter(Boolean))].join(' / ') }}</span>
+          <button class="detail-close secondary" type="button" @click="selectedInquiryId = null">关闭详情</button>
+        </div>
+        <div class="detail-navigation">
+          <button type="button" class="secondary" :disabled="selectedInquiryIndex <= 0 && inquiryPage === 1" @click="moveInquiry(-1)">上一条</button>
+          <span>第 {{ inquiryPage }} / {{ inquiryTotalPages }} 页 · 本页 {{ selectedInquiryIndex + 1 }} / {{ inquiries.length }} 条</span>
+          <button type="button" class="secondary" :disabled="selectedInquiryIndex >= inquiries.length - 1 && !inquiryHasMore" @click="moveInquiry(1)">下一条</button>
         </div>
 
         <div class="facts-grid">
-          <div><span>业务类型</span><strong>未提供（当前模型无此字段）</strong></div>
-          <div><span>阶段/状态</span><strong>{{ statusLabel(selectedInquiry.status) }}</strong></div>
+          <div><span>业务类型</span><strong>{{ selectedInquiry.business_type === 'inquiry' ? '询盘' : selectedInquiry.business_type === 'after_sales' ? '售后' : '未分类' }}</strong></div>
+          <div><span>阶段/状态</span><strong>{{ selectedInquiry.status === 'new' ? '待人工确认' : statusLabel(selectedInquiry.status) }}</strong></div>
           <div><span>负责人</span><strong>{{ selectedInquiry.assigned_sales_user_id ? `用户 #${selectedInquiry.assigned_sales_user_id}` : '未分配' }}</strong></div>
-          <div><span>来源渠道</span><strong>{{ accountLabel(selectedInquiry.source_channel_account_id) }}</strong></div>
+          <div><span>来源渠道</span><strong>{{ [...new Set(selectedInquiry.messages.map((source) => source.channel_type).filter(Boolean))].join(' / ') || '当前授权可见来源为空' }}</strong></div>
+          <div><span>归链阶段</span><strong>{{ lifecycleStageLabel(selectedInquiry.lifecycle_stage) }}</strong></div>
         </div>
 
         <section class="detail-section">
-          <h3>原始客户信息</h3>
-          <dl class="contact-list">
-            <div><dt>联系人</dt><dd>{{ selectedInquiry.customer_nickname }}</dd></div>
-            <div><dt>联系方式</dt><dd>{{ selectedInquiry.customer_contact }}</dd></div>
-            <div><dt>安全正文</dt><dd>{{ selectedInquiry.display_text || '（无正文）' }}</dd></div>
-            <div v-if="selectedInquiry.content_truncated"><dt>正文状态</dt><dd>正文已安全截断，仅展示授权范围内的纯文本内容。</dd></div>
+          <h3>当前授权可见的联系人身份来源</h3>
+          <p v-if="selectedInquiry.contact_sources.length === 0" class="empty">没有当前可见的联系人来源。</p>
+          <dl v-for="(source, index) in selectedInquiry.contact_sources" :key="`${source.channel_account_id}-${index}`" class="contact-list">
+            <div><dt>来源</dt><dd>{{ source.channel_type || '未知渠道' }} · 账号 #{{ source.channel_account_id ?? '不可见' }}</dd></div>
+            <div><dt>联系人</dt><dd>{{ source.customer_nickname || source.raw_customer_contact || '未提供' }}</dd></div>
+            <div><dt>身份状态</dt><dd>{{ contactIdentityLabel(source.contact_identity_state) }}</dd></div>
           </dl>
-        </section>
-
-        <section class="detail-section">
-          <h3>附件 metadata</h3>
-          <p v-if="selectedInquiry.attachments.length === 0" class="empty">没有附件 metadata。</p>
-          <ul v-else class="attachment-list">
-            <li v-for="attachment in selectedInquiry.attachments" :key="attachment.id">
-              <strong>{{ attachment.original_filename }}</strong>
-              <span>{{ attachment.media_type }} · {{ attachment.size_bytes }} bytes</span>
-            </li>
-          </ul>
+          <p class="muted">联系方式仅来自当前授权可见消息；撤权来源不会显示。原文须从下方对应消息单独授权回溯。</p>
         </section>
 
         <section class="detail-section">
@@ -1180,6 +1769,23 @@ onMounted(() => {
         </section>
 
         <section class="detail-section">
+          <h3>关联客户消息</h3>
+          <p class="muted">客户消息概要、渠道和人工处理状态。</p>
+          <p v-if="selectedInquiry.messages.length === 0" class="empty">当前没有可见关联消息。</p>
+          <ol v-else class="timeline linked-message-timeline">
+            <li v-for="linkedMessage in selectedInquiry.messages" :key="linkedMessage.id">
+              <span>
+                {{ channelLabel(linkedMessage.channel_type) }} · {{ linkedMessage.direction === 'inbound' ? '客户入站' : '系统出站' }} · {{ formatTime(linkedMessage.occurred_at) }}
+              </span>
+               <strong>消息 #{{ linkedMessage.id }} · {{ handlingStatusLabel(linkedMessage.handling_status) }} · 概要 {{ linkedMessage.overview_status === 'ready' ? '已生成' : linkedMessage.overview_status === 'pending' ? '生成中' : '待生成' }}</strong>
+              <small>发送人/联系人：{{ selectedInquiry.contact_sources.find((source) => source.channel_account_id === linkedMessage.channel_account_id)?.customer_nickname || selectedInquiry.contact_sources.find((source) => source.channel_account_id === linkedMessage.channel_account_id)?.raw_customer_contact || '当前来源未提供' }} · 渠道账号：{{ linkedMessage.channel_account_external_id || accountLabel(linkedMessage.channel_account_id) }}</small>
+              <p class="linked-message-overview">{{ linkedMessage.overview_text || (linkedMessage.overview_status === 'pending' ? '中文概要正在生成。' : linkedMessage.overview_status === 'failed' ? '中文概要生成失败，可在消息收件箱重试。' : '暂无中文概要。') }}</p>
+              <button class="secondary" type="button" @click="openCustomerMessage(linkedMessage.id)">查看客户消息</button>
+            </li>
+          </ol>
+        </section>
+
+        <section class="detail-section">
           <h3>确定性分析</h3>
           <p v-if="!analysis" class="empty">当前没有分析结果。</p>
           <template v-else>
@@ -1191,10 +1797,14 @@ onMounted(() => {
 
         <section class="detail-section action-section">
           <h3>当前可执行操作</h3>
-          <p v-if="actionMessage" class="action-success">{{ actionMessage }}</p>
+          <button class="secondary operation-log-button" type="button" @click="openOperationLogs(selectedInquiry.id)">查看此链路操作记录</button>
           <p v-if="actionError" class="action-error">{{ actionError }}</p>
           <div v-if="selectedInquiry.status === 'new'" class="transfer-form">
-            <label for="transfer-target">手动转交给业务员</label>
+            <label for="transfer-business-type">业务类型</label>
+            <select id="transfer-business-type" v-model="selectedBusinessType">
+              <option :value="null">请选择类型</option><option value="inquiry">询盘</option><option value="after_sales">售后</option>
+            </select>
+            <label for="transfer-target">分配负责人</label>
             <select id="transfer-target" v-model="selectedSalesUserId">
               <option :value="null">请选择业务员</option>
               <option v-for="target in transferTargets" :key="target.id" :value="target.id">
@@ -1204,10 +1814,10 @@ onMounted(() => {
             <button
               class="primary"
               type="button"
-              :disabled="transferSubmitting || selectedSalesUserId === null"
+              :disabled="transferSubmitting || selectedSalesUserId === null || selectedBusinessType === null"
               @click="transferSelectedInquiry"
             >
-              {{ transferSubmitting ? '转交中…' : '确认手动转交' }}
+              {{ transferSubmitting ? '分配中…' : '确认分配' }}
             </button>
             <p v-if="transferTargets.length === 0" class="muted">当前没有可用的 active sales 目标。</p>
           </div>
@@ -1233,16 +1843,80 @@ onMounted(() => {
           <p class="muted">页面不代替后端授权，不会自动发送、自动转交或修改客户数据。</p>
         </section>
       </section>
-      <section v-else class="detail-panel panel empty-state">
+      <section v-else-if="isInquiryView && inquiries.length === 0" class="detail-panel panel empty-state">
         <h2>暂无可展示的链路</h2>
         <p>授权范围内没有询盘，或后端返回为空。</p>
       </section>
       </section>
     </template>
-  </main>
+  <Transition name="link-dialog">
+    <div
+      v-if="linkReviewMessageId !== null"
+      class="link-review-backdrop"
+      @click.self="closeLinkReview"
+      @keydown.esc.window="closeLinkReview"
+    >
+      <section class="link-review-dialog" role="dialog" aria-modal="true" aria-labelledby="link-review-title" tabindex="-1">
+        <header class="link-review-heading">
+          <div>
+            <p class="eyebrow">消息 #{{ linkReviewMessageId }} · 客户归属</p>
+            <h2 id="link-review-title">选择对应的客户链路</h2>
+            <p v-if="linkReviewMessage" class="link-review-subtitle">
+              {{ messageContactLabel(linkReviewMessage) }}<span v-if="messageSenderLabel(linkReviewMessage)"> · {{ messageSenderLabel(linkReviewMessage) }}</span>
+            </p>
+          </div>
+          <button class="dialog-close" type="button" aria-label="关闭客户归属窗口" @click="closeLinkReview">关闭 <span aria-hidden="true">×</span></button>
+        </header>
+        <div class="link-review-content" aria-live="polite">
+          <p v-if="linkReviewLoading" class="dialog-state">正在查找当前授权范围内的客户链路…</p>
+          <div v-else-if="linkReviewError" class="dialog-state dialog-error" role="alert">
+            <p>{{ linkReviewError }}</p>
+            <button class="secondary" type="button" @click="retryLinkReview">重试</button>
+          </div>
+          <template v-else-if="linkReviewCandidates">
+            <p v-if="linkReviewCandidates.match_state === 'manual_confirmation_required'" class="review-guidance">
+              请核对消息发送人和候选客户的联系方式后再关联。系统不会依据正文或相似姓名自动合并客户。
+            </p>
+            <p v-else-if="linkReviewCandidates.match_state === 'multiple'" class="review-guidance">找到多个可能的客户，请逐项核对联系方式后选择。</p>
+            <p v-else-if="linkReviewCandidates.match_state === 'none'" class="dialog-state">没有找到匹配链路。此消息仍留在消息收件箱中。</p>
+            <p v-else-if="linkReviewCandidates.match_state === 'missing_identity' || linkReviewCandidates.match_state === 'unsupported_identity'" class="dialog-state">这条消息没有可用于安全匹配的邮箱或手机号，暂时不能关联。</p>
+            <p v-else-if="linkReviewCandidates.match_state === 'linked'" class="dialog-state">这条消息已经关联到客户链路。</p>
+            <p v-if="linkReviewCandidates.items.length === 0 && ['manual_confirmation_required', 'multiple'].includes(linkReviewCandidates.match_state)" class="dialog-state">当前授权范围内没有可供确认的客户链路。</p>
+            <div v-if="linkReviewCandidates.items.length > 0" class="link-candidate-list">
+              <article v-for="candidate in linkReviewCandidates.items" :key="candidate.id" class="link-candidate-row">
+                <div class="link-candidate-identity">
+                  <strong>{{ candidate.customer_nickname || candidate.customer_contact || `未命名客户 #${candidate.id}` }}</strong>
+                  <span>{{ candidate.customer_contact || '联系方式未提供' }}</span>
+                  <small>链路 #{{ candidate.id }} · {{ statusLabel(candidate.status) }} · {{ handlingStatusLabel(candidate.handling_status) }}</small>
+                </div>
+                <button class="primary" type="button" :disabled="handlingSubmitting" @click="confirmMessageLink(candidate.id, linkReviewCandidates?.requires_identity_confirmation === true)">
+                  {{ handlingSubmitting ? '正在关联…' : linkReviewCandidates?.requires_identity_confirmation ? '确认身份并关联' : '关联此客户' }}
+                </button>
+              </article>
+            </div>
+          </template>
+        </div>
+        <footer class="link-review-footer">
+          <span>关闭窗口不会修改消息或客户资料。</span>
+          <button class="secondary" type="button" @click="closeLinkReview">关闭</button>
+        </footer>
+      </section>
+    </div>
+  </Transition>
+</main>
 </template>
 
 <style>
+.workspace-tabs { display: flex; gap: 4px; border-bottom: 1px solid #d6dfe2; }
+.workspace-tabs button { padding: 12px 18px; color: #52606d; background: transparent; border: 0; border-bottom: 3px solid transparent; cursor: pointer; font-weight: 700; }
+.workspace-tabs button.active { color: #165d68; border-bottom-color: #165d68; }
+.workspace-tabs button:focus-visible { outline: 2px solid #165d68; outline-offset: -3px; }
+.flow-note { margin: 14px 0 0; padding: 10px 12px; color: #46565c; background: #f1f5f5; border-left: 3px solid #147a85; font-size: 13px; line-height: 1.5; }
+.inbox-panel > .panel-heading > div > p:not(.eyebrow) { margin: 6px 0 0; color: #687782; font-size: 13px; line-height: 1.5; }
+.inquiry-pagination { padding: 16px 26px; border-top: 1px solid #e5eaec; }
+.detail-navigation { display: flex; align-items: center; gap: 12px; padding: 10px 0; border-top: 1px solid #e5eaec; border-bottom: 1px solid #e5eaec; }
+.detail-navigation span { flex: 1; color: #687782; font-size: 12px; }
+@media (max-width: 480px) { .workspace-tabs button { flex: 1; padding: 12px 4px; } }
 :root {
   color: #172033;
   background: #f4f6fa;
@@ -1276,7 +1950,12 @@ h3 { margin-bottom: 14px; font-size: 15px; }
 .channel-card { display: grid; gap: 8px; padding: 15px; background: #f7f9fc; border: 1px solid #e5eaf2; border-radius: 10px; }
 .channel-provider { margin: 0; color: #3158c9; font-size: 12px; overflow-wrap: anywhere; }
 .channel-actions { display: flex; align-items: center; gap: 10px; }
-.analysis-strip { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-top: 20px; }
+.analysis-strip { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-top: 20px; }
+.analysis-lists { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; grid-column: 1 / -1; }
+.analysis-list { padding: 16px 18px; min-width: 0; }
+.analysis-list ul { margin: 0; padding-left: 18px; }
+.analysis-list li { display: flex; justify-content: space-between; gap: 12px; padding: 7px 0; border-top: 1px solid #edf0f5; font-size: 12px; overflow-wrap: anywhere; }
+.analysis-list li span:last-child { color: #758198; text-align: right; }
 .analysis-card { display: grid; gap: 7px; padding: 15px 16px; background: white; border: 1px solid #e2e7f0; border-radius: 12px; }
 .analysis-card span { color: #758198; font-size: 12px; }
 .analysis-card strong { font-size: 18px; }
@@ -1297,6 +1976,7 @@ h3 { margin-bottom: 14px; font-size: 15px; }
 .inbox-filters { display: flex; flex-wrap: wrap; gap: 8px; padding: 0 20px 10px; }
 .inbox-filters select { min-width: 0; padding: 7px 8px; color: #172033; background: white; border: 1px solid #cbd6f4; border-radius: 7px; }
 .status-warning { color: #9a2f3b; font-size: 11px; font-weight: 700; }
+.review-guidance { color: #5b6470; font-size: 12px; line-height: 1.6; margin: 0 0 10px; }
 .subsection { margin: 25px 20px 0; padding-top: 20px; border-top: 1px solid #e5eaf2; }
 .message-row { padding: 11px 0; border-top: 1px solid #edf0f5; font-size: 13px; }
 .message-row p { margin: 5px 0 0; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
@@ -1358,6 +2038,12 @@ h3 { margin-bottom: 14px; font-size: 15px; }
 .setting-facts span { display: block; margin-bottom: 5px; color: #788397; font-size: 12px; }
 .setting-facts strong { display: block; overflow-wrap: anywhere; color: #253047; font-size: 14px; font-weight: 550; }
 .setting-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; }
+.refetch-check-result { margin-top: 12px; padding: 10px 12px; border: 1px solid #d7e5e7; border-radius: 4px; background: #f7fafb; font-size: 12px; line-height: 1.6; }
+.refetch-check-result.ok { border-color: #b6d8c4; background: #f2faf5; color: #2f6b4f; }
+.refetch-check-result.warn { border-color: #e8c4c9; background: #fdf5f6; color: #9a2f3b; }
+.refetch-check-result p { margin: 4px 0 0; }
+.refetch-check-result ul { margin: 6px 0 0; padding-left: 18px; }
+.content-source-hint { margin-top: 4px; color: #9a2f3b !important; font-size: 11px !important; }
 .danger-link { color: #9a2f3b; }
 .profile-feedback { margin-top: -8px; }
 .fixture-section { padding-top: 8px; border-top: 1px solid #dfe4eb; }
@@ -1376,7 +2062,7 @@ h3 { margin-bottom: 14px; font-size: 15px; }
 .loading-title { width: 28%; height: 20px; }
 .loading-line { width: 72%; }
 .loading-line.short { width: 48%; }
-@media (max-width: 800px) { .channel-grid { grid-template-columns: 1fr; } .analysis-strip { grid-template-columns: repeat(2, 1fr); } .content-grid { grid-template-columns: 1fr; } .facts-grid { grid-template-columns: repeat(2, 1fr); } }
+@media (max-width: 800px) { .channel-grid { grid-template-columns: 1fr; } .analysis-strip { grid-template-columns: repeat(2, 1fr); } .analysis-lists { grid-template-columns: 1fr; } .content-grid { grid-template-columns: 1fr; } .facts-grid { grid-template-columns: repeat(2, 1fr); } }
 @media (max-width: 800px) { .channel-setting { grid-template-columns: 1fr; gap: 18px; } .profile-heading { display: block; } .back-link { margin-top: 12px; } }
 @media (max-width: 480px) { .analysis-strip { grid-template-columns: 1fr; } .transfer-form { grid-template-columns: 1fr; } .transfer-form .primary { grid-column: 1; } .profile-view { margin-top: 20px; } .profile-heading h2 { font-size: 25px; } .setting-panel { padding: 16px; } .setting-facts { grid-template-columns: 1fr; gap: 12px; } .fixture-row { display: grid; align-items: start; } .setting-actions > button { min-height: 42px; } }
 @media (max-width: 480px) { .workspace { width: min(100% - 24px, 1240px); padding-top: 22px; } .detail-panel { padding: 20px; } .facts-grid { grid-template-columns: 1fr; } .attachment-list li { display: grid; gap: 5px; } }
@@ -1422,6 +2108,7 @@ h3 { color: #20272d; }
 .message-meta strong { flex-basis: 100%; color: #20272d; font-size: 13px; }
 .message-meta .sender, .message-meta .meta-time, .message-meta .state-label { color: #68727b; font-size: 12px; line-height: 1.45; }
 .message-meta .state-label { color: #1d5fbf; font-weight: 700; }
+.message-meta .group-badge { background: #e8f1f8; border: 1px solid #c9dcef; border-radius: 999px; padding: 0 8px; color: #1d5fbf; }
 .message-meta .ingestion-state { color: #68727b; font-weight: 600; }
 .message-row p { grid-column: 2; grid-row: 1; margin: 0; color: #344047; line-height: 1.55; }
 .message-row .message-actions { grid-column: 3; grid-row: 1 / span 2; justify-content: flex-end; align-items: flex-start; margin-top: 0; }
@@ -1622,14 +2309,31 @@ button:focus-visible, select:focus-visible, .inquiry-row:focus-visible {
 .inline-feedback a { color: inherit; font-weight: 700; }
 .action-primary.is-opening { cursor: progress; opacity: .78; }
 .content-expand-link { margin-top: 6px; color: #165d68; font-size: 12px; font-weight: 700; }
-.message-original-preview { white-space: pre-wrap; }
+.message-original-preview { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 8; overflow: hidden; white-space: pre-wrap; }
 .message-full-content { white-space: pre-wrap; }
+.message-group-bar { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 14px; padding: 7px 12px; background: #f2f7f8; border: 1px solid #d7e5e7; border-radius: 4px; }
+.message-group-bar .group-label { color: #165d68; font-size: 12px; font-weight: 700; }
+.message-group-bar .link-button { color: #165d68; font-size: 12px; font-weight: 700; }
+.message-group { margin-top: 14px; padding: 0 14px 4px; border: 1px solid #dce4e7; border-radius: 6px; background: #fff; }
+.message-group.has-multiple { background: #fbfcfc; }
+.message-group-bar { margin: 0 -14px; padding: 11px 14px; border: 0; border-bottom: 1px solid #dce4e7; border-radius: 5px 5px 0 0; background: #f1f6f6; }
+.message-group .message-row:first-of-type { border-top: 0; }
+.message-group .message-row:last-child { border-bottom: 0; }
+.action-toast { position: fixed; z-index: 1000; top: 22px; left: 50%; display: flex; align-items: center; gap: 11px; max-width: min(390px, calc(100vw - 32px)); padding: 13px 17px; transform: translateX(-50%); color: #263b34; background: #fff; border: 1px solid #dce8e1; border-left: 4px solid #27845d; border-radius: 7px; box-shadow: 0 8px 28px rgb(24 42 34 / 16%); font-size: 14px; font-weight: 650; }
+.action-toast.toast-ignored { color: #554629; border-color: #eee4cb; border-left-color: #b48627; }
+.toast-mark { display: grid; flex: 0 0 24px; width: 24px; height: 24px; place-items: center; border-radius: 50%; color: #fff; background: #27845d; font-size: 14px; }
+.toast-ignored .toast-mark { background: #b48627; }
+.action-toast-enter-active, .action-toast-leave-active { transition: opacity 220ms ease, transform 220ms cubic-bezier(.2,.75,.25,1); }
+.action-toast-enter-from { opacity: 0; transform: translate(-50%, -16px); }
+.action-toast-leave-to { opacity: 0; transform: translate(-50%, -8px); }
 .content-label { display: block; margin-bottom: 4px; color: #687782; font-size: 12px; font-weight: 700; }
 .content-source-note { color: #687782 !important; font-size: 11px !important; }
-.content-refetch-warning { color: #9a2f3b !important; font-size: 12px !important; }
+.content-source-note.tone-ok { color: #2f6b4f !important; }
+.content-source-note.tone-warn { color: #9a2f3b !important; }
+.content-clamp-hint { display: block; margin-top: 4px; color: #89939b !important; font-size: 11px !important; }
 .message-overview { grid-column: 2; color: #165d68 !important; font-weight: 700; }
 .message-overview.fallback { color: #9a2f3b !important; font-weight: 500; }
-.archive-toolbar { display: flex; align-items: center; gap: 12px; margin: 12px 0; }
+.archive-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin: 12px 0; }
 .archive-box { margin: 12px 0 18px; padding: 14px; background: #f8fbfb; border: 1px solid #d7e5e7; border-radius: 6px; }
 .archive-box h3 { margin-bottom: 10px; }
 .archive-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 0; border-top: 1px solid #e3edef; }
@@ -1645,5 +2349,173 @@ button:focus-visible, select:focus-visible, .inquiry-row:focus-visible {
 @media (max-width: 700px) {
   .refresh-state { margin-left: 18px; margin-right: 18px; }
   .message-row:hover { transform: none; }
+  .action-toast { top: 12px; left: 50%; width: max-content; max-width: calc(100vw - 24px); }
+}
+
+.content-grid.has-selected-inquiry { display: grid; grid-template-columns: minmax(230px, 300px) minmax(0, 1fr); align-items: start; gap: 18px; }
+.has-selected-inquiry > .workspace-tabs { grid-column: 1 / -1; }
+.inbox-panel.inquiry-sidebar { position: sticky; top: 16px; align-self: start; max-height: calc(100vh - 32px); overflow-y: auto; scrollbar-width: thin; }
+.inquiry-sidebar .panel-heading { padding: 16px; }
+.inquiry-sidebar .panel-heading > div > p:not(.eyebrow) { display: none; }
+.inquiry-sidebar .panel-heading h2 { font-size: 16px; }
+.inquiry-sidebar .count { white-space: nowrap; font-size: 11px; }
+.inquiry-sidebar .inbox-filters { padding: 10px 14px; }
+.inquiry-sidebar .inquiry-row { padding: 11px 14px; }
+.inquiry-sidebar .inquiry-row .channel, .inquiry-sidebar .inquiry-row .preview { display: none; }
+.inquiry-sidebar .inquiry-row strong { overflow-wrap: anywhere; }
+.inquiry-sidebar .inquiry-pagination { display: grid; gap: 8px; padding: 12px 14px; }
+.page-progress-label { margin: 0 !important; color: #52606d; font-size: 12px; text-align: center; }
+.page-dots { display: flex; align-items: center; justify-content: center; flex-wrap: wrap; gap: 2px; }
+.page-dot { display: grid; flex: 0 0 24px; width: 24px; min-width: 24px !important; height: 24px; place-items: center; padding: 0 !important; border: 0 !important; border-radius: 50%; background: transparent !important; cursor: pointer; }
+.page-dot span { width: 7px; height: 7px; border-radius: 50%; background: #aab6ba; transition: width 160ms ease, height 160ms ease, background-color 160ms ease; }
+.page-dot.active span { width: 10px; height: 10px; background: #147a85; }
+.page-dot:hover span { background: #147a85; }
+.page-dot:disabled { cursor: progress; }
+.detail-close { flex: 0 0 auto; }
+@media (max-width: 800px) {
+  .content-grid.has-selected-inquiry { grid-template-columns: 1fr; }
+  .has-selected-inquiry > .workspace-tabs { grid-column: 1; }
+  .inbox-panel.inquiry-sidebar { position: static; max-height: 38vh; }
+}
+
+/* Framed-sheet operations layout: one cool frame, one continuous white work surface. */
+:root { color: #20292c; background: #edf2f3; font-family: "IBM Plex Sans", "Noto Sans SC", "Microsoft YaHei", sans-serif; }
+body { min-width: 320px; background: #edf2f3; }
+.workspace { width: min(1680px, 100% - 32px); padding: 26px 0 32px; }
+.topbar { min-height: 52px; margin: 0; padding: 0 12px 18px; }
+.topbar h1 { margin: 0; color: #182326; font-size: 22px; font-weight: 600; }
+.eyebrow { color: #66777c; letter-spacing: 0; text-transform: none; }
+.workspace-tabs { gap: 0; padding: 0 20px; background: #f6f9f9; border: 1px solid #dfe7e8; border-bottom: 0; border-radius: 12px 12px 0 0; }
+.workspace-tabs button { min-height: 48px; padding: 10px 16px; color: #657277; border-bottom: 2px solid transparent; font-size: 14px; font-weight: 500; }
+.workspace-tabs button.active { color: #1b6c80; border-bottom-color: #1b6c80; }
+.content-grid { gap: 0; margin: 0; padding: 8px; background: #f6f9f9; border: 1px solid #dfe7e8; border-top: 0; border-radius: 0 0 12px 12px; }
+.inbox-panel, .detail-panel { background: #fff; border: 1px solid #e4eaeb; border-radius: 8px; box-shadow: none; }
+.inbox-panel { overflow: hidden; }
+.inbox-panel > .panel-heading { padding: 22px 24px 16px; }
+.inbox-panel > .panel-heading h2, .detail-panel h2 { color: #1c292d; font-size: 18px; font-weight: 600; }
+.inbox-filters { display: flex; align-items: end; gap: 14px; padding: 12px 24px; background: #f8fafb; border-top: 1px solid #edf1f2; border-bottom: 1px solid #e7edef; }
+.filter-group { gap: 8px; }
+.filter-group > span { color: #66777c; font-size: 12px; font-weight: 500; }
+.inbox-filters select, .transfer-form select { min-height: 34px; padding: 6px 28px 6px 9px; color: #253338; background: #fff; border: 1px solid #d4dfe1; border-radius: 5px; font-size: 13px; }
+.subsection { padding: 18px 24px 22px; border: 0; }
+.message-heading { padding: 0 0 14px !important; }
+.message-heading h2 { margin: 0; color: #1e2b2f; font-size: 17px; font-weight: 600; }
+.archive-toolbar { margin: 0 0 12px; }
+.message-group { margin: 12px 0 0; padding: 0 16px 2px; border: 1px solid #e3eaeb; border-radius: 6px; background: #fff; }
+.message-group.has-multiple { background: #fbfcfc; }
+.message-group-bar { margin: 0 -16px; padding: 10px 16px; background: #f3f7f7; border-bottom: 1px solid #e3eaeb; border-radius: 5px 5px 0 0; }
+.message-group-bar .group-label { color: #314b50; font-weight: 600; }
+.message-group.has-multiple { padding-bottom: 8px; border: 2px solid #738c91; border-left: 6px solid #367c72; background: #f3f8f6; }
+.message-group.has-multiple > .message-group-bar { margin: 0 -16px; padding: 12px 16px; color: #173d3b; background: #e3efeb; border-bottom: 1px solid #c7dad3; }
+.message-group.has-multiple .group-label::before { content: '同一客户链路'; display: inline-block; margin-right: 9px; padding: 3px 7px; color: #fff; background: #367c72; border-radius: 3px; font-size: 11px; }
+.message-group.has-multiple .message-row { margin: 0 -8px; padding-right: 10px; padding-left: 10px; background: #f8fbfa; }
+.message-group.has-multiple .message-row + .message-row { border-top: 1px dashed #bacbc4; }
+.message-group.has-multiple .group-badge { color: #164c43; background: #dcece5; border: 1px solid #b4d0c4; }
+.message-inline-feedback { grid-column: 1 / -1 !important; margin: 3px 0 0 !important; padding: 8px 10px; border-left: 3px solid #2d875f; color: #245b43 !important; background: #eef7f1; font-size: 12px; }
+.message-inline-feedback.feedback-error { color: #8a322e !important; background: #fff2ef; border-left-color: #bb5348; }
+.operation-log-button { margin: 10px 0 4px; }
+.profile-operations { display: flex; align-items: center; justify-content: space-between; gap: 18px; padding: 16px 18px; border-bottom: 1px solid #e4ebea; }
+.profile-operations h3, .profile-operations p { margin: 0; }
+.profile-operations p { margin-top: 4px; color: #687782; font-size: 13px; }
+.operation-object-link { padding: 0; color: #176b70; background: transparent; border: 0; font: inherit; text-align: left; text-decoration: underline; text-underline-offset: 3px; cursor: pointer; }
+.operation-object-link:hover { color: #10494d; }
+.operation-log-backdrop { position: fixed; z-index: 1200; inset: 0; display: grid; place-items: center; padding: 20px; background: rgba(22, 34, 37, .42); }
+.operation-log-dialog { width: min(920px, 100%); max-height: min(78vh, 720px); overflow: hidden; background: #fff; border: 1px solid #d8e1e1; border-radius: 8px; box-shadow: 0 20px 60px rgba(20, 40, 40, .24); }
+.operation-log-dialog > header { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 18px 22px; border-bottom: 1px solid #e4ebea; }
+.operation-log-dialog h2 { margin: 0; color: #203133; font-size: 18px; }
+.operation-log-table-wrap { max-height: calc(min(78vh, 720px) - 80px); overflow: auto; }
+.operation-log-table { width: 100%; border-collapse: collapse; font-size: 13px; text-align: left; }
+.operation-log-table th, .operation-log-table td { padding: 11px 14px; border-bottom: 1px solid #e8eeee; vertical-align: top; }
+.operation-log-table th { position: sticky; top: 0; color: #5c6d70; background: #f5f8f7; font-size: 12px; font-weight: 600; }
+.operation-log-table td small { display: block; margin-top: 3px; color: #728184; }
+.operation-result { display: inline-block; padding: 3px 7px; border-radius: 3px; color: #236345; background: #eaf5ee; white-space: nowrap; }
+.operation-result.result-failure { color: #933b31; background: #fff0ed; }
+.operation-result.result-timeout { color: #815d16; background: #fff6dc; }
+.message-row { grid-template-columns: minmax(170px, 220px) minmax(0, 1fr) auto; column-gap: 20px; padding: 15px 0; border-color: #e9eeef; }
+.message-row.is-focused-message { margin: 0 -8px; padding-right: 8px; padding-left: 8px; background: #eff8f8; outline: 1px solid #93c9cc; outline-offset: -1px; }
+.message-row { scroll-margin-top: 100px; }
+.message-row.is-focused-message { z-index: 1; background: #e5f3e9; outline: 2px solid #247a57; box-shadow: inset 6px 0 0 #247a57, 0 5px 18px rgba(31, 100, 72, .16); animation: message-focus-arrive 700ms ease-out both; }
+.message-row.is-focused-message::after { content: '当前查看'; position: absolute; top: 8px; right: 8px; padding: 3px 8px; color: #fff; background: #247a57; border-radius: 3px; font-size: 11px; font-weight: 700; }
+.linked-message-overview { margin: 8px 0; padding: 10px 12px; color: #283b39; background: #f1f7f2; border-left: 3px solid #61916e; line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; }
+@keyframes message-focus-arrive { from { background: #d5eddf; transform: translateY(5px); } to { background: #e5f3e9; transform: translateY(0); } }
+.message-meta strong, .inquiry-row strong { color: #24373c; }
+.message-overview { color: #31515a !important; font-weight: 500; }
+.message-row .channel-mark { color: #285761; background: #e9f3f3; }
+.message-row .message-actions { gap: 6px; }
+.action-button, .secondary, .primary { border-radius: 5px; }
+.primary, .action-primary { color: #fff; background: #1b6c80; border-color: #1b6c80; }
+.content-grid.has-selected-inquiry { grid-template-columns: minmax(230px, 290px) minmax(0, 1fr); gap: 10px; }
+.has-selected-inquiry > .workspace-tabs { grid-column: 1 / -1; }
+.inbox-panel.inquiry-sidebar { max-height: calc(100vh - 70px); border-radius: 8px; }
+.inquiry-sidebar .panel-heading { padding: 15px; }
+.inquiry-row { padding: 12px 15px; border-color: #edf1f2; }
+.inquiry-row:hover { background: #f6f9f9; }
+.inquiry-row.selected { background: #edf5f5; box-shadow: inset 2px 0 0 #1b6c80; }
+.inquiry-row .status { color: #315b62; background: #edf3f3; }
+.detail-panel { padding: 20px 24px; }
+.detail-section { border-color: #e8edef; }
+.detail-section h3 { color: #24373c; font-size: 14px; font-weight: 600; }
+.facts-grid > div { background: #f7f9fa; border-color: #e5ebed; border-radius: 5px; }
+.transfer-form { grid-template-columns: auto minmax(150px, 1fr) auto minmax(150px, 1fr) auto; align-items: center; }
+.transfer-form .primary { grid-column: auto; }
+.detail-navigation { border-color: #e6ecee; }
+.detail-close { padding: 6px 10px; }
+@media (max-width: 800px) {
+  .workspace { width: calc(100% - 20px); padding-top: 14px; }
+  .workspace-tabs { padding: 0 6px; overflow-x: auto; }
+  .workspace-tabs button { flex: 1 0 auto; padding: 10px 12px; white-space: nowrap; }
+  .content-grid { padding: 5px; }
+  .content-grid.has-selected-inquiry { grid-template-columns: 1fr; }
+  .inbox-panel.inquiry-sidebar { max-height: 34vh; }
+  .operation-log-dialog { max-height: 82vh; }
+  .operation-log-table { min-width: 640px; }
+  .subsection { padding: 15px; }
+  .inbox-filters { flex-wrap: wrap; padding: 12px 15px; }
+  .message-row { grid-template-columns: 1fr; gap: 8px; }
+  .message-row .message-meta, .message-row p, .message-row .message-preview, .message-row .message-actions { grid-column: 1; grid-row: auto; }
+  .message-row .message-actions { justify-content: flex-start; margin-top: 4px; }
+  .transfer-form { grid-template-columns: 1fr; }
+  .transfer-form .primary { grid-column: 1; }
+}
+.message-row { grid-template-columns: minmax(170px, 210px) minmax(0, 1fr) minmax(250px, 290px); column-gap: 20px; }
+.message-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-content: start; max-width: none; gap: 6px; margin: 0; }
+.message-actions .action-button { min-height: 32px; padding: 6px 8px; font-size: 12px; line-height: 1.25; white-space: normal; }
+.link-review-backdrop { position: fixed; z-index: 1200; inset: 0; display: grid; place-items: center; padding: 24px; background: rgb(23 35 39 / 42%); }
+.link-review-dialog { display: flex; width: min(760px, 100%); max-height: min(82vh, 720px); flex-direction: column; overflow: hidden; background: #fff; border: 1px solid #dbe4e6; border-radius: 10px; box-shadow: 0 22px 64px rgb(24 42 46 / 24%); outline: none; }
+.link-review-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; padding: 22px 24px 18px; border-bottom: 1px solid #e8edef; }
+.link-review-heading .eyebrow { margin-bottom: 7px; }
+.link-review-heading h2 { margin: 0; color: #202d31; font-size: 20px; font-weight: 600; }
+.link-review-subtitle { margin: 7px 0 0; color: #5c6d72; font-size: 13px; overflow-wrap: anywhere; }
+.dialog-close { display: inline-flex; min-height: 38px; flex: 0 0 auto; align-items: center; gap: 8px; padding: 7px 11px; color: #34464b; background: #f5f8f8; border: 1px solid #d9e2e4; border-radius: 5px; cursor: pointer; font-size: 13px; font-weight: 600; }
+.dialog-close span { color: #718186; font-size: 19px; line-height: 1; }
+.link-review-content { min-height: 180px; overflow-y: auto; padding: 20px 24px; }
+.dialog-state { margin: 0; padding: 18px 16px; color: #55676c; background: #f6f9f9; border: 1px solid #e4ebec; border-radius: 6px; font-size: 14px; line-height: 1.6; }
+.dialog-error { color: #812b32; background: #fff7f7; border-color: #f0d5d7; }
+.dialog-error p { margin-bottom: 12px; }
+.review-guidance { margin: 0 0 14px; padding: 12px 14px; color: #654e19; background: #fbf7ea; border-left: 3px solid #bf9638; font-size: 13px; line-height: 1.6; }
+.link-candidate-list { display: grid; gap: 8px; }
+.link-candidate-row { display: flex; min-height: 76px; align-items: center; justify-content: space-between; gap: 20px; padding: 14px 16px; background: #fff; border: 1px solid #e2e9eb; border-radius: 6px; }
+.link-candidate-identity { display: grid; min-width: 0; gap: 4px; }
+.link-candidate-identity strong { color: #24373c; font-size: 14px; overflow-wrap: anywhere; }
+.link-candidate-identity span { color: #40565c; font-size: 13px; overflow-wrap: anywhere; }
+.link-candidate-identity small { color: #718085; font-size: 12px; }
+.link-candidate-row .primary { flex: 0 0 auto; min-height: 36px; padding: 7px 12px; }
+.link-review-footer { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 14px 24px; background: #fafcfc; border-top: 1px solid #e8edef; }
+.link-review-footer span { color: #718085; font-size: 12px; }
+.link-review-footer .secondary { min-width: 74px; min-height: 36px; }
+.link-dialog-enter-active, .link-dialog-leave-active { transition: opacity 180ms ease; }
+.link-dialog-enter-active .link-review-dialog, .link-dialog-leave-active .link-review-dialog { transition: transform 180ms cubic-bezier(.2,.75,.25,1); }
+.link-dialog-enter-from, .link-dialog-leave-to { opacity: 0; }
+.link-dialog-enter-from .link-review-dialog, .link-dialog-leave-to .link-review-dialog { transform: translateY(10px); }
+@media (max-width: 700px) {
+  .message-row { grid-template-columns: 1fr; gap: 8px; }
+  .message-row .message-meta, .message-row p, .message-row .message-preview, .message-row .message-actions { grid-column: 1; grid-row: auto; }
+  .link-review-backdrop { align-items: end; padding: 8px; }
+  .link-review-dialog { width: 100%; max-height: 88vh; border-radius: 10px 10px 6px 6px; }
+  .link-review-heading, .link-review-content { padding-right: 16px; padding-left: 16px; }
+  .link-review-heading h2 { font-size: 18px; }
+  .link-candidate-row { align-items: stretch; flex-direction: column; gap: 12px; }
+  .link-candidate-row .primary { width: 100%; }
+  .link-review-footer { padding: 12px 16px; }
 }
 </style>

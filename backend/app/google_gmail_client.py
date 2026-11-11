@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import os
+import logging
 from urllib.parse import urlencode
 
 import httpx
@@ -21,9 +22,14 @@ class GoogleOAuthHttpClient:
         self.client_id = os.environ.get("GMAIL_CLIENT_ID")
         self.client_secret = os.environ.get("GMAIL_CLIENT_SECRET")
         self.redirect_uri = os.environ.get("GMAIL_REDIRECT_URI")
-        self.scopes = os.environ.get(
+        scopes = os.environ.get(
             "GMAIL_SCOPES", "https://www.googleapis.com/auth/gmail.readonly"
-        )
+        ).split()
+        # Userinfo's stable subject requires OpenID, including with existing
+        # deployments that override GMAIL_SCOPES with only Gmail permissions.
+        if "openid" not in scopes:
+            scopes.append("openid")
+        self.scopes = " ".join(scopes)
         if not self.client_id or not self.client_secret or not self.redirect_uri:
             raise GmailOAuthConfigurationError("Gmail OAuth configuration is incomplete")
         self.http = http or httpx.Client(timeout=float(os.environ.get("GMAIL_TIMEOUT_SECONDS", "20")))
@@ -51,6 +57,7 @@ class GoogleOAuthHttpClient:
                 "grant_type": "authorization_code",
             },
         )
+        logging.getLogger(__name__).warning("gmail_oauth stage=token status=%d", response.status_code)
         if response.status_code >= 400:
             raise GmailOAuthConfigurationError("Google OAuth code exchange failed")
         data = response.json()
@@ -58,6 +65,8 @@ class GoogleOAuthHttpClient:
         required_scope = "https://www.googleapis.com/auth/gmail.readonly"
         if required_scope not in granted_scopes:
             raise GmailOAuthConfigurationError("Google OAuth did not grant Gmail readonly scope")
+        if "openid" not in granted_scopes:
+            raise GmailOAuthConfigurationError("Google OAuth did not grant OpenID scope")
         access_token = data.get("access_token")
         if not isinstance(access_token, str) or not access_token:
             raise GmailOAuthConfigurationError("Google OAuth response has no access token")
@@ -68,6 +77,7 @@ class GoogleOAuthHttpClient:
             GOOGLE_USERINFO_URL,
             headers={"Authorization": f"Bearer {access_token}"},
         )
+        logging.getLogger(__name__).warning("gmail_oauth stage=userinfo status=%d", identity.status_code)
         if identity.status_code >= 400:
             raise GmailOAuthConfigurationError("Google account identity lookup failed")
         external_account_id = identity.json().get("sub")
@@ -99,6 +109,7 @@ class GmailWatchHttpClient:
             headers={"Authorization": f"Bearer {self.access_token}"},
             json={"topicName": topic_name, "labelIds": ["INBOX"]},
         )
+        logging.getLogger(__name__).warning("gmail_oauth stage=watch status=%d", response.status_code)
         if response.status_code >= 400:
             raise GmailOAuthConfigurationError("Gmail Watch creation failed")
         data = response.json()

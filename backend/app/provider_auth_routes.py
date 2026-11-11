@@ -1,5 +1,6 @@
 from datetime import datetime, timezone
 import os
+import logging
 from typing import Annotated, Protocol
 from urllib.parse import urlencode
 
@@ -81,7 +82,7 @@ def _scoped_account(db: Session, user: User, account_id: int, channel_type: str)
             ChannelAccount.id == account_id,
             ChannelAccount.channel_type == channel_type,
             ChannelAccount.id.in_(scoped_channel_account_ids(user)),
-        )
+        ).with_for_update()
     )
     if account is None:
         raise HTTPException(status_code=403, detail="没有权限访问")
@@ -106,17 +107,26 @@ def gmail_authorize_start(
 
 @router.get("/gmail/authorize/callback")
 def gmail_authorize_callback(
-    code: str = Query(min_length=1),
+    code: str | None = None,
     state: str = Query(min_length=1),
     user: Annotated[User, Depends(current_user)] = None,
     db: Session = Depends(get_db),
     client: GmailOAuthClient = Depends(get_gmail_oauth_client),
+    error: str | None = None,
 ) -> dict[str, int | str]:
     # Validate state before configuration checks so malformed/replayed browser
     # callbacks are rejected consistently without consuming a valid state.
     pending = _oauth_states.validate_any(state)
     if pending is None:
         raise HTTPException(status_code=400, detail="OAuth state 无效或已过期")
+    account = _scoped_account(db, user, pending.channel_account_id, "gmail")
+    if error:
+        if _oauth_states.consume_any(state) is None:
+            raise HTTPException(status_code=400, detail="OAuth state 无效或已过期")
+        logging.getLogger(__name__).info("gmail_oauth stage=callback status=provider_denied")
+        raise HTTPException(status_code=400, detail="Gmail 授权被取消或拒绝")
+    if not code:
+        raise HTTPException(status_code=400, detail="Gmail 授权代码缺失")
     if not gmail_authorization_storage_configured():
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -132,6 +142,8 @@ def gmail_authorize_callback(
         authorization = client.exchange_code(code=code, state=state)
         if not authorization.refresh_token:
             raise GmailCredentialError("Google OAuth did not return a refresh token")
+        if account.external_account_id and account.external_account_id != authorization.external_account_id:
+            raise HTTPException(status_code=409, detail="请重新授权原 Gmail 账号")
         topic_name = os.environ.get("GMAIL_PUBSUB_TOPIC", "")
         if not topic_name:
             raise GmailOAuthConfigurationError("Gmail Pub/Sub topic is not configured")

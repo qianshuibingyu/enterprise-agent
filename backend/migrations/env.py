@@ -12,6 +12,7 @@ from app.models.business import (  # noqa: F401
     InquiryEvent,
     Message,
     MessageAttachment,
+    OperationLog,
 )
 from app.models.overview import MessageOverview  # noqa: F401
 

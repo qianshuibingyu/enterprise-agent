@@ -19,6 +19,25 @@ class OutlookGraphError(RuntimeError):
 class OutlookGraphClient:
     MAIL_FOLDERS = ("inbox", "junkemail")
 
+    @staticmethod
+    def _identity_matches(identity: dict[str, Any], external_account_id: str | None) -> bool:
+        """Compare the stored mapping against every stable Graph identity field.
+
+        Older accounts stored an OIDC-style subject while Graph /me returns a
+        different id shape, so all stable Graph identity fields are accepted.
+        A total mismatch still fails closed: it can mean the account was
+        re-authorized to a different mailbox.
+        """
+        if not external_account_id:
+            return False
+        target = external_account_id.strip().lower()
+        candidates = {
+            str(identity.get("id") or "").lower(),
+            str(identity.get("mail") or "").lower(),
+            str(identity.get("userPrincipalName") or "").lower(),
+        }
+        return target in candidates
+
     def __init__(self, *, refresh_token: str, http: httpx.Client | None = None) -> None:
         self.refresh_token = refresh_token
         self.http = http or httpx.Client(
@@ -76,7 +95,7 @@ class OutlookGraphClient:
         into "every message ever received".
         """
         identity = self._get("/me", {"$select": "id,mail,userPrincipalName"})
-        if identity.get("id") != external_account_id:
+        if not self._identity_matches(identity, external_account_id):
             raise OutlookGraphError("Outlook account mapping failed")
         messages: list[dict[str, Any]] = []
         for folder in self.MAIL_FOLDERS:
@@ -101,7 +120,7 @@ class OutlookGraphClient:
     ) -> dict[str, Any]:
         """Fetch one message after verifying the delegated account mapping."""
         identity = self._get("/me", {"$select": "id,mail,userPrincipalName"})
-        if identity.get("id") != external_account_id:
+        if not self._identity_matches(identity, external_account_id):
             raise OutlookGraphError("Outlook account mapping failed")
         message = self._get(
             f"/me/messages/{quote(message_id.strip(), safe='')}",

@@ -1,10 +1,10 @@
 from typing import Literal
 
 from fastapi import HTTPException
-from sqlalchemy import Select, and_, exists, false, select
+from sqlalchemy import Select, and_, exists, or_, select
 from sqlalchemy.orm import Session
 
-from app.models.business import ChannelAccount, ChannelGrant, Inquiry, InternalNotification, Message
+from app.models.business import ChannelAccount, ChannelGrant, Inquiry, InquiryMessage, InternalNotification, Message
 from app.models.user import User
 
 DENIED_DETAIL = "没有权限访问"
@@ -31,8 +31,7 @@ def scoped_channel_account_ids(user: User) -> Select:
 
 
 def scoped_inquiries(user: User) -> Select:
-    """Build a query whose predicates enforce the caller's object scope."""
-    channel_scope = scoped_channel_account_ids(user)
+    """Build the Inquiry object scope; linked-message visibility is filtered separately."""
     if user.role == "sales":
         return (
             select(Inquiry)
@@ -42,16 +41,34 @@ def scoped_inquiries(user: User) -> Select:
                 ChannelAccount.status != "revoked",
             )
         )
-    return select(Inquiry).where(Inquiry.source_channel_account_id.in_(channel_scope))
+    visible_message = (
+        select(InquiryMessage.inquiry_id)
+        .join(Message, Message.id == InquiryMessage.message_id)
+        .join(ChannelAccount, ChannelAccount.id == Message.channel_account_id)
+        .where(InquiryMessage.inquiry_id == Inquiry.id)
+    )
+    visible_message = visible_message.where(
+        Message.channel_account_id.in_(scoped_channel_account_ids(user))
+    )
+    return select(Inquiry).where(exists(visible_message))
 
 
 def scoped_messages(user: User) -> Select:
     """Build a message query scoped through the caller's authorized accounts."""
     channel_scope = scoped_channel_account_ids(user)
     if user.role == "sales":
-        # Message has no inquiry/conversation foreign key yet. Do not infer
-        # message visibility from an account-level inquiry assignment.
-        return select(Message).where(false())
+        # Sales can read only messages explicitly linked to their assigned
+        # inquiries; assignment does not grant access to unrelated account mail.
+        return (
+            select(Message)
+            .join(InquiryMessage, InquiryMessage.message_id == Message.id)
+            .join(Inquiry, Inquiry.id == InquiryMessage.inquiry_id)
+            .join(ChannelAccount, ChannelAccount.id == Message.channel_account_id)
+            .where(
+                Inquiry.assigned_sales_user_id == user.id,
+                ChannelAccount.status != "revoked",
+            )
+        )
     return select(Message).where(Message.channel_account_id.in_(channel_scope))
 
 
@@ -91,11 +108,18 @@ def get_scoped_notification(db: Session, user: User, notification_id: int) -> In
     notification = db.scalar(
         select(InternalNotification)
         .join(Inquiry, InternalNotification.inquiry_id == Inquiry.id)
-        .join(ChannelAccount, ChannelAccount.id == Inquiry.source_channel_account_id)
         .where(
             InternalNotification.id == notification_id,
             Inquiry.assigned_sales_user_id == user.id,
-            ChannelAccount.status != "revoked",
+            exists(
+                select(InquiryMessage.inquiry_id)
+                .join(Message, Message.id == InquiryMessage.message_id)
+                .join(ChannelAccount, ChannelAccount.id == Message.channel_account_id)
+                .where(
+                    InquiryMessage.inquiry_id == Inquiry.id,
+                    ChannelAccount.status != "revoked",
+                )
+            ),
         )
     )
     if notification is None:
@@ -110,11 +134,7 @@ def can_access_channel_account(db: Session, user: User, account_id: int) -> bool
 
 
 def can_transfer_inquiry(db: Session, user: User, inquiry: Inquiry) -> bool:
-    return db.scalar(
-        select(exists(scoped_channel_account_ids(user).where(
-            ChannelAccount.id == inquiry.source_channel_account_id
-        )))
-    )
+    return db.scalar(select(exists(scoped_inquiries(user).where(Inquiry.id == inquiry.id))))
 
 
 def validate_read_query(query: Literal["channel_accounts", "inquiries", "notifications"]) -> None:

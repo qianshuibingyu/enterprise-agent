@@ -90,6 +90,26 @@ def content_view(value: Any) -> dict[str, object]:
     }
 
 
+def full_content_view(value: Any) -> dict[str, object]:
+    """Return the complete sanitized text for the original-content view.
+
+    List endpoints use ``content_view`` to bound untrusted provider data. The
+    detail view must instead be able to show the whole ingest snapshot, so this
+    renderer keeps text/plain output without applying MAX_DISPLAY_TEXT.
+    """
+    text = _plain_text(value)
+    excerpt = text[:MAX_DISPLAY_EXCERPT].rstrip()
+    if len(text) > MAX_DISPLAY_EXCERPT:
+        excerpt = text[: max(0, MAX_DISPLAY_EXCERPT - 1)].rstrip() + "…"
+    return {
+        "display_text": text,
+        "display_excerpt": excerpt,
+        "content_format": "text/plain",
+        "content_sanitized": True,
+        "content_truncated": False,
+    }
+
+
 def legacy_contact_view(raw_content: Any, provider: str | None) -> tuple[str | None, str | None]:
     """Best-effort contact recovery for rows created before contact columns.
 

@@ -28,22 +28,41 @@ export type TransferTarget = {
 
 export type Inquiry = {
   id: number
-  customer_contact: string
-  customer_nickname: string
-  display_text: string
-  display_excerpt: string
-  content_format: 'text/plain'
-  content_sanitized: boolean
-  content_truncated: boolean
-  source_channel_account_id: number
+  contact_sources: Array<{
+    raw_customer_contact: string | null
+    normalized_customer_contact: string | null
+    contact_identity_state: 'certain' | 'forwarded' | 'identity_uncertain' | 'needs_manual_review' | 'unsupported'
+    contact_identity_kind: 'email' | 'whatsapp' | null
+    customer_nickname: string | null
+    channel_account_id: number | null
+    channel_type: string | null
+  }>
+  /** Authorized metadata only; source content is fetched via the message-scoped content endpoint. */
+  messages: Array<{
+    id: number
+    channel_account_id: number
+    channel_account_external_id: string | null
+    channel_type: string
+    provider: string
+    external_message_id: string
+    direction: string
+    handling_status: 'pending' | 'processed' | 'ignored'
+    occurred_at: string
+    overview_status: 'pending' | 'ready' | 'failed' | null
+    overview_text: string | null
+  }>
+  source_channel_account_id: null
   status: string
+  business_type: 'inquiry' | 'after_sales' | null
   handling_status: 'pending' | 'processed' | 'ignored'
   assigned_sales_user_id: number | null
+  last_activity_at: string | null
+  lifecycle_stage: 'unknown' | 'active' | 'archived_silent' | 'purge_due'
   created_at: string | null
   updated_at: string | null
   timeline: InquiryEvent[]
   timeline_complete: boolean
-  attachments: AttachmentMetadata[]
+  attachments: []
 }
 
 export type InquiryEvent = {
@@ -71,17 +90,48 @@ export type InquiryHandlingStatusCounts = {
 export type InternalAnalysis = {
   mode: 'read_only' | 'guidance'
   read_only: boolean
+  generated_at?: string
+  mutation_performed?: false
+  write_operations_performed?: 0
+  query_scope?: 'current_user_authorized_objects'
   test_only: string
   stage_source?: string
   event_source?: string
   event_history_available?: boolean
   actor_id?: number
+  actions?: Array<{ operation: 'create' | 'assign' | 'update' | 'send'; page: string; label: string }>
   pending_message_count?: number
+  pending_inbound_message_count?: number
+  pending_contact_count?: number
+  inquiries_by_lifecycle_stage?: Record<'unknown' | 'active' | 'archived_silent' | 'purge_due', number>
+  messages_by_link_state?: Record<'pending' | 'linked' | 'unmatched' | 'manual_review' | 'not_linkable', number>
+  unlinked_messages?: Array<{
+    id: number
+    channel_account_id: number
+    provider: string
+    external_message_id: string
+    identity_state: string
+    link_state: string
+    occurred_at: string
+  }>
+  recent_events?: Array<{
+    inquiry_id: number
+    event_type: string
+    occurred_at: string
+    actor_user_id: number | null
+  }>
+  messages_needing_manual_review?: Array<{
+    id: number
+    provider: string
+    external_message_id: string
+    link_state: string
+    identity_state: string
+    occurred_at: string
+  }>
   inquiries_by_status?: InquiryStatusCounts
   inquiries_by_handling_status?: InquiryHandlingStatusCounts
   my_transfers?: Array<{
     inquiry_id: number
-    customer_nickname: string
     status: string
     assigned_sales_user_id: number | null
     updated_at: string | null
@@ -103,17 +153,47 @@ export type InternalAnalysis = {
   message?: string
 }
 
+export type InquiryLinkCandidates = {
+  message_id: number
+  match_state: 'linked' | 'missing_identity' | 'unsupported_identity' | 'manual_confirmation_required' | 'none' | 'unique' | 'multiple'
+  identity_state?: 'certain' | 'forwarded' | 'identity_uncertain' | 'needs_manual_review' | 'unsupported'
+  identity_kind?: 'email' | 'whatsapp_phone'
+  requires_identity_confirmation?: boolean
+  items: Array<Pick<Inquiry, 'id' | 'status' | 'handling_status'> & {
+    customer_contact?: string
+    customer_nickname?: string
+    contact_identity_kind?: 'email' | 'whatsapp' | null
+    contact_identity_state?: Inquiry['contact_identity_state']
+  }>
+}
+
+export type RefetchCheck = {
+  account_id: number
+  channel_type: string
+  ready: boolean
+  failure_kind: string | null
+  recommended_action: string
+  steps: Array<{ name: string; ok: boolean; detail: string }>
+}
+
 export type Message = {
   id: number
   channel_account_id: number
   channel_type: string
+  is_website_form?: boolean
   provider: string
   external_message_id: string
   customer_contact: string | null
+  normalized_customer_contact: string | null
+  original_sender_contact: string | null
+  contact_identity_state: 'certain' | 'forwarded' | 'identity_uncertain' | 'needs_manual_review' | 'unsupported'
+  contact_identity_kind: 'email' | 'whatsapp' | null
   customer_nickname: string | null
   direction: string
   ingestion_status: string
   handling_status: 'pending' | 'processed' | 'ignored'
+  inquiry_id: number | null
+  link_state: 'pending' | 'linked' | 'manual_review' | 'unmatched' | 'not_linkable'
   occurred_at: string
   created_at: string | null
   display_text: string
@@ -133,11 +213,23 @@ export type Message = {
   attachments: AttachmentMetadata[]
 }
 
+export type OperationLog = {
+  id: number
+  actor_name: string
+  operation_name: string
+  object_type: string
+  object_id: number | null
+  result: 'success' | 'failure' | 'timeout'
+  detail: string | null
+  created_at: string
+}
+
 export type PagedResponse<T> = {
   items: T[]
   page: number
   page_size: number
   has_more: boolean
+  total_count?: number
 }
 
 export class ApiError extends Error {
@@ -165,6 +257,16 @@ async function getJson<T>(path: string, init?: RequestInit): Promise<T> {
     try {
       const body = await response.json()
       if (typeof body.detail === 'string') message = body.detail
+      else if (Array.isArray(body.detail)) {
+        const issues = body.detail
+          .map((item: { loc?: unknown[]; msg?: unknown }) => {
+            const location = Array.isArray(item.loc) ? item.loc.slice(1).join('.') : ''
+            const detail = typeof item.msg === 'string' ? item.msg : ''
+            return [location, detail].filter(Boolean).join(': ')
+          })
+          .filter(Boolean)
+        if (issues.length > 0) message = `请求参数未通过校验：${issues.join('；')}`
+      }
     } catch {
       // Keep the status-based message when the response is not JSON.
     }
@@ -176,10 +278,16 @@ async function getJson<T>(path: string, init?: RequestInit): Promise<T> {
 
 export const inboxApi = {
   getCurrentUser: () => getJson<CurrentUser>('/auth/me'),
+  checkChannelRefetch: (accountId: number) =>
+    getJson<RefetchCheck>(`/api/channel-accounts/${accountId}/refetch-check`),
   getAccounts: () => getJson<ChannelAccount[]>('/api/channel-accounts'),
   getMessages: (params = '') => getJson<PagedResponse<Message>>(`/api/messages${params}`),
+  getMessage: (id: number) => getJson<Message>(`/api/messages/${id}`),
   getInquiries: (params = '') => getJson<PagedResponse<Inquiry>>(`/api/inquiries${params}`),
   getInquiry: (id: number) => getJson<Inquiry>(`/api/inquiries/${id}`),
+  getOperationLogs: (inquiryId?: number) => getJson<OperationLog[]>(
+    `/api/operation-logs?limit=100${inquiryId === undefined ? '' : `&inquiry_id=${inquiryId}`}`,
+  ),
   getMessageContent: (id: number) => getJson<{
     message_id: number
     channel_type: string
@@ -188,11 +296,14 @@ export const inboxApi = {
     direction: string
     occurred_at: string
     source: {
-      kind: 'cached_safe_text'
+      kind: 'cached_safe_text' | 'provider_refetch'
       provider: string
       external_message_id: string
       live_refetch: boolean
       fallback_reason: string | null
+      authoritative: boolean
+      refetch_status: 'refreshed' | 'snapshot'
+      snapshot_at: string | null
     }
     raw_content_exposed: false
     parsed_content: {
@@ -207,6 +318,20 @@ export const inboxApi = {
     can_expand: boolean
     attachments: AttachmentMetadata[]
   }>(`/api/messages/${id}/content`),
+  getMessageInquiryCandidates: (messageId: number) =>
+    getJson<InquiryLinkCandidates>(`/api/messages/${messageId}/inquiry-candidates`, {
+      signal: AbortSignal.timeout(15000),
+    }),
+  linkMessageToInquiry: (inquiryId: number, messageId: number, csrfToken: string, confirmIdentity = false) =>
+    getJson<Inquiry>(`/api/inquiries/${inquiryId}/messages`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Origin: window.location.origin,
+        'X-CSRF-Token': csrfToken,
+      },
+      body: JSON.stringify({ message_id: messageId, confirm_identity: confirmIdentity }),
+    }),
   getMessageProviderAction: (id: number) => getJson<{
     supported: boolean
     channel_type: string
@@ -245,7 +370,7 @@ export const inboxApi = {
       },
     })
   },
-  transferInquiry: (inquiryId: number, salesUserId: number, csrfToken: string) =>
+  transferInquiry: (inquiryId: number, salesUserId: number, businessType: 'inquiry' | 'after_sales', csrfToken: string) =>
     getJson<Inquiry>(`/api/inquiries/${inquiryId}/transfer`, {
       method: 'POST',
       headers: {
@@ -253,7 +378,7 @@ export const inboxApi = {
         Origin: window.location.origin,
         'X-CSRF-Token': csrfToken,
       },
-      body: JSON.stringify({ sales_user_id: salesUserId }),
+      body: JSON.stringify({ sales_user_id: salesUserId, business_type: businessType }),
     }),
   updateInquiryHandling: (inquiryId: number, action: 'processed' | 'ignored', csrfToken: string) =>
     getJson<Inquiry>(`/api/inquiries/${inquiryId}/action`, {

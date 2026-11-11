@@ -5,18 +5,18 @@
 ## 当前实现范围
 
 - `backend/app/`：FastAPI 应用、内部用户认证、基于服务端会话的登录/登出、首次登录强制修改密码、首期对象授权、三渠道连接/入站路径、运营收件箱和内容处理 API。
-- `backend/app/models/`、`backend/migrations/`：SQLAlchemy 用户/会话、渠道账号/授权、询盘/附件/内部通知、统一消息/消息附件、消息概要模型与 Alembic 迁移；工作区 head 为 `0012_message_overviews`，目标环境以用户最新核验为准。
-- `backend/app/message_ingestion.py`：provider-specific/provider-neutral 消息 mapping、批量入站、账号/provider/external ID 幂等和附件 metadata 保存服务；已由用户运行相关回归测试。
+- `backend/app/models/`、`backend/migrations/`：SQLAlchemy 用户/会话、渠道账号/授权、询盘/附件/内部通知、统一消息/消息附件、消息概要、询盘—消息关联及操作日志模型；工作区 Alembic head 为 `0017_message_feed_indexes`。目标环境是否已应用后续迁移，须以用户最新提供的在线核验为准。
+- `backend/app/message_ingestion.py`、`contact_identity.py`、`business_service.py`：provider-specific/provider-neutral 入站、身份规范化、消息幂等、询盘归链/人工关联和人工状态转换服务。当前工作区代码含 Gmail/Outlook/WhatsApp 入站与回源路径；本轮未运行测试，现状不等于最新版本回归通过。
 - `backend/app/channels/`：provider 合同、能力目录、fake 测试 provider、入站 seam 和凭据引用安全边界；三渠道真实入站主链路已有 Day 6 证据，补充重放/撤销/附件/长期运行专项仍待验收。
 - `backend/scripts/create_admin.py`：管理员初始化脚本。
-- `backend/tests/`：健康检查、数据库配置、认证、迁移、首期对象授权和渠道连接中心测试。
+- `backend/tests/`：健康检查、认证/授权、消息入站与回源、询盘—消息关联、身份规范化、内部只读分析、概要、渠道和迁移测试；测试文件存在不表示本轮或当前工作区版本已执行通过。
 - `frontend/`：Vue 3 + TypeScript + Vite 渠道账号“我的”页、运营收件箱、消息详情、原文预览/展开和人工状态操作；前端单元测试与生产构建已有 Day 8 证据，目标浏览器异常路径仍按 handoff 记录。
 - `backend/app/document_processing.py`：provider-neutral、纯内存、确定性资料清洗与切片；不上传、不持久化、不生成 embedding、不执行检索。
 - `backend/app/overview_service.py`、`backend/app/models/overview.py`：中文概要异步生成、状态/失败回退和概要持久化边界；生产目标环境自动生成仍待完整浏览器证据。
 - `compose.yaml`、`backend/Dockerfile`、`frontend/Dockerfile`、`whatsapp-bridge/`：开发/验收服务和镜像配置。
 - `PROJECT_SPEC.md`、`docs/`、`plan/`：项目范围、架构、交接记录及开发指南。
 
-三渠道真实入站主链路、授权收件箱、原文回源代码、中文概要代码闭环和内存资料清洗/切片基础已有 Day 6–Day 8 证据。知识资料上传/持久化、embedding、pgvector、检索/RAG、回复建议、人工审批和真实出站仍未实现。代码、隔离测试、目标环境 schema 和镜像构建不自动代表所有生产/真实 provider 补充验收已完成。
+三渠道真实入站主链路及 Day 8 内容处理曾有交接记录；当前工作区另有询盘—消息关联/人工确认、业务类型、官网表单隔离、操作日志、消息列表索引，以及 bridge 持久化加密消息归档等增量。最新这些改动的自动化回归、前端构建、部署和目标环境核验在本轮均未执行，勿沿用早期测试数字作为当前版本结果。知识资料上传/持久化、embedding、pgvector、检索/RAG、回复建议、审批发送仍未形成完整闭环；真实 provider 和生产状态按各 handoff 的证据边界判断。
 
 ## 开发环境
 

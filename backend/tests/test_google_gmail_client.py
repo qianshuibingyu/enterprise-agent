@@ -60,6 +60,33 @@ def test_google_oauth_rejects_missing_stable_subject(monkeypatch):
         client.exchange_code(code="fixture-code", state="fixture-state")
 
 
+def test_google_oauth_adds_openid_to_configured_scopes(monkeypatch):
+    from urllib.parse import parse_qs, urlsplit
+
+    monkeypatch.setenv("GMAIL_CLIENT_ID", "client")
+    monkeypatch.setenv("GMAIL_CLIENT_SECRET", "secret")
+    monkeypatch.setenv("GMAIL_REDIRECT_URI", "https://testserver/callback")
+    monkeypatch.setenv("GMAIL_SCOPES", "https://www.googleapis.com/auth/gmail.readonly")
+    client = GoogleOAuthHttpClient()
+    scopes = parse_qs(urlsplit(client.authorization_url(state="state")).query)["scope"][0].split()
+    assert "openid" in scopes
+    assert "https://www.googleapis.com/auth/gmail.readonly" in scopes
+
+
+def test_google_oauth_rejects_missing_openid_before_userinfo(monkeypatch):
+    monkeypatch.setenv("GMAIL_CLIENT_ID", "client")
+    monkeypatch.setenv("GMAIL_CLIENT_SECRET", "secret")
+    monkeypatch.setenv("GMAIL_REDIRECT_URI", "https://testserver/callback")
+
+    def handler(request):
+        assert request.url.host == "oauth2.googleapis.com"
+        return httpx.Response(200, json={"access_token": "secret", "scope": "https://www.googleapis.com/auth/gmail.readonly"})
+
+    client = GoogleOAuthHttpClient(http=httpx.Client(transport=httpx.MockTransport(handler)))
+    with pytest.raises(GmailOAuthConfigurationError, match="OpenID"):
+        client.exchange_code(code="code", state="state")
+
+
 def test_gmail_watch_requires_access_token(monkeypatch):
     monkeypatch.delenv("GMAIL_CLIENT_ID", raising=False)
     with pytest.raises(GmailOAuthConfigurationError):

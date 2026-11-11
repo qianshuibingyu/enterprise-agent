@@ -15,6 +15,8 @@ from sqlalchemy.orm import Session
 from app.channels.inbound import (
     InboundBatchResult,
     InvalidProviderAuthorization,
+    ProviderRateLimited,
+    ProviderTemporaryFailure,
     SourceValidationFailure,
     ingest_gmail_history,
 )
@@ -158,6 +160,14 @@ def gmail_pubsub(
         )
     except (InvalidProviderAuthorization, SourceValidationFailure) as exc:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="没有权限访问") from exc
+    except (ProviderRateLimited, ProviderTemporaryFailure) as exc:
+        # Return a retryable 5xx so Pub/Sub redelivers instead of acknowledging
+        # a notification whose history cursor was not persisted.
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Gmail provider temporarily unavailable",
+            headers={"Retry-After": "60"},
+        ) from exc
 
     if result.cursor is not None:
         account.gmail_watch_history_id = result.cursor

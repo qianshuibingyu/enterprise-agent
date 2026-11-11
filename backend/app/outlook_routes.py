@@ -1,5 +1,6 @@
 from typing import Annotated
 import ast
+import logging
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
 from sqlalchemy import select
@@ -16,6 +17,7 @@ from app.overview_service import schedule_message_overview
 from app.provider_links import outlook_web_link
 
 router = APIRouter(prefix="/api/integrations/outlook", tags=["outlook"])
+logger = logging.getLogger(__name__)
 
 # The unread read window never returns a message twice, so rows ingested before
 # provider links were persisted would keep an empty link forever. Repair them in
@@ -89,14 +91,25 @@ def _outlook_body_text(item: dict[str, object]) -> str:
 
 def _normalized_message(item: dict[str, object]) -> dict[str, object]:
     customer_contact, customer_nickname = _outlook_sender(item)
+    original_sender = None
+    original = item.get("originalSender")
+    if isinstance(original, dict):
+        original_address = original.get("emailAddress")
+        if isinstance(original_address, dict) and isinstance(original_address.get("address"), str):
+            original_sender = original_address["address"]
+    forwarded_marker = bool(item.get("isForwarded") or item.get("is_forwarded") or original is not None)
+    external_id = item.get("id") or item.get("message_id")
     return {
-        "external_message_id": str(item.get("id") or item.get("message_id")),
+        "external_message_id": str(external_id) if external_id else "",
         "direction": "inbound",
         "status": "received",
         "occurred_at": item.get("received_date_time") or item.get("receivedDateTime"),
         "raw_content": _outlook_body_text(item),
         "customer_contact": customer_contact,
         "customer_nickname": customer_nickname,
+        "contact_identity_kind": "email",
+        "contact_forwarded": forwarded_marker,
+        "original_sender_contact": original_sender,
         "provider_web_link": (
             str(item["webLink"]) if isinstance(item.get("webLink"), str) else None
         ),
@@ -128,6 +141,11 @@ def _backfill_provider_links(
             link = outlook_web_link(client.message_web_link(message.external_message_id))
         except OutlookGraphError:
             continue
+        except Exception as exc:
+            # Link repair is best-effort: a malformed provider response must
+            # never turn a successful mailbox read into a 500.
+            logger.warning("Outlook link backfill skipped message_id=%s error=%s", message.id, type(exc).__name__)
+            continue
         if link is None:
             continue
         message.provider_web_link = link
@@ -151,7 +169,9 @@ def list_outlook_messages(
             count=count,
         )
     except OutlookGraphError as exc:
-        raise HTTPException(status_code=502, detail="Outlook Graph 读取失败") from exc
+        # Surface the concrete provider failure (expired grant, mapping
+        # mismatch, Graph error) instead of a generic message.
+        raise HTTPException(status_code=502, detail=f"Outlook Graph 读取失败：{exc}") from exc
 
     output: list[dict[str, object]] = []
     for item in messages:
@@ -159,13 +179,21 @@ def list_outlook_messages(
             continue
         normalized = _normalized_message(item)
         if not normalized["external_message_id"] or normalized["occurred_at"] is None:
+            logger.warning("Outlook message skipped: missing id or receivedDateTime")
             continue
-        ingested = ingest_provider_message(
-            db,
-            channel_account_id=account.id,
-            provider="outlook_mcp_graph",
-            message=normalized,
-        )
+        try:
+            ingested = ingest_provider_message(
+                db,
+                channel_account_id=account.id,
+                provider="outlook_mcp_graph",
+                message=normalized,
+            )
+        except (ValueError, TypeError) as exc:
+            # One malformed provider row must not fail the whole read. The
+            # ingest layer already rolls back its own savepoint, so the
+            # successfully ingested rows above stay pending for the final commit.
+            logger.warning("Outlook message skipped: %s", exc)
+            continue
         output.append({"id": ingested.message.id, "created": ingested.created})
     created = sum(1 for item in output if item["created"] is True)
     links_repaired = _backfill_provider_links(db, account, client)
@@ -175,9 +203,10 @@ def list_outlook_messages(
         account.status = "verified_inbound"
     try:
         db.commit()
-    except Exception:
+    except Exception as exc:
         db.rollback()
-        raise
+        logger.warning("Outlook read persistence failed: %s", type(exc).__name__)
+        raise HTTPException(status_code=502, detail="Outlook 读取结果保存失败，请检查数据库连接后重试") from exc
     for item in output:
         if item["created"] is True:
             background_tasks.add_task(schedule_message_overview, int(item["id"]))

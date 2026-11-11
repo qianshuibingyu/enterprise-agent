@@ -24,7 +24,7 @@ flowchart LR
         subgraph Backend[backend 容器：Python 3.11 + Uvicorn]
             API[FastAPI 应用\n认证、对象授权、业务和渠道状态 API]
             DBModule[SQLAlchemy 数据库模块\nengine / SessionLocal / get_db]
-            Migration[Alembic CLI 环境\nBase.metadata；无 revision 文件]
+            Migration[Alembic CLI 环境\n迁移 revision 0001–0017；目标库状态另行核验]
         end
         Postgres[(PostgreSQL 16\n容器端口 5432)]
         Volume[(postgres_data 命名卷)]
@@ -117,7 +117,7 @@ flowchart LR
 - 回复 AI 与内部 AI 职责分离：前者生成需运营审核的客户回复建议；后者只做授权范围内查询、分析及操作指引，不执行写操作。内部 AI 的操作类意图可给出页面入口和步骤，由员工自行操作。
 - 询盘转交由运营手动触发，转交数据保留联系人、联系方式、客户原始内容和来源渠道；售后在转交业务或运营标记已处理后进入静默期。静默期长度、新消息到达后的处理与恢复规则仍待实现前确认。
 - 首期不建设部门内部作业系统、合同管理/OCR、统计报表或自动发送。业务员查看转交客户的必要原始信息和链路状态，不等于建设其完整作业工作台。
-- **尚未实现或尚待环境验收（按当前仓库与用户环境分层核对）：** 三渠道真实入站主链路已按 Day 6 分渠道记录；仍待真实 provider 重放、撤销/断开恢复、附件和长期运行专项。知识资料上传/ACL/持久化 chunk、embedding、pgvector、关键词/向量检索、RAG、回复建议、人工审批/出站发送、生产调度、SSE、完整审计保留生命周期、附件实际存储和跨进程专项仍未完成。当前工作区已实现认证与会话、首期对象授权、渠道状态与三渠道入站路径、统一消息入库、中文概要代码闭环、原文安全回源、运营收件箱、询盘时间线、手动转交、人工状态、内存资料清洗/切片和前端“我的”/运营工作台；目标 PostgreSQL 最新用户记录为 `0012_message_overviews`，具体运行版本以最新 handoff 为准。代码、隔离测试和目标 schema 证据需与真实 provider/浏览器证据分层表达。图中的逻辑连线不是接口或调用合同。
+- **尚未实现或尚待环境验收（静态核对：2026-11-11）：** 三渠道真实入站主链路曾有 Day 6 分渠道记录；重放、撤销/断开恢复、真实附件和长期运行仍待专项。工作区已实现认证与会话、首期对象授权、渠道状态/入站路径、统一消息入库、中文概要、原文安全回源、运营收件箱、Inquiry—Message 关联/人工确认、业务类型字段、有限操作日志、询盘时间线/转交/人工状态、内存资料清洗切片、前端工作台，以及 bridge 端加密历史消息归档代码。迁移源码 head 为 `0017_message_feed_indexes`；这不证明目标 PostgreSQL 已应用 0014–0017。知识资料上传/ACL/持久化 chunk、embedding、pgvector、关键词/向量检索、RAG、回复建议、人工审批/真实出站、可靠生产调度、SSE、完整审计保留生命周期、附件对象存储和跨进程专项仍未完成。本轮未执行测试、构建、Docker、数据库或浏览器验收；历史测试/目标 schema 证据不得直接视为当前代码验收。图中的逻辑连线不是接口或调用合同。
 
 ### 当前骨架与目标能力差距
 
@@ -125,7 +125,7 @@ flowchart LR
 |---|---|---|
 | 前端 | [frontend/src/main.ts](../frontend/src/main.ts)、[frontend/src/App.vue](../frontend/src/App.vue)、[frontend/src/api/channels.ts](../frontend/src/api/channels.ts)、[frontend/src/api/inbox.ts](../frontend/src/api/inbox.ts) | Vue/Vite “我的”渠道管理、收件箱/客户链路详情、原文预览/展开、人工状态和只读分析；前端单元测试/生产构建已有 Day 8 证据，目标浏览器异常路径按 handoff 保留 |
 | 后端 API | [backend/app/main.py](../backend/app/main.py)、[backend/app/channel_routes.py](../backend/app/channel_routes.py)、[backend/app/business_routes.py](../backend/app/business_routes.py) | 认证、首期对象授权、渠道目录/账号状态、三渠道入站、收件箱/询盘查询、原文回源、中文概要和内部只读分析 API；回复建议、RAG 和出站未实现 |
-| 数据库连接 | [backend/app/database.py](../backend/app/database.py)、[compose.yaml](../compose.yaml) | SQLAlchemy PostgreSQL/Compose PostgreSQL；用户最新 Day 8 记录核验目标库已到 `0012_message_overviews`，真实 provider 补充专项和并发证据仍分开记录 |
+| 数据库连接 | [backend/app/database.py](../backend/app/database.py)、[compose.yaml](../compose.yaml) | SQLAlchemy PostgreSQL/Compose PostgreSQL；用户提供的历史目标库证据至 `0012_message_overviews`，当前工作区代码 head 为 `0017_message_feed_indexes`；0014–0017 目标环境应用状态未核验 |
 | 业务模型与迁移 | [backend/app/models/user.py](../backend/app/models/user.py)、[backend/app/models/business.py](../backend/app/models/business.py)、[backend/migrations/env.py](../backend/migrations/env.py)、[backend/migrations/versions/](../backend/migrations/versions/) | ORM/迁移包含认证、渠道账号/授权、询盘/附件/通知、消息/消息附件、InquiryEvent、人工状态、外部账号映射和 `message_overviews`；目标 schema 以最新用户 handoff 为准 |
 | 认证与授权 | [backend/app/auth.py](../backend/app/auth.py)、[backend/app/authorization.py](../backend/app/authorization.py) | 服务端 session/CSRF/Argon2、首期对象授权、消息/询盘/timeline/转交/原文/概要范围测试；完整 RBAC、部门/经理权限未实现 |
 | 渠道与消息处理 | [backend/app/channels/](../backend/app/channels/)、[backend/app/channel_routes.py](../backend/app/channel_routes.py)、[backend/app/channels/inbound.py](../backend/app/channels/inbound.py)、[backend/app/message_ingestion.py](../backend/app/message_ingestion.py) | provider-specific/provider-neutral 入站、统一消息幂等、原文安全回源和失败回退已实现；真实 provider 重放、撤销恢复、附件、长期运行和出站仍待专项验收 |
@@ -403,7 +403,7 @@ WhatsApp / Gmail / Outlook
 
 ### 8.2 Alembic 迁移应用
 
-- **迁移配置：** 用户检查的容器文件 `/app/alembic.ini` 最初含拼写错误的 `[alemibic]` section；后续重建后输出为 `[alembic]`，包含 `script_location = migrations` 和 `prepend_sys_path = .`。`/app/migrations` 中用户检查到的文件只有 `env.py`，没有 `versions/` 迁移脚本。
+- **历史迁移配置记录（2026-10-20）：** 当时用户检查的容器文件 `/app/migrations` 只有 `env.py`、没有 `versions/`，且目标数据库没有业务 revision。这是早期状态，已被后续仓库 migration 源码取代；不得作为当前工作区或当前目标库状态。当前源码 revision 见 [plan/project-tree.md §3](../plan/project-tree.md#3-数据库与-migration-状态)。
 - **命令结果：** 用户提供的后续 `docker compose exec backend alembic upgrade head` 未显示错误并返回 shell 提示符；在无 revision 脚本的现状下，这只表示命令未报错完成，不能证明有业务迁移被应用。
 - **实际 revision 证据：** 用户执行 `docker compose exec backend alembic current` 未见 revision 输出；`docker compose exec backend alembic heads` 也未见 head 输出。数据库查询 `SELECT * FROM alembic_version;` 返回 `(0 rows)`。
 - **结论：迁移应用状态为未完成业务 schema／无已应用 revision。** 数据库中存在 `public.alembic_version` 表，但其 `version_num` 为空；未发现可应用的迁移版本。不能将 `upgrade head` 无报错单独记录为迁移已应用。
@@ -418,7 +418,7 @@ WhatsApp / Gmail / Outlook
 
 - **结果：未验证**。
 - **用户提供的命令：** `docker compose exec backend alembic downgrade -1` 返回 `FAILED: Relative revision -1 didn't produce 1 migrations`。
-- **解释：** 当前没有迁移 revision 可供相对回退；该错误反映没有可回退的迁移版本，不是用户操作错误，也不能证明回退功能成功或失败。
+- **解释（历史时点）：** 执行该命令时没有迁移 revision 可供相对回退；这是 2026-10-20 的早期记录，不代表当前已有 0017 源码之后的目标库状态。回退结果当时未验证。
 - **状态：** 迁移回退未验证完成。待有经审阅并应用的迁移 revision 后，才可在确认目标数据库与数据影响、具备恢复方案的条件下设计和验证回退；当前不要重复执行 `downgrade -1` 来制造验证结果。
 
 ### 8.5 后续验证补充（用户提供，2026-10-20）
@@ -426,7 +426,7 @@ WhatsApp / Gmail / Outlook
 - 用户从项目根目录执行 `python -m pip install -r requirements.txt` 失败，原因是根目录没有该文件；进入 `backend/` 后运行 `python -m pip install -r requirements.txt` 成功，记录退出状态为 0。安装输出报告 SQLAlchemy 2.1.5、Psycopg 3.3.6、Alembic 1.20.0、pytest 8.4.2。该结果只证明当次服务器 `.venv` 中依赖安装成功，不代表容器依赖版本锁定。
 - 用户提供的 `.env` 检查结果：`git check-ignore -v .env` 命中根 `.gitignore` 第 1 行；`git ls-files --error-unmatch .env` 返回 1；`git status --short --ignored -- .env` 显示 `!! .env`。据此该服务器工作树中的 `.env` 被忽略且未被 Git 跟踪；未检查或记录其内容。
 - 用户执行 `docker compose up -d --build db backend` 后，`docker compose ps` 显示 backend Running、db Healthy；backend 日志显示 Uvicorn 启动。该输出是该次检查时的服务状态，不保证后续仍运行。
-- 用户再次执行 `docker compose exec backend python -m alembic upgrade head`，并记录退出状态 0；`python -m alembic current` 退出状态 0但无 revision 输出；只读 SQL `SELECT version_num FROM alembic_version` 退出状态 0并返回 `(0 rows)`。结合迁移目录只有 `env.py`、没有 revision 文件，此结果**不构成业务迁移已应用的证据**。
+- **历史事实（2026-10-20）：** 用户再次执行 upgrade 时仓库迁移目录尚无 revision，`current` 无输出且 `alembic_version` 为 0 行；因此当时不构成业务 migration 已应用证据。该结果仅描述该历史版本，不能推断当前仓库/目标数据库 revision。当前代码迁移链与较新的目标库证据见 [plan/project-tree.md §3](../plan/project-tree.md#3-数据库与-migration-状态)。
 - 用户明确说明当前实际 schema 中**没有身份表和权限表**，计划在后续实际开发过程中补充。当前没有身份/权限业务表，是未实现的业务 schema，不是用户操作错误；具体字段和关系不在本记录中臆造。
 - 当前记录的 `alembic_version` 表为 Alembic 自身的版本跟踪表，不是身份表或权限表；表存在且查询 0 行不代表业务迁移已完成。
 - **迁移回退仍为未验证完成**：当前没有业务 revision，因此没有可执行的回退目标；此前 `downgrade -1` 的报错是没有可回退迁移的结果，不代表用户操作错误，也不能记作回退通过。

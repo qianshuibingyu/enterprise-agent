@@ -75,7 +75,7 @@ def _get_scoped_account(db: Session, user: User, account_id: int) -> ChannelAcco
         select(ChannelAccount).where(
             ChannelAccount.id == account_id,
             ChannelAccount.id.in_(scoped_channel_account_ids(user)),
-        )
+        ).with_for_update()
     )
     if account is None:
         raise HTTPException(status_code=403, detail="没有权限访问")
@@ -168,6 +168,20 @@ def create_gmail_account(
         ).order_by(ChannelAccount.id)
     )
     if existing is not None:
+        grant = db.get(ChannelGrant, (existing.id, "gmail", user.id))
+        if grant is None:
+            raise HTTPException(status_code=403, detail="没有权限访问")
+        if existing.status == "revoked":
+            # The shell becomes visible again, but cannot use old credentials
+            # or an OAuth attempt started before the revocation.
+            from app.provider_auth_routes import _oauth_states
+            _oauth_states.invalidate_account(existing.id)
+            existing.gmail_credential_ciphertext = None
+            existing.credential_reference = None
+            existing.gmail_watch_history_id = None
+            existing.gmail_watch_expiration = None
+            existing.status = "not_ready"
+            db.commit()
         return _account_view(existing)
     account = ChannelAccount(
         owner_user_id=user.id,
@@ -295,6 +309,15 @@ def revoke_channel(
     user, _ = pair
     account = _get_scoped_account(db, user, account_id)
     account.status = "revoked"
+    if account.channel_type == "gmail":
+        # Drop local credentials and pending OAuth attempts; reconnect must use
+        # a fresh authorization, never the revoked refresh token.
+        from app.provider_auth_routes import _oauth_states
+        _oauth_states.invalidate_account(account.id)
+        account.gmail_credential_ciphertext = None
+        account.credential_reference = None
+        account.gmail_watch_history_id = None
+        account.gmail_watch_expiration = None
     db.commit()
     return {
         "channel_account_id": account.id,
