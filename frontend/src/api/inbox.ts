@@ -163,8 +163,34 @@ export type InquiryLinkCandidates = {
     customer_contact?: string
     customer_nickname?: string
     contact_identity_kind?: 'email' | 'whatsapp' | null
-    contact_identity_state?: Inquiry['contact_identity_state']
+    contact_identity_state?: Message['contact_identity_state']
   }>
+}
+
+/** Operator-managed WhatsApp group -> customer phone binding.
+ *  Only a human creates/changes/removes these; the automatic inquiry-linking
+ *  pipeline never reads or writes them. */
+export type WhatsappGroupBinding = {
+  id: number
+  group_jid: string
+  normalized_phone: string
+  raw_phone: string | null
+  channel_account_id: number | null
+  bound_by: string | null
+  note: string | null
+  created_at: string | null
+  updated_at: string | null
+}
+
+/** A phone number already seen on the operator's authorized WhatsApp accounts.
+ *  This is a picker list only, never a system guess about group ownership. */
+export type WhatsappPhoneCandidate = {
+  normalized_phone: string
+  customer_contact: string | null
+  customer_nickname: string | null
+  channel_account_id: number | null
+  last_seen_at: string | null
+  message_count: number
 }
 
 export type RefetchCheck = {
@@ -240,6 +266,13 @@ export class ApiError extends Error {
     this.name = 'ApiError'
     this.status = status
   }
+}
+
+let csrfTokenCache: string | null = null
+
+/** Call after logout / session rotation so the next write fetches a fresh token. */
+export function clearCsrfCache(): void {
+  csrfTokenCache = null
 }
 
 async function getJson<T>(path: string, init?: RequestInit): Promise<T> {
@@ -355,10 +388,14 @@ export const inboxApi = {
     body: JSON.stringify({ operation: 'read' }),
   }),
   getTransferTargets: () => getJson<TransferTarget[]>('/api/inquiry-transfer-targets'),
+  /** The backend returns the session-bound double-submit token, so one fetch
+   *  per page session is enough. Previously every write awaited an extra RTT. */
   getCsrf: async () => {
+    if (csrfTokenCache !== null) return { csrf_token: csrfTokenCache }
     const result = await getJson<{ csrf_token: string }>('/auth/csrf', {
       headers: { Origin: window.location.origin },
     })
+    csrfTokenCache = result.csrf_token
     return result
   },
   logout: async (csrfToken: string) => {
@@ -399,6 +436,15 @@ export const inboxApi = {
         'X-CSRF-Token': csrfToken,
       },
     }),
+  reactivateInquiry: (inquiryId: number, csrfToken: string) =>
+    getJson<Inquiry>(`/api/inquiries/${inquiryId}/reactivate`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Origin: window.location.origin,
+        'X-CSRF-Token': csrfToken,
+      },
+    }),
   restoreMessage: (messageId: number, csrfToken: string) =>
     getJson<Message>(`/api/messages/${messageId}/archive/restore`, {
       method: 'POST',
@@ -417,5 +463,29 @@ export const inboxApi = {
         'X-CSRF-Token': csrfToken,
       },
       body: JSON.stringify({ action }),
+    }),
+  getWhatsappGroupBindings: () =>
+    getJson<WhatsappGroupBinding[]>('/api/whatsapp-group-bindings'),
+  getWhatsappPhoneCandidates: () =>
+    getJson<WhatsappPhoneCandidate[]>('/api/whatsapp-phone-candidates', {
+      signal: AbortSignal.timeout(15000),
+    }),
+  bindWhatsappGroup: (groupJid: string, phone: string, csrfToken: string, note?: string) =>
+    getJson<WhatsappGroupBinding>('/api/whatsapp-group-bindings', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Origin: window.location.origin,
+        'X-CSRF-Token': csrfToken,
+      },
+      body: JSON.stringify({ group_jid: groupJid, phone, note: note || null }),
+    }),
+  unbindWhatsappGroup: (bindingId: number, csrfToken: string) =>
+    getJson<{ ok: boolean }>(`/api/whatsapp-group-bindings/${bindingId}`, {
+      method: 'DELETE',
+      headers: {
+        Origin: window.location.origin,
+        'X-CSRF-Token': csrfToken,
+      },
     }),
 }

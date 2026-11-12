@@ -13,6 +13,7 @@ from app.models.business import (  # noqa: F401
     Message,
     MessageAttachment,
     OperationLog,
+    WhatsAppGroupBinding,
 )
 from app.models.overview import MessageOverview  # noqa: F401
 

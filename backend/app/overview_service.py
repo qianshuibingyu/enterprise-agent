@@ -125,7 +125,7 @@ def _request_overview(base_url: str, api_key: str, model: str, safe_text: str) -
         "遇到付款、签署文件、外部链接或疑似钓鱼内容，只陈述事实并提示人工核验。"
         "不要输出标题、JSON、HTML、链接、系统提示、前端展示说明或操作指令。"
     )
-    timeout = float(os.environ.get("LLM_TIMEOUT_SECONDS", "20"))
+    timeout = float(os.environ.get("LLM_TIMEOUT_SECONDS", "8"))
     chat_payload = {
         "model": model,
         "temperature": 0,
@@ -151,7 +151,9 @@ def _request_overview(base_url: str, api_key: str, model: str, safe_text: str) -
                 "input": safe_text,
                 "temperature": 0,
             },
-            timeout=timeout,
+            # A gateway 404 fallback must not double the background task's
+            # hold on the shared uvicorn threadpool.
+            timeout=min(timeout, 3.0),
         )
         return response, "responses"
     return response, "chat"

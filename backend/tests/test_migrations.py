@@ -15,6 +15,11 @@ def test_business_revision_is_the_only_migration_head():
     revisions = list(script.walk_revisions())
 
     assert [revision.revision for revision in revisions] == [
+        "0018_whatsapp_group_bindings",
+        "0017_message_feed_indexes",
+        "0016_operation_logs",
+        "0015_website_form_messages",
+        "0014_inquiry_business_type",
         "0013_inquiry_messages",
         "0012_message_overviews",
         "0011_message_provider_web_link",
@@ -29,19 +34,24 @@ def test_business_revision_is_the_only_migration_head():
         "0002_business_authorization",
         "0001_auth_sessions",
     ]
-    assert revisions[0].down_revision == "0012_message_overviews"
-    assert revisions[1].down_revision == "0011_message_provider_web_link"
-    assert revisions[2].down_revision == "0010_message_customer_contact"
-    assert revisions[3].down_revision == "0009_outlook_account_credential"
-    assert revisions[4].down_revision == "0008_gmail_account_runtime"
-    assert revisions[5].down_revision == "0007_message_handling_status"
-    assert revisions[6].down_revision == "0006_manual_handling_status"
-    assert revisions[7].down_revision == "0005_channel_external_account"
-    assert revisions[8].down_revision == "0004_inquiry_events"
-    assert revisions[9].down_revision == "0003_messages"
-    assert revisions[10].down_revision == "0002_business_authorization"
-    assert revisions[11].down_revision == "0001_auth_sessions"
-    assert revisions[12].down_revision is None
+    assert revisions[0].down_revision == "0017_message_feed_indexes"
+    assert revisions[1].down_revision == "0016_operation_logs"
+    assert revisions[2].down_revision == "0015_website_form_messages"
+    assert revisions[3].down_revision == "0014_inquiry_business_type"
+    assert revisions[4].down_revision == "0013_inquiry_messages"
+    assert revisions[5].down_revision == "0012_message_overviews"
+    assert revisions[6].down_revision == "0011_message_provider_web_link"
+    assert revisions[7].down_revision == "0010_message_customer_contact"
+    assert revisions[8].down_revision == "0009_outlook_account_credential"
+    assert revisions[9].down_revision == "0008_gmail_account_runtime"
+    assert revisions[10].down_revision == "0007_message_handling_status"
+    assert revisions[11].down_revision == "0006_manual_handling_status"
+    assert revisions[12].down_revision == "0005_channel_external_account"
+    assert revisions[13].down_revision == "0004_inquiry_events"
+    assert revisions[14].down_revision == "0003_messages"
+    assert revisions[15].down_revision == "0002_business_authorization"
+    assert revisions[16].down_revision == "0001_auth_sessions"
+    assert revisions[17].down_revision is None
 
 
 def test_auth_migration_contains_only_auth_tables():

@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import {
   ApiError,
+  clearCsrfCache,
   inboxApi,
   type ChannelAccount,
   type Inquiry,
@@ -11,9 +12,21 @@ import {
   type OperationLog,
   type RefetchCheck,
   type TransferTarget,
+  type WhatsappGroupBinding,
+  type WhatsappPhoneCandidate,
 } from './api/inbox'
 import { channelsApi } from './api/channels'
 import type { ChannelType, ConnectionStatus } from './api/channels'
+import {
+  goBack,
+  initRouter,
+  isStandalonePage,
+  navigate,
+  route,
+  type AppRoute,
+  type RouteChange,
+  type WorkspaceView,
+} from './router'
 import {
   fakeAuthorize,
   fakeChannels,
@@ -57,7 +70,18 @@ const inquiryStatusFilter = ref('')
 const inquiryHandlingFilter = ref('')
 const filterLoading = ref(false)
 const inquiries = ref<Inquiry[]>([])
-const workspaceView = ref<'messages' | 'review' | 'customers' | 'customerMessages'>('messages')
+const workspaceView = ref<WorkspaceView>('messages')
+/** Standalone detail pages load their own record instead of relying on the list cache. */
+const inquiryDetail = ref<Inquiry | null>(null)
+const messageDetail = ref<Message | null>(null)
+const messageDetailContent = ref<MessageContent | null>(null)
+const messageDetailLoading = ref(false)
+const isStandalone = computed(() => isStandalonePage(route.value.page))
+const showInquiryDetail = computed(() =>
+  selectedInquiry.value !== null && (route.value.page === 'inquiry' || isInquiryView.value),
+)
+/** Signature of the currently loaded list; unchanged on Back means zero requests. */
+let loadedListSignature = ''
 const inquiryPage = ref(1)
 const inquiryHasMore = ref(false)
 const inquiryTotalCount = ref(0)
@@ -101,6 +125,20 @@ const logoutError = ref('')
 const refetchChecks = ref<Record<number, RefetchCheck>>({})
 const refetchCheckingAccountIds = ref<Set<number>>(new Set())
 let whatsappPollTimer: number | undefined
+
+/** WhatsApp group -> customer phone bindings: 100% operator-confirmed. */
+const groupBindingOpen = ref(false)
+const groupBindings = ref<WhatsappGroupBinding[]>([])
+let groupBindingsLoaded = false
+const groupBindingCandidates = ref<WhatsappPhoneCandidate[]>([])
+const groupBindingLoading = ref(false)
+const groupBindingError = ref('')
+const groupBindingSubmitting = ref(false)
+const groupBindingSelectedPhone = ref('')
+const groupBindingPhoneInput = ref('')
+const groupBindingNote = ref('')
+const groupBindingFeedback = ref<{ text: string; kind: 'success' | 'error' } | null>(null)
+let groupBindingRequestId = 0
 
 const channelDetails: Record<ChannelType, { name: string; provider: string; description: string; next: string }> = {
   gmail: {
@@ -183,7 +221,7 @@ async function disconnectChannel(channelType: ChannelType) {
     } else {
       await channelsApi.revoke(account.id, csrf.csrf_token)
     }
-    await loadWorkspace()
+    await refreshList('full')
     if (channelType === 'whatsapp') whatsappMessage.value = 'WhatsApp 已断开本地连接，历史消息保留。'
     if (channelType === 'gmail') gmailMessage.value = 'Gmail 已撤销本地连接状态；如需撤销 Google 授权，请在 Google 账号设置中操作。'
     if (channelType === 'outlook') outlookAuthorizationMessage.value = 'Outlook 已撤销本地连接状态；如需撤销 Microsoft 授权，请在 Microsoft 账号设置中操作。'
@@ -196,60 +234,64 @@ async function disconnectChannel(channelType: ChannelType) {
 }
 
 const selectedInquiry = computed(() =>
-  inquiries.value.find((inquiry) => inquiry.id === selectedInquiryId.value) ?? null,
+  inquiryDetail.value ?? inquiries.value.find((inquiry) => inquiry.id === selectedInquiryId.value) ?? null,
 )
 const linkReviewMessage = computed(() => messages.value.find((message) => message.id === linkReviewMessageId.value) ?? null)
 const selectedInquiryIndex = computed(() => inquiries.value.findIndex((item) => item.id === selectedInquiryId.value))
 const isInquiryView = computed(() => workspaceView.value === 'review' || workspaceView.value === 'customers')
+const standaloneTitle = computed(() => {
+  if (route.value.page === 'inquiry') return `客户链路 #${route.value.id ?? ''}`
+  if (route.value.page === 'message') return `消息 #${route.value.id ?? ''}`
+  if (route.value.page === 'logs') return route.value.logsInquiry === null ? '我的操作记录' : `链路 #${route.value.logsInquiry} 操作记录`
+  if (route.value.page === 'settings') return '接入账号与个人设置'
+  if (route.value.page === 'groupBinding') return '群聊客户归属确认'
+  return ''
+})
 
-async function switchWorkspaceView(view: 'messages' | 'review' | 'customers' | 'customerMessages') {
-  workspaceView.value = view
-  inquiryPage.value = 1
-  inquiryHandlingFilter.value = view === 'review' ? 'pending' : ''
-  selectedMessageId.value = null
-  if (view === 'messages' || view === 'customerMessages') {
-    messageAssignmentFilter.value = view === 'customerMessages' ? 'assigned' : 'all'
-    messageHandlingFilter.value = 'pending'
-    messageIngestionFilter.value = ''
-    messageChannelAccountFilter.value = ''
-  }
-  selectedInquiryId.value = null
-  await loadWorkspace()
+/** The list view a Back / breadcrumb should land on for the current standalone page. */
+function parentRoute(): Partial<AppRoute> {
+  return { page: route.value.view, id: null, logsInquiry: null, groupJid: null }
 }
 
-async function openCustomerMessage(messageId: number) {
-  await switchWorkspaceView('customerMessages')
-  try {
-    const message = await inboxApi.getMessage(messageId)
-    if (!messages.value.some((item) => item.id === messageId)) messages.value = [message, ...messages.value]
-    const groupKey = messageGroupKey(message)
-    const expandedGroups = new Set(collapsedGroupKeys.value)
-    expandedGroups.delete(groupKey)
-    collapsedGroupKeys.value = expandedGroups
-    selectedMessageId.value = messageId
-    await nextTick()
-    document.getElementById(`message-${messageId}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' })
-  } catch (cause) {
-    actionError.value = cause instanceof Error ? cause.message : '客户消息加载失败。'
-  }
+function closeStandalonePage() {
+  goBack(parentRoute())
 }
 
-async function goToInquiryPage(page: number, preferredIndex?: number) {
+/** Each tab is an addressable page; view state lives in the URL, not only in refs. */
+function switchWorkspaceView(view: WorkspaceView) {
+  navigate({
+    page: view,
+    view,
+    id: null,
+    logsInquiry: null,
+    mpage: 1,
+    ipage: 1,
+    mh: 'pending',
+    mi: '',
+    ma: view === 'customerMessages' ? 'assigned' : 'all',
+    mc: '',
+    ih: view === 'review' ? 'pending' : '',
+    box: '',
+    groupJid: null,
+  })
+}
+
+/** A message opened from logs / an inquiry is its own page, not an in-page jump. */
+function openCustomerMessage(messageId: number) {
+  navigate({ page: 'message', id: messageId })
+}
+
+function goToInquiryPage(page: number, preferredIndex?: number) {
   const targetPage = Math.max(1, Math.min(page, inquiryTotalPages.value))
   if (targetPage === inquiryPage.value || filterLoading.value) return
   const keepDetailOpen = selectedInquiryId.value !== null
-  const targetIndex = preferredIndex ?? Math.max(0, selectedInquiryIndex.value)
-  inquiryPage.value = targetPage
-  const loaded = await loadWorkspace()
-  if (loaded && keepDetailOpen) {
-    selectedInquiryId.value = inquiries.value[Math.min(targetIndex, inquiries.value.length - 1)]?.id ?? null
-  }
+  pendingInquirySelection = keepDetailOpen ? (preferredIndex ?? Math.max(0, selectedInquiryIndex.value)) : null
+  navigate({ ipage: targetPage }, true)
 }
 
 function resetInquiryFilters() {
-  inquiryPage.value = 1
-  selectedInquiryId.value = null
-  void loadWorkspace()
+  pendingInquirySelection = null
+  navigate({ ipage: 1, ih: '', id: null }, true)
 }
 
 async function moveInquiry(delta: number) {
@@ -257,9 +299,9 @@ async function moveInquiry(delta: number) {
   if (index >= 0 && index < inquiries.value.length) {
     selectInquiry(inquiries.value[index].id)
   } else if (delta > 0 && inquiryHasMore.value) {
-    await goToInquiryPage(inquiryPage.value + 1, 0)
+    goToInquiryPage(inquiryPage.value + 1, 0)
   } else if (delta < 0 && inquiryPage.value > 1) {
-    await goToInquiryPage(inquiryPage.value - 1, INQUIRY_PAGE_SIZE - 1)
+    goToInquiryPage(inquiryPage.value - 1, INQUIRY_PAGE_SIZE - 1)
   }
 }
 
@@ -279,7 +321,7 @@ const timeline = computed(() => {
 })
 
 function selectInquiry(id: number) {
-  selectedInquiryId.value = id
+  navigate({ page: 'inquiry', id })
 }
 
 function toggleMessageExpanded(messageId: number) {
@@ -371,6 +413,18 @@ async function refreshAnalysisCounts() {
   }
 }
 
+/** The analysis endpoint runs ~20 SQL statements (two full-table loads).
+ *  Debounce it so a burst of operator actions triggers at most one request,
+ *  and never on the critical path of a click. */
+let analysisRefreshTimer: number | undefined
+function scheduleAnalysisRefresh() {
+  if (analysisRefreshTimer !== undefined) window.clearTimeout(analysisRefreshTimer)
+  analysisRefreshTimer = window.setTimeout(() => {
+    analysisRefreshTimer = undefined
+    void refreshAnalysisCounts()
+  }, 4000)
+}
+
 function showActionToast(text: string, kind: 'processed' | 'ignored') {
   if (actionToastTimer !== undefined) window.clearTimeout(actionToastTimer)
   actionToast.value = { text, kind }
@@ -393,12 +447,15 @@ function showMessageFeedback(messageId: number, text: string, kind: 'success' | 
   messageFeedbackTimers.set(messageId, timer)
 }
 
-async function openOperationLogs(inquiryId?: number) {
-  operationLogOpen.value = true
-  operationLogInquiryId.value = inquiryId ?? null
+function openOperationLogs(inquiryId?: number) {
+  navigate({ page: 'logs', id: null, logsInquiry: inquiryId ?? null })
+}
+
+/** Load logs for the standalone logs page (also used by its retry button). */
+async function fetchOperationLogs(inquiryId: number | null) {
   operationLogLoading.value = true
   try {
-    operationLogs.value = await inboxApi.getOperationLogs(inquiryId)
+    operationLogs.value = await inboxApi.getOperationLogs(inquiryId ?? undefined)
   } catch (cause) {
     actionError.value = cause instanceof Error ? cause.message : '操作记录加载失败。'
   } finally {
@@ -406,10 +463,9 @@ async function openOperationLogs(inquiryId?: number) {
   }
 }
 
-async function openOperationLogObject(record: OperationLog) {
+function openOperationLogObject(record: OperationLog) {
   if (record.object_type !== 'message' || record.object_id === null) return
-  operationLogOpen.value = false
-  await openCustomerMessage(record.object_id)
+  navigate({ page: 'message', id: record.object_id })
 }
 
 function moveMessageToBox(updated: Message) {
@@ -424,8 +480,8 @@ function moveMessageToBox(updated: Message) {
 async function loadArchive() {
   try {
     const [processed, ignored] = await Promise.all([
-      inboxApi.getMessages(queryString({ handling_status: 'processed', page: '1', page_size: '100', sort: 'occurred_at', descending: 'true' })),
-      inboxApi.getMessages(queryString({ handling_status: 'ignored', page: '1', page_size: '100', sort: 'occurred_at', descending: 'true' })),
+      inboxApi.getMessages(queryString({ handling_status: 'processed', page: '1', page_size: '50', sort: 'occurred_at', descending: 'true' })),
+      inboxApi.getMessages(queryString({ handling_status: 'ignored', page: '1', page_size: '50', sort: 'occurred_at', descending: 'true' })),
     ])
     processedMessages.value = processed.items
     ignoredMessages.value = ignored.items
@@ -486,7 +542,7 @@ async function confirmMessageLink(inquiryId: number, confirmIdentity = false) {
       ? '已人工确认联系人身份并关联到所选链路。'
       : '消息已关联到所选链路。'
     closeLinkReview()
-    await loadWorkspace()
+    await refreshList()
   } catch (cause) {
     actionError.value = cause instanceof Error ? cause.message : '消息关联失败。'
   } finally {
@@ -528,9 +584,10 @@ async function restoreArchivedMessage(messageId: number) {
   try {
     const csrf = await inboxApi.getCsrf()
     await inboxApi.restoreMessage(messageId, csrf.csrf_token)
-    actionMessage.value = '消息已恢复到待处理栏。'
-    await loadWorkspace()
-    await loadArchive()
+    actionMessage.value = '消息已恢复；若它属于已处理/已忽略的客户链路，链路也已同步恢复。'
+    // Archive + list refresh happen in the background; the button returns immediately.
+    void loadArchive()
+    void refreshList('list')
   } catch (cause) {
     actionError.value = cause instanceof Error ? cause.message : '消息恢复失败。'
   } finally {
@@ -803,6 +860,19 @@ function handlingStatusLabel(status: string) {
   return status
 }
 
+function inquiryEventLabel(eventType: string) {
+  const labels: Record<string, string> = {
+    inquiry_created: '客户链路已创建',
+    inquiry_transferred: '已分配负责人',
+    inquiry_processed: '标记为已处理',
+    inquiry_ignored: '已忽略此链路',
+    inquiry_reactivated: '客户链路已恢复',
+    inquiry_message_linked: '关联客户消息',
+    manual_link: '人工确认并关联身份',
+  }
+  return labels[eventType] ?? eventType
+}
+
 async function runRefetchCheck(accountId: number) {
   if (!accountId) return
   const checking = new Set(refetchCheckingAccountIds.value)
@@ -826,61 +896,81 @@ async function logoutSystemAccount() {
   try {
     const csrf = await inboxApi.getCsrf()
     await inboxApi.logout(csrf.csrf_token)
-    window.location.reload()
+    clearCsrfCache()
+    // Drop the page fragment so the next login starts on the inbox, not the
+    // previously open detail page.
+    window.location.assign(window.location.pathname + window.location.search)
   } catch (cause) {
     logoutError.value = cause instanceof Error ? cause.message : '退出登录失败，请稍后重试。'
   }
 }
 
-async function loadWorkspace(): Promise<boolean> {
-  const initialLoad = accounts.value.length === 0 && messages.value.length === 0 && inquiries.value.length === 0 && analysis.value === null
+/**
+ * `full` = first paint (accounts + user + list), `list` = only the list the
+ * current page needs, `base` = accounts + user only (standalone detail pages).
+ * Previously every filter change and every action re-issued 3-4 requests and
+ * waited serially for a 200-row archive fetch on top of that.
+ */
+async function loadWorkspace(mode: 'full' | 'list' | 'base' = 'list'): Promise<boolean> {
+  const initialLoad = currentUser.value === null
   if (initialLoad) loading.value = true
   filterLoading.value = true
   error.value = ''
-  actionError.value = ''
   unauthorized.value = false
 
   try {
-    const emptyMessagePage = { items: [] as Message[], page: 1, page_size: 20, has_more: false }
-    const emptyInquiryPage = { items: [] as Inquiry[], page: 1, page_size: INQUIRY_PAGE_SIZE, has_more: false, total_count: 0 }
-    const [nextChannelAccounts, nextMessages, nextInquiries, nextTargets, nextUser] = await Promise.all([
-      channelsApi.accounts(),
-      isInquiryView.value ? Promise.resolve(emptyMessagePage) : inboxApi.getMessages(queryString({
+    const emptyMessagePage = { items: [] as Message[], page: messagePage.value, page_size: 20, has_more: false }
+    const emptyInquiryPage = { items: [] as Inquiry[], page: inquiryPage.value, page_size: INQUIRY_PAGE_SIZE, has_more: false, total_count: 0 }
+    const loadList = mode !== 'base'
+    const needAccounts = mode !== 'list' || accounts.value.length === 0
+    const needUser = mode !== 'list' || currentUser.value === null
+    const needTargets = loadList && isInquiryView.value && (mode === 'full' || transferTargets.value.length === 0)
+    const [nextChannelAccounts, nextMessages, nextInquiries, nextTargets, nextUser, nextGroupBindings] = await Promise.all([
+      needAccounts ? channelsApi.accounts() : Promise.resolve(accounts.value),
+      loadList && !isInquiryView.value ? inboxApi.getMessages(queryString({
         handling_status: messageHandlingFilter.value,
         assignment_status: workspaceView.value === 'customerMessages' ? 'assigned' : messageAssignmentFilter.value,
         ingestion_status: messageIngestionFilter.value,
         ...messageChannelFilterParams(),
         needs_review: '',
-        page: '1', page_size: '20', sort: 'occurred_at', descending: 'true',
-      })),
-      isInquiryView.value ? inboxApi.getInquiries(queryString({
+        page: String(messagePage.value), page_size: '20', sort: 'occurred_at', descending: 'true',
+      })) : Promise.resolve(emptyMessagePage),
+      loadList && isInquiryView.value ? inboxApi.getInquiries(queryString({
         status: workspaceView.value === 'customers' ? 'assigned' : workspaceView.value === 'review' ? 'new' : '',
         handling_status: inquiryHandlingFilter.value,
         page: String(inquiryPage.value), page_size: String(INQUIRY_PAGE_SIZE), sort: 'updated_at', descending: 'true',
       })) : Promise.resolve(emptyInquiryPage),
-      isInquiryView.value ? inboxApi.getTransferTargets().catch((cause) => {
-        if (cause instanceof ApiError && cause.status === 403) return []
+      needTargets ? inboxApi.getTransferTargets().catch((cause) => {
+        if (cause instanceof ApiError && cause.status === 403) return [] as TransferTarget[]
         throw cause
-      }) : Promise.resolve([] as TransferTarget[]),
-      inboxApi.getCurrentUser(),
+      }) : Promise.resolve(transferTargets.value),
+      needUser ? inboxApi.getCurrentUser() : Promise.resolve(currentUser.value!),
+      // Small, cached, fetched in parallel: no extra serial round trip on first paint.
+      // The standalone binding page loads bindings + candidates together itself.
+      groupBindingsLoaded || route.value.page === 'groupBinding' || currentUser.value?.role === 'sales'
+        ? Promise.resolve(null)
+        : inboxApi.getWhatsappGroupBindings().catch(() => [] as WhatsappGroupBinding[]),
     ])
     currentUser.value = nextUser
     accounts.value = nextChannelAccounts
-    messages.value = nextMessages.items
-    messagePage.value = nextMessages.page
-    messageHasMore.value = nextMessages.has_more
-    expandedMessageIds.value = new Set()
-    fullMessageContentIds.value = new Set()
-    messageContent.value = {}
-    contentLoadingMessageIds.value = new Set()
-    if (archiveOpen.value || processedBoxOpen.value) await loadArchive()
-    inquiries.value = nextInquiries.items
-    inquiryHasMore.value = nextInquiries.has_more
-    inquiryTotalCount.value = nextInquiries.total_count ?? (nextInquiries.has_more ? inquiryPage.value * INQUIRY_PAGE_SIZE + 1 : (inquiryPage.value - 1) * INQUIRY_PAGE_SIZE + nextInquiries.items.length)
     transferTargets.value = nextTargets
-    if (!nextInquiries.items.some((inquiry) => inquiry.id === selectedInquiryId.value)) {
-      selectedInquiryId.value = null
-      selectedSalesUserId.value = null
+    if (nextGroupBindings !== null) {
+      groupBindings.value = nextGroupBindings
+      groupBindingsLoaded = true
+    }
+    if (loadList) {
+      messages.value = nextMessages.items
+      messagePage.value = nextMessages.page
+      messageHasMore.value = nextMessages.has_more
+      expandedMessageIds.value = new Set()
+      fullMessageContentIds.value = new Set()
+      messageContent.value = {}
+      contentLoadingMessageIds.value = new Set()
+      inquiries.value = nextInquiries.items
+      inquiryHasMore.value = nextInquiries.has_more
+      inquiryTotalCount.value = nextInquiries.total_count ?? (nextInquiries.has_more ? inquiryPage.value * INQUIRY_PAGE_SIZE + 1 : (inquiryPage.value - 1) * INQUIRY_PAGE_SIZE + nextInquiries.items.length)
+      // Archive boxes are secondary data: never hold up the primary list.
+      if (archiveOpen.value || processedBoxOpen.value) void loadArchive()
     }
     return true
   } catch (cause) {
@@ -898,6 +988,305 @@ async function loadWorkspace(): Promise<boolean> {
     if (initialLoad) loading.value = false
     filterLoading.value = false
   }
+}
+
+/** In-place refresh after a mutation; keeps URL and loaded-list signature intact. */
+function refreshList(mode: 'full' | 'list' = 'list'): Promise<boolean> {
+  return loadWorkspace(mode)
+}
+
+function listSignature(r: AppRoute): string {
+  // Boxes are archive-only; toggling them must not refetch the primary list.
+  return [r.view, r.mpage, r.ipage, r.mh, r.mi, r.ma, r.mc, r.ih].join('|')
+}
+
+let applyToken = 0
+let pendingInquirySelection: number | null = null
+
+/* ---- WhatsApp 群聊客户归属：纯人工绑定，绝不参与自动归链 ---- */
+
+/** 群 JID 优先用与 bridge 一致的解析，兜底从分组 key 反解。 */
+function groupJidOf(group: MessageGroup): string | null {
+  if (group.scope !== 'group') return null
+  const parsed = whatsappGroupJid(group.messages[0])
+  if (parsed) return parsed
+  const fallback = group.key.replace(/^group:[^:]+:/, '')
+  return fallback || null
+}
+
+function groupBindingFor(group: MessageGroup): WhatsappGroupBinding | null {
+  const jid = groupJidOf(group)
+  if (!jid) return null
+  return groupBindings.value.find((binding) => binding.group_jid === jid) ?? null
+}
+
+function openGroupBinding(group: MessageGroup) {
+  const jid = groupJidOf(group)
+  if (!jid) return
+  navigate({ page: 'groupBinding', groupJid: jid })
+}
+
+const activeGroupJid = computed(() =>
+  route.value.page === 'groupBinding' ? route.value.groupJid : null,
+)
+const activeGroupBinding = computed(() => {
+  const jid = activeGroupJid.value
+  return jid ? groupBindings.value.find((binding) => binding.group_jid === jid) ?? null : null
+})
+/** 手输优先于候选点选，两者互斥，避免运营误以为选中的候选生效。 */
+const bindingPhone = computed(() => groupBindingPhoneInput.value.trim() || groupBindingSelectedPhone.value)
+
+async function loadGroupBindingPage(jid: string | null, token: number) {
+  if (!jid) {
+    groupBindingError.value = '缺少群 JID，请从群聊分组卡片上的「确认群聊客户归属」进入此页面。'
+    return
+  }
+  const requestId = ++groupBindingRequestId
+  groupBindingLoading.value = true
+  groupBindingError.value = ''
+  groupBindingFeedback.value = null
+  groupBindingSelectedPhone.value = ''
+  groupBindingPhoneInput.value = ''
+  groupBindingNote.value = ''
+  try {
+    const [bindings, candidates] = await Promise.all([
+      inboxApi.getWhatsappGroupBindings(),
+      inboxApi.getWhatsappPhoneCandidates(),
+    ])
+    if (token !== applyToken || requestId !== groupBindingRequestId) return
+    groupBindings.value = bindings
+    groupBindingsLoaded = true
+    groupBindingCandidates.value = candidates
+  } catch (cause) {
+    if (token !== applyToken || requestId !== groupBindingRequestId) return
+    groupBindingError.value = cause instanceof Error ? cause.message : '群聊归属信息加载失败。'
+  } finally {
+    if (token === applyToken && requestId === groupBindingRequestId) groupBindingLoading.value = false
+  }
+}
+
+function selectGroupBindingCandidate(phone: string) {
+  groupBindingSelectedPhone.value = groupBindingSelectedPhone.value === phone ? '' : phone
+  groupBindingPhoneInput.value = ''
+}
+
+function onGroupBindingPhoneInput() {
+  if (groupBindingPhoneInput.value.trim()) groupBindingSelectedPhone.value = ''
+}
+
+async function submitGroupBinding() {
+  const jid = activeGroupJid.value
+  const phone = bindingPhone.value
+  if (!jid || !phone || groupBindingSubmitting.value) return
+  groupBindingSubmitting.value = true
+  groupBindingFeedback.value = null
+  try {
+    const csrf = await inboxApi.getCsrf()
+    const updated = await inboxApi.bindWhatsappGroup(jid, phone, csrf.csrf_token, groupBindingNote.value.trim() || undefined)
+    groupBindings.value = [...groupBindings.value.filter((item) => item.id !== updated.id), updated]
+    groupBindingsLoaded = true
+    groupBindingFeedback.value = {
+      text: `已由人工确认：该群归属 ${updated.normalized_phone}。未改动任何消息，也未创建或修改询盘链路。`,
+      kind: 'success',
+    }
+    groupBindingPhoneInput.value = ''
+    groupBindingSelectedPhone.value = ''
+    groupBindingNote.value = ''
+  } catch (cause) {
+    groupBindingFeedback.value = {
+      text: cause instanceof Error ? cause.message : '绑定失败，请稍后重试。',
+      kind: 'error',
+    }
+  } finally {
+    groupBindingSubmitting.value = false
+  }
+}
+
+async function removeGroupBinding() {
+  const binding = activeGroupBinding.value
+  if (!binding || groupBindingSubmitting.value) return
+  groupBindingSubmitting.value = true
+  groupBindingFeedback.value = null
+  try {
+    const csrf = await inboxApi.getCsrf()
+    await inboxApi.unbindWhatsappGroup(binding.id, csrf.csrf_token)
+    groupBindings.value = groupBindings.value.filter((item) => item.id !== binding.id)
+    groupBindingsLoaded = true
+    groupBindingFeedback.value = { text: '已解除该群的客户绑定，历史消息与链路未受影响。', kind: 'success' }
+  } catch (cause) {
+    groupBindingFeedback.value = {
+      text: cause instanceof Error ? cause.message : '解绑失败，请稍后重试。',
+      kind: 'error',
+    }
+  } finally {
+    groupBindingSubmitting.value = false
+  }
+}
+
+/** A directly opened detail URL never loaded the list, so targets may be empty. */
+async function loadTransferTargets() {
+  try {
+    transferTargets.value = await inboxApi.getTransferTargets()
+  } catch (cause) {
+    if (cause instanceof ApiError && cause.status === 403) transferTargets.value = []
+  }
+}
+
+async function loadInquiryDetail(id: number, token: number) {
+  try {
+    const [inquiry] = await Promise.all([
+      inboxApi.getInquiry(id),
+      transferTargets.value.length === 0 ? loadTransferTargets() : Promise.resolve(),
+    ])
+    if (token !== applyToken) return
+    inquiryDetail.value = inquiry
+  } catch (cause) {
+    if (token !== applyToken) return
+    actionError.value = cause instanceof Error ? cause.message : '链路加载失败。'
+  }
+}
+
+async function loadMessageDetail(id: number, token: number) {
+  messageDetailLoading.value = true
+  try {
+    const message = await inboxApi.getMessage(id)
+    if (token !== applyToken) return
+    messageDetail.value = message
+  } catch (cause) {
+    if (token !== applyToken) return
+    actionError.value = cause instanceof Error ? cause.message : '消息加载失败。'
+  } finally {
+    if (token === applyToken) messageDetailLoading.value = false
+  }
+}
+
+/** Full original text is fetched only when the operator asks for it. */
+async function loadMessageDetailContent() {
+  if (!messageDetail.value) return
+  const id = messageDetail.value.id
+  messageDetailLoading.value = true
+  try {
+    messageDetailContent.value = await inboxApi.getMessageContent(id)
+  } catch (cause) {
+    actionError.value = cause instanceof Error ? cause.message : '原文查看失败，请稍后重试。'
+  } finally {
+    messageDetailLoading.value = false
+  }
+}
+
+async function reactivateSelectedInquiry() {
+  if (!selectedInquiry.value) return
+  handlingSubmitting.value = true
+  actionError.value = ''
+  actionMessage.value = ''
+  try {
+    const csrf = await inboxApi.getCsrf()
+    const updated = await inboxApi.reactivateInquiry(selectedInquiry.value.id, csrf.csrf_token)
+    inquiryDetail.value = updated
+    actionMessage.value = '链路已恢复到待处理状态，可继续分配或处理。'
+  } catch (cause) {
+    actionError.value = cause instanceof Error ? cause.message : '链路恢复失败。'
+  } finally {
+    handlingSubmitting.value = false
+  }
+}
+
+async function updateDetailMessageHandling(action: 'processed' | 'ignored') {
+  if (!messageDetail.value) return
+  const id = messageDetail.value.id
+  await updateMessageHandling(messageDetail.value, action)
+  await loadMessageDetail(id, applyToken)
+}
+
+async function restoreDetailMessage() {
+  if (!messageDetail.value) return
+  const id = messageDetail.value.id
+  await restoreArchivedMessage(id)
+  await loadMessageDetail(id, applyToken)
+}
+
+/** v-model changes are written back to the URL so refresh / Back keep filters. */
+function onMessageFilterChange() {
+  navigate({
+    mh: messageHandlingFilter.value,
+    mi: messageIngestionFilter.value,
+    ma: messageAssignmentFilter.value,
+    mc: messageChannelAccountFilter.value,
+    mpage: 1,
+  }, true)
+}
+
+function onInquiryFilterChange() {
+  navigate({ ih: inquiryHandlingFilter.value, ipage: 1 }, true)
+}
+
+function toggleBox(box: 'processed' | 'ignored') {
+  const next = route.value.box === box ? '' : box
+  navigate({ box: next }, true)
+  if (next) void loadArchive()
+}
+
+function goToMessagePage(page: number) {
+  if (page < 1 || (page > messagePage.value && !canLoadMoreMessages.value)) return
+  navigate({ mpage: page }, true)
+}
+
+/** Single entry point for URL -> UI state. Back/forward with an unchanged list
+ *  signature reuses already loaded data and issues zero HTTP requests. */
+async function applyRoute(r: AppRoute, info: RouteChange) {
+  const token = ++applyToken
+  workspaceView.value = r.view
+  messagePage.value = r.mpage
+  inquiryPage.value = r.ipage
+  messageHandlingFilter.value = r.mh
+  messageIngestionFilter.value = r.mi
+  messageAssignmentFilter.value = r.ma
+  messageChannelAccountFilter.value = r.mc
+  inquiryHandlingFilter.value = r.ih
+  processedBoxOpen.value = r.box === 'processed'
+  archiveOpen.value = r.box === 'ignored'
+  profileOpen.value = r.page === 'settings'
+  operationLogOpen.value = r.page === 'logs'
+  operationLogInquiryId.value = r.logsInquiry
+  groupBindingOpen.value = r.page === 'groupBinding'
+  selectedInquiryId.value = null
+  selectedMessageId.value = r.page === 'message' ? r.id : null
+  selectedSalesUserId.value = null
+  selectedBusinessType.value = null
+  inquiryDetail.value = null
+  messageDetail.value = null
+  messageDetailContent.value = null
+  closeLinkReview()
+  actionError.value = ''
+  actionMessage.value = ''
+
+  const standalone = isStandalonePage(r.page)
+  const signature = listSignature(r)
+  if (!standalone) {
+    if (info.initial || signature !== loadedListSignature) {
+      const ok = await loadWorkspace(info.initial ? 'full' : 'list')
+      if (token !== applyToken) return
+      if (!ok) return
+      loadedListSignature = signature
+    }
+    if (pendingInquirySelection !== null) {
+      const index = Math.min(pendingInquirySelection, inquiries.value.length - 1)
+      selectedInquiryId.value = inquiries.value[index]?.id ?? null
+      pendingInquirySelection = null
+    }
+  } else if (info.initial) {
+    const ok = await loadWorkspace('base')
+    if (token !== applyToken || !ok) return
+    loading.value = false
+  }
+
+  if (r.page === 'inquiry' && r.id !== null) await loadInquiryDetail(r.id, token)
+  else if (r.page === 'message' && r.id !== null) await loadMessageDetail(r.id, token)
+  else if (r.page === 'logs') await fetchOperationLogs(r.logsInquiry)
+  else if (r.page === 'groupBinding') await loadGroupBindingPage(r.groupJid, token)
+  else if (r.page === 'settings' && accounts.value.length === 0) await loadWorkspace('base')
+
+  if (info.initial) window.setTimeout(() => void refreshAnalysisCounts(), 1200)
 }
 
 function authorizeFakeChannel(channelType: FakeChannel['channel_type']) {
@@ -991,7 +1380,7 @@ async function startGmailAuthorization() {
     if (!account || account.status === 'revoked') {
       const csrf = await inboxApi.getCsrf()
       await channelsApi.createGmailAccount(csrf.csrf_token)
-      if (!await loadWorkspace()) {
+      if (!await refreshList('full')) {
         gmailError.value = 'Gmail 账号已初始化，但工作台刷新失败，请刷新后重试。'
         return
       }
@@ -1030,7 +1419,7 @@ async function startOutlookAuthorization() {
     if (!account) {
       const csrf = await inboxApi.getCsrf()
       await channelsApi.createOutlookAccount(csrf.csrf_token)
-      await loadWorkspace()
+      await refreshList('full')
       account = accounts.value.find((item) => item.channel_type === 'outlook')
     }
     if (!account) throw new Error('Outlook 账号初始化失败。')
@@ -1069,7 +1458,7 @@ async function readOutlookMessages() {
       : result
     const repaired = summary.links_repaired ? `，补齐邮件链接 ${summary.links_repaired} 条` : ''
     outlookMessage.value = `Outlook 主动读取完成：确认 ${summary.total} 条，其中新增 ${summary.created} 条，重复 ${summary.duplicates} 条${repaired}。`
-    await loadWorkspace()
+    await refreshList()
   } catch (cause) {
     if (cause instanceof ApiError && (cause.status === 401 || cause.status === 403)) {
       outlookError.value = '当前用户没有权限读取该 Outlook 账号。'
@@ -1177,7 +1566,7 @@ async function updateMessageHandling(message: Message, action: 'processed' | 'ig
         `询盘 #${message.inquiry_id} 会话的 ${messageCount} 条消息已${action === 'processed' ? '处理' : '忽略'}`,
         action,
       )
-      void refreshAnalysisCounts()
+      scheduleAnalysisRefresh()
     } catch (cause) {
       actionError.value = cause instanceof Error ? cause.message : '状态更新失败，请稍后重试。'
     } finally {
@@ -1193,8 +1582,8 @@ async function updateMessageHandling(message: Message, action: 'processed' | 'ig
     const updated = await inboxApi.updateMessageHandling(message.id, action, csrf.csrf_token)
     moveMessageToBox(updated)
     showActionToast(action === 'processed' ? '已处理' : '已忽略', action)
-    if (archiveOpen.value || processedBoxOpen.value) await loadArchive()
-    await refreshAnalysisCounts()
+    if (archiveOpen.value || processedBoxOpen.value) void loadArchive()
+    scheduleAnalysisRefresh()
   } catch (cause) {
     actionError.value = cause instanceof Error ? cause.message : '消息状态更新失败，请稍后重试。'
   } finally {
@@ -1211,16 +1600,20 @@ async function updateSelectedInquiryHandling(action: 'processed' | 'ignored') {
     const csrf = await inboxApi.getCsrf()
     const updated = await inboxApi.updateInquiryHandling(selectedInquiry.value.id, action, csrf.csrf_token)
     actionMessage.value = action === 'processed' ? '询盘已标记为已处理。' : '询盘已忽略。'
-    // 保持当前页面位置：本地替换或移除该询盘，不整页刷新。
-    const matchesFilter = !inquiryHandlingFilter.value || inquiryHandlingFilter.value === updated.handling_status
-    inquiries.value = matchesFilter
-      ? inquiries.value.map((item) => (item.id === updated.id ? updated : item))
-      : inquiries.value.filter((item) => item.id !== updated.id)
-    if (!inquiries.value.some((inquiry) => inquiry.id === selectedInquiryId.value)) {
-      selectedInquiryId.value = inquiries.value[0]?.id ?? null
-      selectedSalesUserId.value = null
+    // 独立详情页直接替换详情对象；列表页则本地替换，不整页刷新。
+    if (inquiryDetail.value?.id === updated.id) {
+      inquiryDetail.value = updated
+    } else {
+      const matchesFilter = !inquiryHandlingFilter.value || inquiryHandlingFilter.value === updated.handling_status
+      inquiries.value = matchesFilter
+        ? inquiries.value.map((item) => (item.id === updated.id ? updated : item))
+        : inquiries.value.filter((item) => item.id !== updated.id)
+      if (!inquiries.value.some((inquiry) => inquiry.id === selectedInquiryId.value)) {
+        selectedInquiryId.value = inquiries.value[0]?.id ?? null
+        selectedSalesUserId.value = null
+      }
     }
-    await refreshAnalysisCounts()
+    scheduleAnalysisRefresh()
   } catch (cause) {
     actionError.value = cause instanceof Error ? cause.message : '状态更新失败，请稍后重试。'
   } finally {
@@ -1241,10 +1634,14 @@ async function transferSelectedInquiry() {
   try {
     const csrf = await inboxApi.getCsrf()
     await inboxApi.transferInquiry(selectedInquiry.value.id, selectedSalesUserId.value, selectedBusinessType.value, csrf.csrf_token)
-    actionMessage.value = '客户链路已分配，正在刷新授权范围内的数据。'
+    actionMessage.value = '客户链路已分配。'
     selectedSalesUserId.value = null
     selectedBusinessType.value = null
-    await loadWorkspace()
+    if (route.value.page === 'inquiry' && route.value.id !== null) {
+      await loadInquiryDetail(route.value.id, applyToken)
+    } else {
+      await refreshList('list')
+    }
   } catch (cause) {
     if (cause instanceof ApiError) {
       actionError.value = cause.status === 403
@@ -1262,16 +1659,7 @@ async function transferSelectedInquiry() {
 
 onMounted(() => {
   readGmailCallbackState()
-  void (async () => {
-    const loaded = await loadWorkspace()
-    if (!loaded) return
-    await nextTick()
-    if ('requestIdleCallback' in window) {
-      window.requestIdleCallback(() => void refreshAnalysisCounts(), { timeout: 2500 })
-    } else {
-      window.setTimeout(() => void refreshAnalysisCounts(), 800)
-    }
-  })()
+  initRouter((r, info) => { void applyRoute(r, info) })
 })
 </script>
 
@@ -1283,48 +1671,20 @@ onMounted(() => {
         <span>{{ actionToast.text }}</span>
       </div>
     </Transition>
-    <div v-if="operationLogOpen" class="operation-log-backdrop" @click.self="operationLogOpen = false">
-      <section class="operation-log-dialog" role="dialog" aria-modal="true" aria-labelledby="operation-log-title">
-        <header>
-          <div><p class="eyebrow">操作回溯</p><h2 id="operation-log-title">{{ operationLogInquiryId === null ? '我的操作记录' : `链路 #${operationLogInquiryId} 操作记录` }}</h2></div>
-          <button class="secondary" type="button" aria-label="关闭操作记录" @click="operationLogOpen = false">关闭</button>
-        </header>
-        <p v-if="operationLogLoading" class="empty">正在加载…</p>
-        <p v-else-if="operationLogs.length === 0" class="empty">暂无操作记录。</p>
-        <div v-else class="operation-log-table-wrap">
-          <table class="operation-log-table">
-            <thead><tr><th>操作账号</th><th>操作名称</th><th>对象</th><th>时间</th><th>结果</th></tr></thead>
-            <tbody>
-              <tr v-for="record in operationLogs" :key="record.id">
-                <td>{{ record.actor_name }}</td>
-                <td>{{ record.operation_name }}</td>
-                <td>
-                  <button v-if="record.object_type === 'message' && record.object_id !== null" class="operation-object-link" type="button" @click="openOperationLogObject(record)">消息 #{{ record.object_id }} · 查看概要与处理</button>
-                  <span v-else>{{ record.object_type === 'inquiry' ? '链路' : '消息' }}{{ record.object_id ? ` #${record.object_id}` : '' }}</span>
-                  <small v-if="record.detail">{{ record.detail }}</small>
-                </td>
-                <td>{{ formatTime(record.created_at) }}</td>
-                <td><span class="operation-result" :class="`result-${record.result}`">{{ record.result === 'success' ? '成功' : record.result === 'timeout' ? '超时' : '失败' }}</span></td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
-      </section>
-    </div>
     <header class="topbar">
       <div>
-        <p class="eyebrow">{{ profileOpen ? '个人设置' : '运营工作台' }}</p>
-        <h1>{{ profileOpen ? '渠道连接' : '消息与客户' }}</h1>
+        <p class="eyebrow">{{ isStandalone ? '页面导航' : '运营工作台' }}</p>
+        <h1>{{ isStandalone ? standaloneTitle : '消息与客户' }}</h1>
       </div>
       <div class="topbar-actions">
         <span v-if="currentUser" class="current-user">{{ currentUser.username }}（{{ currentUser.role }}）</span>
         <button class="link-button logout-link" type="button" @click="logoutSystemAccount">
           退出登录
         </button>
-        <button class="secondary" type="button" @click="profileOpen = !profileOpen">
+        <button class="secondary" type="button" @click="profileOpen ? closeStandalonePage() : navigate({ page: 'settings' })">
           {{ profileOpen ? '返回工作台' : '我的 / 接入账号' }}
         </button>
-        <button class="secondary" type="button" @click="loadWorkspace">刷新</button>
+        <button class="secondary" type="button" @click="refreshList('full')">刷新</button>
       </div>
     </header>
     <p v-if="logoutError" class="action-error">{{ logoutError }}</p>
@@ -1336,7 +1696,7 @@ onMounted(() => {
           <h2>个人渠道连接</h2>
           <p class="profile-lede">管理当前登录用户本人的授权和连接状态。所有 provider 调用都经过后端，页面只展示非敏感状态。</p>
         </div>
-        <button class="link-button back-link" type="button" @click="profileOpen = false">返回工作台</button>
+        <button class="link-button back-link" type="button" @click="closeStandalonePage">← 返回上一页</button>
       </div>
 
       <div class="settings-list">
@@ -1453,16 +1813,118 @@ onMounted(() => {
       <p class="security-note">浏览器不保存 token、refresh token、client secret、OAuth code、QR 或 auth state；OAuth 只通过后端返回的官方授权地址启动。</p>
     </section>
 
-    <template v-else-if="!profileOpen">
+    <section v-else-if="operationLogOpen" class="standalone-page operation-log-page" role="region" aria-labelledby="operation-log-title">
+      <nav class="page-breadcrumb">
+        <button class="link-button" type="button" @click="closeStandalonePage">← 返回上一页</button>
+        <span>{{ standaloneTitle }}</span>
+      </nav>
+      <div class="operation-log-dialog">
+        <header>
+          <div><p class="eyebrow">操作回溯</p><h2 id="operation-log-title">{{ standaloneTitle }}</h2></div>
+          <button class="secondary" type="button" @click="closeStandalonePage">关闭</button>
+        </header>
+        <p v-if="operationLogLoading" class="empty">正在加载…</p>
+        <p v-else-if="operationLogs.length === 0" class="empty">暂无操作记录。</p>
+        <div v-else class="operation-log-table-wrap">
+          <table class="operation-log-table">
+            <thead><tr><th>操作账号</th><th>操作名称</th><th>对象</th><th>时间</th><th>结果</th></tr></thead>
+            <tbody>
+              <tr v-for="record in operationLogs" :key="record.id">
+                <td>{{ record.actor_name }}</td>
+                <td>{{ record.operation_name }}</td>
+                <td>
+                  <button v-if="record.object_type === 'message' && record.object_id !== null" class="operation-object-link" type="button" @click="openOperationLogObject(record)">消息 #{{ record.object_id }} · 查看概要与处理</button>
+                  <span v-else>{{ record.object_type === 'inquiry' ? '链路' : '消息' }}{{ record.object_id ? ` #${record.object_id}` : '' }}</span>
+                  <small v-if="record.detail">{{ record.detail }}</small>
+                </td>
+                <td>{{ formatTime(record.created_at) }}</td>
+                <td><span class="operation-result" :class="`result-${record.result}`">{{ record.result === 'success' ? '成功' : record.result === 'timeout' ? '超时' : '失败' }}</span></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <section v-else-if="groupBindingOpen" class="standalone-page gb-page" role="region" aria-labelledby="gb-title">
+      <nav class="page-breadcrumb">
+        <button class="link-button" type="button" @click="closeStandalonePage">← 返回上一页</button>
+        <span>{{ standaloneTitle }}</span>
+      </nav>
+      <div class="gb-dialog">
+        <header class="gb-heading">
+          <div>
+            <p class="eyebrow">WhatsApp 群聊 · 客户归属</p>
+            <h2 id="gb-title">确认群聊客户归属</h2>
+            <p class="gb-jid">群 JID：<code>{{ activeGroupJid || '未提供' }}</code></p>
+          </div>
+          <button class="secondary" type="button" @click="closeStandalonePage">关闭</button>
+        </header>
+        <p class="gb-notice">
+          此绑定<strong>完全由运营人员人工确认</strong>。系统不会根据群名、群成员或消息内容推断客户，也不会从通讯录添加好友。
+          绑定不会改写历史消息、不会自动创建或合并询盘链路。一个群只对应一个客户。
+        </p>
+        <div class="gb-content" aria-live="polite">
+          <p v-if="!activeGroupJid" class="action-error">{{ groupBindingError || '缺少群 JID，请从群聊分组卡片进入此页面。' }}</p>
+          <p v-else-if="groupBindingLoading" class="empty">正在加载归属信息与可用客户手机号…</p>
+          <template v-else>
+            <section class="gb-section gb-current">
+              <h3>当前绑定</h3>
+              <template v-if="activeGroupBinding">
+                <p class="gb-current-phone">{{ activeGroupBinding.normalized_phone }}</p>
+                <p class="muted">绑定人：{{ activeGroupBinding.bound_by || '未知' }} · 时间：{{ formatTime(activeGroupBinding.updated_at) }}<span v-if="activeGroupBinding.note"> · 备注：{{ activeGroupBinding.note }}</span></p>
+                <button class="secondary gb-danger" type="button" :disabled="groupBindingSubmitting" @click="removeGroupBinding">解除绑定</button>
+              </template>
+              <p v-else class="muted">尚未绑定客户。请从下方选择或输入客户手机号。</p>
+            </section>
+            <section class="gb-section">
+              <h3>方式一 · 从当前消息渠道已获取的客户中选择</h3>
+              <p class="muted">以下手机号来自你有权访问的 WhatsApp 消息，只是供人工挑选的列表，不代表系统判断该群属于此客户。</p>
+              <p v-if="groupBindingError" class="action-error">{{ groupBindingError }}</p>
+              <p v-else-if="groupBindingCandidates.length === 0" class="empty">当前授权范围内没有可用的客户手机号，请使用方式二手动输入。</p>
+              <div v-else class="gb-candidate-list">
+                <button v-for="candidate in groupBindingCandidates" :key="candidate.normalized_phone" class="gb-candidate" :class="{ 'is-selected': groupBindingSelectedPhone === candidate.normalized_phone }" type="button" :aria-pressed="groupBindingSelectedPhone === candidate.normalized_phone" @click="selectGroupBindingCandidate(candidate.normalized_phone)">
+                  <strong>{{ candidate.normalized_phone }}</strong>
+                  <span>{{ candidate.customer_nickname || '未提供昵称' }}<span v-if="candidate.customer_contact && candidate.customer_contact !== candidate.normalized_phone"> · {{ candidate.customer_contact }}</span></span>
+                  <small>最近出现 {{ formatTime(candidate.last_seen_at) }} · 共 {{ candidate.message_count }} 条消息</small>
+                </button>
+              </div>
+            </section>
+            <section class="gb-section">
+              <h3>方式二 · 直接输入带地区码的手机号</h3>
+              <label class="gb-label" for="gb-phone">客户手机号（例如 +8613800138000）</label>
+              <input id="gb-phone" v-model="groupBindingPhoneInput" class="gb-input" type="tel" inputmode="tel" autocomplete="off" placeholder="+8613800138000" maxlength="32" @input="onGroupBindingPhoneInput" />
+              <p class="muted">手动输入优先于上方候选选择；提交前请核对地区码。后端会按 E.164 校验。</p>
+              <label class="gb-label" for="gb-note">备注（可选）</label>
+              <input id="gb-note" v-model="groupBindingNote" class="gb-input" type="text" maxlength="255" placeholder="例如：该群为某公司采购对接群" />
+            </section>
+            <p v-if="groupBindingFeedback" class="gb-feedback" :class="`is-${groupBindingFeedback.kind}`" role="status">{{ groupBindingFeedback.text }}</p>
+            <div class="gb-actions">
+              <button class="primary" type="button" :disabled="groupBindingSubmitting || !bindingPhone || !activeGroupJid" @click="submitGroupBinding">
+                {{ groupBindingSubmitting ? '正在提交…' : activeGroupBinding ? '确认改绑' : '确认绑定' }}
+              </button>
+              <button class="secondary" type="button" @click="closeStandalonePage">返回，不修改</button>
+            </div>
+          </template>
+        </div>
+      </div>
+    </section>
+
+    <template v-else>
       <section v-if="loading" class="notice">正在加载授权范围内的数据…</section>
       <section v-else-if="unauthorized" class="notice error">
       {{ unauthorizedStatus === 401 ? '当前会话已失效，请重新登录。' : '当前账号无权访问该运营收件箱。' }}
     </section>
     <section v-else-if="error" class="notice error">
       {{ error }}
-      <button class="link-button" type="button" @click="loadWorkspace">重试</button>
+      <button class="link-button" type="button" @click="refreshList('full')">重试</button>
     </section>
-    <section v-else class="content-grid" :class="{ 'has-selected-inquiry': isInquiryView && selectedInquiry }" data-ui="inbox">
+    <section v-else class="content-grid" :class="{ 'has-selected-inquiry': isInquiryView && selectedInquiry, 'is-standalone': isStandalone }" data-ui="inbox">
+      <nav v-if="isStandalone" class="page-breadcrumb page-breadcrumb-full">
+        <button class="link-button" type="button" @click="closeStandalonePage">← 返回上一页</button>
+        <span>{{ standaloneTitle }}</span>
+      </nav>
+      <template v-if="!isStandalone">
       <nav class="workspace-tabs" aria-label="工作台视图">
         <button type="button" :class="{ active: workspaceView === 'messages' }" @click="switchWorkspaceView('messages')">消息收件箱</button>
         <button type="button" :class="{ active: workspaceView === 'review' }" @click="switchWorkspaceView('review')">待分配</button>
@@ -1482,7 +1944,7 @@ onMounted(() => {
         <div v-if="isInquiryView" class="inbox-filters">
           <div class="filter-group">
             <span>处理状态</span>
-            <select v-model="inquiryHandlingFilter" aria-label="询盘人工状态" @change="resetInquiryFilters">
+            <select v-model="inquiryHandlingFilter" aria-label="询盘人工状态" @change="onInquiryFilterChange">
               <option value="">全部处理状态</option><option value="pending">待处理</option><option value="processed">已处理</option><option value="ignored">已忽略</option>
             </select>
           </div>
@@ -1531,46 +1993,57 @@ onMounted(() => {
             </div>
             <span class="count">{{ messages.length }} 条</span>
           </div>
-          <div class="inbox-filters">
-            <div v-if="workspaceView === 'messages'" class="filter-group">
-              <span>客户归属</span>
-              <select v-model="messageAssignmentFilter" aria-label="客户归属筛选" @change="loadWorkspace">
-                <option value="all">全部消息</option><option value="assigned">已归属客户</option><option value="unassigned">未归属客户</option>
-              </select>
-            </div>
-            <div class="filter-group">
-              <span>渠道</span>
-              <select v-model="messageChannelAccountFilter" aria-label="消息渠道" @change="loadWorkspace">
-                <option value="">全部渠道</option>
-                <option value="website_form">官网表单</option>
-                <option v-for="account in messageChannelAccounts" :key="account.id" :value="String(account.id)">
-                  {{ channelLabel(account.channel_type) }}
-                </option>
-              </select>
-            </div>
-            <div class="filter-group">
-              <span>状态</span>
-              <select v-model="messageIngestionFilter" aria-label="消息入站状态" @change="loadWorkspace">
-                <option value="">全部入站</option><option value="received">已接收</option><option value="processed">已处理入站</option><option value="failed">入站失败</option>
-              </select>
-              <select v-model="messageHandlingFilter" aria-label="消息人工状态" @change="loadWorkspace">
-                <option value="all">全部人工</option><option value="pending">待处理</option><option value="processed">已处理</option><option value="ignored">已忽略</option>
-              </select>
-            </div>
-          </div>
-          <div class="archive-toolbar">
-            <button class="secondary" type="button" @click="processedBoxOpen = !processedBoxOpen; (processedBoxOpen || archiveOpen) ? loadArchive() : undefined">
+          <div class="message-tools">
+            <section class="message-tool-group message-filter-set" aria-labelledby="message-filter-heading">
+              <h3 id="message-filter-heading">筛选条件</h3>
+              <div class="inbox-filters">
+                <div v-if="workspaceView === 'messages'" class="filter-group">
+                  <span>客户归属</span>
+                  <select v-model="messageAssignmentFilter" aria-label="客户归属筛选" @change="onMessageFilterChange">
+                    <option value="all">全部消息</option><option value="assigned">已归属客户</option><option value="unassigned">未归属客户</option>
+                  </select>
+                </div>
+                <div class="filter-group">
+                  <span>渠道</span>
+                  <select v-model="messageChannelAccountFilter" aria-label="消息渠道" @change="onMessageFilterChange">
+                    <option value="">全部渠道</option>
+                    <option value="website_form">官网表单</option>
+                    <option v-for="account in messageChannelAccounts" :key="account.id" :value="String(account.id)">
+                      {{ channelLabel(account.channel_type) }}
+                    </option>
+                  </select>
+                </div>
+                <div class="filter-group">
+                  <span>入站状态</span>
+                  <select v-model="messageIngestionFilter" aria-label="消息入站状态" @change="onMessageFilterChange">
+                    <option value="">全部入站</option><option value="received">已接收</option><option value="processed">已处理入站</option><option value="failed">入站失败</option>
+                  </select>
+                </div>
+                <div class="filter-group">
+                  <span>处理状态</span>
+                  <select v-model="messageHandlingFilter" aria-label="消息人工处理状态" @change="onMessageFilterChange">
+                    <option value="all">全部状态</option><option value="pending">待处理</option><option value="processed">已处理</option><option value="ignored">已忽略</option>
+                  </select>
+                </div>
+              </div>
+            </section>
+            <section class="message-tool-group message-box-set" aria-labelledby="message-box-heading">
+              <h3 id="message-box-heading">消息箱</h3>
+              <div class="archive-toolbar">
+            <button class="secondary" :class="{ 'is-active': processedBoxOpen }" type="button" :aria-expanded="processedBoxOpen" @click="toggleBox('processed')">
               {{ processedBoxOpen ? '收起已处理箱' : '已处理箱' }}
             </button>
-            <button class="secondary" type="button" @click="archiveOpen = !archiveOpen; (processedBoxOpen || archiveOpen) ? loadArchive() : undefined">
+            <button class="secondary" :class="{ 'is-active': archiveOpen }" type="button" :aria-expanded="archiveOpen" @click="toggleBox('ignored')">
               {{ archiveOpen ? '收起归档箱' : '归档箱' }}
             </button>
+              </div>
+            </section>
           </div>
           <p v-if="providerFallback" class="inline-feedback success">
             <a :href="providerFallback.url" target="_blank" rel="noopener noreferrer">{{ providerFallback.label }}</a>
           </p>
           <p v-if="actionError" class="inline-feedback error" role="alert">{{ actionError }}</p>
-          <section v-if="processedBoxOpen" class="archive-box">
+          <section v-if="processedBoxOpen" id="processed-message-box" class="archive-box">
             <h3>已处理</h3>
             <p v-if="processedMessages.length === 0" class="empty">已处理箱为空。</p>
             <article v-for="archived in processedMessages" :key="archived.id" class="archive-row">
@@ -1582,7 +2055,7 @@ onMounted(() => {
               <button class="secondary" type="button" :disabled="handlingSubmitting" @click="restoreArchivedMessage(archived.id)">恢复到待处理</button>
             </article>
           </section>
-          <section v-if="archiveOpen" class="archive-box">
+          <section v-if="archiveOpen" id="ignored-message-box" class="archive-box">
             <h3>已忽略归档</h3>
             <p v-if="ignoredMessages.length === 0" class="empty">归档箱为空。</p>
             <article v-for="archived in ignoredMessages" :key="archived.id" class="archive-row">
@@ -1597,9 +2070,16 @@ onMounted(() => {
           <p v-if="messages.length === 0" class="empty">当前授权范围内没有符合条件的消息。</p>
           <template v-for="group in groupedMessageItems" :key="group.key">
             <section class="message-group" :class="{ 'has-multiple': group.messages.length > 1 }">
-            <div v-if="group.messages.length > 1" class="message-group-bar">
-              <span class="group-label">{{ messageGroupLabel(group) }} · {{ group.contactLabel }}</span>
-              <button class="link-button" type="button" @click="toggleMessageGroup(group.key)">
+            <div v-if="group.messages.length > 1 || group.scope === 'group'" class="message-group-bar">
+              <span class="group-label">
+                {{ messageGroupLabel(group) }} · {{ group.contactLabel }}
+                <span v-if="group.scope === 'group' && groupBindingFor(group)" class="gb-group-tag is-bound">已归属 {{ groupBindingFor(group)?.normalized_phone }}</span>
+                <span v-else-if="group.scope === 'group'" class="gb-group-tag is-unbound">未确认客户归属</span>
+              </span>
+              <button v-if="group.scope === 'group' && currentUser?.role !== 'sales'" class="action-button action-secondary gb-group-entry" type="button" @click="openGroupBinding(group)">
+                {{ groupBindingFor(group) ? '修改客户归属' : '确认群聊客户归属' }}
+              </button>
+              <button v-if="group.messages.length > 1" class="link-button" type="button" @click="toggleMessageGroup(group.key)">
                 {{ collapsedGroupKeys.has(group.key) ? `展开组内其他 ${group.messages.length - 1} 条` : '收起组内消息' }}
               </button>
             </div>
@@ -1648,7 +2128,8 @@ onMounted(() => {
               </p>
               <span v-if="messageContentFor(message.id)?.can_expand" class="content-clamp-hint">预览最多显示 8 行；完整内容请展开全文。</span>
             </div>
-            <div class="message-actions">
+            <div class="message-actions" :aria-label="`消息 #${message.id} 的操作`">
+              <span class="message-action-label">此消息操作</span>
               <button
                 v-if="message.overview?.status === 'failed' || message.overview?.status === 'ready'"
                 class="action-button action-secondary"
@@ -1667,7 +2148,7 @@ onMounted(() => {
                 {{ contentLoadingMessageIds.has(message.id) ? '正在读取…' : expandedMessageIds.has(message.id) ? '收起正文' : '查看原文' }}
               </button>
               <button
-                v-if="message.link_state !== 'linked' && currentUser?.role !== 'sales'"
+                v-if="message.link_state !== 'linked' && currentUser?.role !== 'sales' && group.scope !== 'group'"
                 class="action-button action-secondary"
                 type="button"
                 :disabled="linkReviewLoading || handlingSubmitting"
@@ -1708,23 +2189,24 @@ onMounted(() => {
             </section>
           </template>
           <div v-if="canLoadMoreMessages || messagePage > 1" class="pagination-bar">
-            <button v-if="messagePage > 1" class="secondary" type="button" :disabled="messageLoadingMore" @click="loadPreviousMessages">上一页</button>
+            <button v-if="messagePage > 1" class="secondary" type="button" :disabled="filterLoading" @click="goToMessagePage(messagePage - 1)">上一页</button>
             <span>第 {{ messagePage }} 页 · 每页 20 条</span>
-            <button v-if="canLoadMoreMessages" class="secondary" type="button" :disabled="messageLoadingMore" @click="loadMoreMessages">下一页</button>
+            <button v-if="canLoadMoreMessages" class="secondary" type="button" :disabled="filterLoading" @click="goToMessagePage(messagePage + 1)">下一页</button>
           </div>
         </div>
       </section>
+      </template>
 
-      <section v-if="isInquiryView && selectedInquiry" class="detail-panel panel">
+      <section v-if="showInquiryDetail" class="detail-panel panel" :class="{ standalone: isStandalone }">
         <div class="panel-heading">
           <div>
             <p class="eyebrow">记录 #{{ selectedInquiry.id }}</p>
             <h2>{{ selectedInquiry.contact_sources[0]?.customer_nickname || selectedInquiry.contact_sources[0]?.raw_customer_contact || `链路 #${selectedInquiry.id}` }}</h2>
           </div>
           <span v-if="selectedInquiry.contact_sources.length > 0" class="status-pill">{{ [...new Set(selectedInquiry.contact_sources.map((source) => source.channel_type).filter(Boolean))].join(' / ') }}</span>
-          <button class="detail-close secondary" type="button" @click="selectedInquiryId = null">关闭详情</button>
+          <button class="detail-close secondary" type="button" @click="closeStandalonePage">← 返回上一页</button>
         </div>
-        <div class="detail-navigation">
+        <div v-if="!isStandalone" class="detail-navigation">
           <button type="button" class="secondary" :disabled="selectedInquiryIndex <= 0 && inquiryPage === 1" @click="moveInquiry(-1)">上一条</button>
           <span>第 {{ inquiryPage }} / {{ inquiryTotalPages }} 页 · 本页 {{ selectedInquiryIndex + 1 }} / {{ inquiries.length }} 条</span>
           <button type="button" class="secondary" :disabled="selectedInquiryIndex >= inquiries.length - 1 && !inquiryHasMore" @click="moveInquiry(1)">下一条</button>
@@ -1762,8 +2244,15 @@ onMounted(() => {
           <p v-else class="muted">当前没有完整的持久化事件历史。</p>
           <ol v-if="selectedInquiry.timeline_complete" class="timeline event-timeline">
             <li v-for="event in selectedInquiry.timeline" :key="event.id">
-              <span>{{ event.event_type }}（{{ event.from_status || '—' }} → {{ event.to_status || '—' }}）</span>
-              <strong>{{ formatTime(event.occurred_at) }}</strong>
+              <div class="timeline-copy">
+                <strong>{{ inquiryEventLabel(event.event_type) }}</strong>
+                <span v-if="event.from_status || event.to_status" class="timeline-change">
+                  {{ event.from_status ? statusLabel(event.from_status) : '新建' }}
+                  <span aria-hidden="true">→</span>
+                  {{ event.to_status ? statusLabel(event.to_status) : '状态未记录' }}
+                </span>
+              </div>
+              <time>{{ formatTime(event.occurred_at) }}</time>
             </li>
           </ol>
         </section>
@@ -1773,13 +2262,15 @@ onMounted(() => {
           <p class="muted">客户消息概要、渠道和人工处理状态。</p>
           <p v-if="selectedInquiry.messages.length === 0" class="empty">当前没有可见关联消息。</p>
           <ol v-else class="timeline linked-message-timeline">
-            <li v-for="linkedMessage in selectedInquiry.messages" :key="linkedMessage.id">
-              <span>
+            <li v-for="linkedMessage in selectedInquiry.messages" :key="linkedMessage.id" class="linked-message-item">
+              <div class="linked-message-copy">
+                <span class="linked-message-origin">
                 {{ channelLabel(linkedMessage.channel_type) }} · {{ linkedMessage.direction === 'inbound' ? '客户入站' : '系统出站' }} · {{ formatTime(linkedMessage.occurred_at) }}
-              </span>
-               <strong>消息 #{{ linkedMessage.id }} · {{ handlingStatusLabel(linkedMessage.handling_status) }} · 概要 {{ linkedMessage.overview_status === 'ready' ? '已生成' : linkedMessage.overview_status === 'pending' ? '生成中' : '待生成' }}</strong>
-              <small>发送人/联系人：{{ selectedInquiry.contact_sources.find((source) => source.channel_account_id === linkedMessage.channel_account_id)?.customer_nickname || selectedInquiry.contact_sources.find((source) => source.channel_account_id === linkedMessage.channel_account_id)?.raw_customer_contact || '当前来源未提供' }} · 渠道账号：{{ linkedMessage.channel_account_external_id || accountLabel(linkedMessage.channel_account_id) }}</small>
-              <p class="linked-message-overview">{{ linkedMessage.overview_text || (linkedMessage.overview_status === 'pending' ? '中文概要正在生成。' : linkedMessage.overview_status === 'failed' ? '中文概要生成失败，可在消息收件箱重试。' : '暂无中文概要。') }}</p>
+                </span>
+                <strong>消息 #{{ linkedMessage.id }} · {{ handlingStatusLabel(linkedMessage.handling_status) }}</strong>
+                <small>发送人/联系人：{{ selectedInquiry.contact_sources.find((source) => source.channel_account_id === linkedMessage.channel_account_id)?.customer_nickname || selectedInquiry.contact_sources.find((source) => source.channel_account_id === linkedMessage.channel_account_id)?.raw_customer_contact || '当前来源未提供' }} · 渠道账号：{{ linkedMessage.channel_account_external_id || accountLabel(linkedMessage.channel_account_id) }}</small>
+                <p class="linked-message-overview">{{ linkedMessage.overview_text || (linkedMessage.overview_status === 'pending' ? '中文概要正在生成。' : linkedMessage.overview_status === 'failed' ? '中文概要生成失败，可在消息收件箱重试。' : '暂无中文概要。') }}</p>
+              </div>
               <button class="secondary" type="button" @click="openCustomerMessage(linkedMessage.id)">查看客户消息</button>
             </li>
           </ol>
@@ -1798,7 +2289,12 @@ onMounted(() => {
         <section class="detail-section action-section">
           <h3>当前可执行操作</h3>
           <button class="secondary operation-log-button" type="button" @click="openOperationLogs(selectedInquiry.id)">查看此链路操作记录</button>
+          <div v-if="selectedInquiry.handling_status !== 'pending'" class="restore-link-banner">
+            <span>当前链路已{{ selectedInquiry.handling_status === 'processed' ? '处理' : '忽略' }}；恢复后才能继续分配或处理。</span>
+            <button class="secondary" type="button" :disabled="handlingSubmitting" @click="reactivateSelectedInquiry">恢复链路</button>
+          </div>
           <p v-if="actionError" class="action-error">{{ actionError }}</p>
+          <p v-if="actionMessage" class="inline-feedback success">{{ actionMessage }}</p>
           <div v-if="selectedInquiry.status === 'new'" class="transfer-form">
             <label for="transfer-business-type">业务类型</label>
             <select id="transfer-business-type" v-model="selectedBusinessType">
@@ -1843,7 +2339,46 @@ onMounted(() => {
           <p class="muted">页面不代替后端授权，不会自动发送、自动转交或修改客户数据。</p>
         </section>
       </section>
-      <section v-else-if="isInquiryView && inquiries.length === 0" class="detail-panel panel empty-state">
+      <section v-else-if="route.page === 'message'" class="detail-panel panel standalone message-detail-page">
+        <p v-if="messageDetailLoading && !messageDetail" class="empty">正在加载消息…</p>
+        <template v-else-if="messageDetail">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">消息 #{{ messageDetail.id }}</p>
+              <h2>{{ messageContactLabel(messageDetail) }}</h2>
+            </div>
+            <span class="status-pill">{{ channelLabel(messageDetail.channel_type) }}</span>
+          </div>
+          <div class="facts-grid">
+            <div><span>发送人</span><strong>{{ messageSenderLabel(messageDetail) }}</strong></div>
+            <div><span>时间</span><strong>{{ formatTime(messageDetail.occurred_at) }}</strong></div>
+            <div><span>人工状态</span><strong>{{ handlingStatusLabel(messageDetail.handling_status) }}</strong></div>
+            <div><span>归链状态</span><strong>{{ linkStateLabel(messageDetail.link_state) }}</strong></div>
+          </div>
+          <section class="detail-section">
+            <h3>中文概要</h3>
+            <p v-if="messageDetail.overview?.status === 'ready'" class="message-overview">{{ messageDetail.overview.text }}</p>
+            <p v-else class="message-preview">{{ messageDetail.display_excerpt || '（无正文）' }}</p>
+          </section>
+          <section class="detail-section">
+            <h3>原文</h3>
+            <p v-if="messageDetailContent" class="message-original">{{ messageDetailContent.parsed_content.display_text || messageDetailContent.preview_text }}</p>
+            <button v-else class="secondary" type="button" :disabled="messageDetailLoading" @click="loadMessageDetailContent">
+              {{ messageDetailLoading ? '加载中…' : '查看原文' }}
+            </button>
+          </section>
+          <p v-if="actionError" class="action-error">{{ actionError }}</p>
+          <p v-if="actionMessage" class="inline-feedback success">{{ actionMessage }}</p>
+          <div class="actions">
+            <button class="secondary" type="button" :disabled="handlingSubmitting" @click="updateDetailMessageHandling('processed')">标记已处理</button>
+            <button class="secondary" type="button" :disabled="handlingSubmitting" @click="updateDetailMessageHandling('ignored')">忽略</button>
+            <button v-if="messageDetail.handling_status !== 'pending'" class="secondary" type="button" :disabled="handlingSubmitting" @click="restoreDetailMessage">恢复到待处理</button>
+          </div>
+          <p class="muted">页面不代替后端授权，不会自动发送、自动转交或修改客户数据。</p>
+        </template>
+        <p v-else class="empty">消息不存在，或当前账号无权访问。</p>
+      </section>
+      <section v-else-if="!isStandalone && isInquiryView && inquiries.length === 0" class="detail-panel panel empty-state">
         <h2>暂无可展示的链路</h2>
         <p>授权范围内没有询盘，或后端返回为空。</p>
       </section>
@@ -2518,4 +3053,22 @@ body { min-width: 320px; background: #edf2f3; }
   .link-candidate-row .primary { width: 100%; }
   .link-review-footer { padding: 12px 16px; }
 }
+
+/* URL-addressable standalone pages (inquiry / message / logs / settings). */
+.page-breadcrumb { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 12px 18px; margin-bottom: 16px; background: #fff; border: 1px solid #e4eaeb; border-radius: 10px; }
+.page-breadcrumb button { font-size: 13px; }
+.page-breadcrumb span { color: #435159; font-size: 14px; font-weight: 600; }
+.page-breadcrumb-full { grid-column: 1 / -1; margin-bottom: 4px; }
+.standalone-page { width: min(1152px, 100%); margin: 24px auto 0; }
+.operation-log-page .operation-log-dialog { width: 100%; max-height: none; box-shadow: none; }
+.content-grid.is-standalone { display: block; padding: 0; background: transparent; border: 0; border-radius: 0; }
+.detail-panel.standalone { width: 100%; }
+.message-detail-page .message-original { white-space: pre-wrap; word-break: break-word; padding: 14px; margin: 0; background: #f7faf9; border: 1px solid #e4eaeb; border-radius: 8px; font-size: 13px; line-height: 1.7; }
+.restore-link-banner { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 12px 14px; margin: 10px 0; color: #8a4b12; background: #fff7e8; border: 1px solid #f0d9ac; border-radius: 8px; font-size: 13px; }
+@media (max-width: 700px) {
+  .page-breadcrumb { padding: 10px 12px; }
+  .restore-link-banner { flex-direction: column; align-items: flex-start; }
+}
 </style>
+
+<style src="./operations-refresh.css"></style>

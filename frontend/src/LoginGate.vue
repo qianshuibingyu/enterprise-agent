@@ -76,7 +76,7 @@ onMounted(checkSession)
   <App v-else-if="authenticated" />
   <main v-else class="login-page">
     <form class="login-card" @submit.prevent="login">
-      <p class="eyebrow">Enterprise Agent</p>
+      <p class="login-brand">Enterprise Agent · 客户运营工作台</p>
       <h1>登录</h1>
       <p class="muted">登录后才能查看授权范围内的 Gmail 账号和收件箱。</p>
       <label for="username">用户名</label>
@@ -94,16 +94,19 @@ onMounted(checkSession)
 
 <style scoped>
 :global(body) { margin: 0; min-width: 320px; }
-.auth-loading { min-height: 100vh; display: grid; place-items: center; color: #758198; }
-.login-page { min-height: 100vh; display: grid; place-items: center; padding: 24px; background: #f4f6fa; }
-.login-card { width: min(100%, 420px); display: grid; gap: 12px; padding: 32px; background: white; border: 1px solid #e2e7f0; border-radius: 16px; box-shadow: 0 10px 30px rgba(30, 45, 75, .08); }
-.eyebrow { margin: 0; color: #6c7890; font-size: 12px; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; }
-h1 { margin: 0 0 4px; color: #172033; }
-label { color: #536079; font-size: 13px; font-weight: 600; }
-input { padding: 11px 12px; color: #172033; background: white; border: 1px solid #cbd6f4; border-radius: 9px; }
-.primary { padding: 11px 14px; color: white; background: #3158c9; border: 1px solid #3158c9; border-radius: 9px; cursor: pointer; }
-.primary:disabled { opacity: .65; cursor: wait; }
-.muted { margin: 0; color: #758198; font-size: 13px; line-height: 1.5; }
-.login-error { margin: 0; padding: 10px 12px; color: #9a2f3b; background: #fff7f8; border: 1px solid #efc7cd; border-radius: 8px; }
-.security-note { margin-top: 4px; }
+.auth-loading { min-height: 100vh; display: grid; place-items: center; color: #52666b; font-size: 14px; }
+.login-page { min-height: 100vh; display: grid; place-items: center; padding: 24px; background: #edf2f3; }
+.login-card { width: min(100%, 420px); display: grid; gap: 12px; padding: 30px; background: #fff; border: 1px solid #dfe7e8; border-radius: 8px; box-shadow: none; }
+.login-brand { margin: 0 0 4px; color: #176978; font-size: 13px; font-weight: 600; }
+h1 { margin: 0 0 2px; color: #19282c; font-size: 24px; font-weight: 600; }
+.muted { margin: 0; color: #52666b; font-size: 13px; line-height: 1.55; }
+label { margin-top: 2px; color: #344b50; font-size: 13px; font-weight: 500; }
+input { min-height: 40px; padding: 9px 11px; color: #19282c; background: #fff; border: 1px solid #cbd7d9; border-radius: 5px; }
+input:hover { border-color: #9aadb1; }
+.primary { min-height: 40px; margin-top: 4px; padding: 9px 14px; color: #fff; background: #176978; border: 1px solid #176978; border-radius: 5px; cursor: pointer; font-size: 14px; font-weight: 500; }
+.primary:hover:not(:disabled) { background: #10515e; border-color: #10515e; }
+.primary:disabled { opacity: .7; cursor: wait; }
+.login-error { margin: 0; padding: 10px 12px; color: #9a3c3c; background: #fff3f2; border: 1px solid #efd5d3; border-radius: 5px; }
+.security-note { padding-top: 4px; border-top: 1px solid #e9eff0; }
+@media (max-width: 480px) { .login-page { padding: 16px; } .login-card { padding: 22px 18px; } }
 </style>

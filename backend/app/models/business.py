@@ -298,5 +298,39 @@ class OperationLog(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
 
 
+class WhatsAppGroupBinding(Base):
+    """Operator-confirmed mapping: one WhatsApp group JID -> one customer phone.
+
+    This table is deliberately isolated from the inquiry-linking pipeline.
+    Creating or changing a binding only writes here (plus OperationLog) and
+    must never INSERT/UPDATE/DELETE messages, inquiries or inquiry_messages.
+    """
+
+    __tablename__ = "whatsapp_group_bindings"
+    __table_args__ = (
+        UniqueConstraint("group_jid", name="uq_whatsapp_group_bindings_group_jid"),
+        CheckConstraint("normalized_phone LIKE '+%'", name="ck_whatsapp_group_bindings_phone_e164"),
+        CheckConstraint("group_jid LIKE '%@g.us'", name="ck_whatsapp_group_bindings_group_jid"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    group_jid: Mapped[str] = mapped_column(String(255), nullable=False)
+    # Account that first made the group visible, used for authorization filtering.
+    # Nullable to stay compatible with historical rows.
+    channel_account_id: Mapped[int | None] = mapped_column(
+        ForeignKey("channel_accounts.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    normalized_phone: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    raw_phone: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    bound_by_user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    note: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
 # Register the one-to-one derived overview model whenever business models load.
 from app.models.overview import MessageOverview  # noqa: E402,F401
