@@ -6,7 +6,7 @@ export const fakeChannels = [
     runtime: 'baileys_adapter',
     authorization_owner: 'account_owner_qr',
     ingress_kind: 'baileys_adapter',
-    status: 'not_connected',
+    status: 'not_ready',
     test_only: true,
     message: 'TEST_ONLY：由 fake Baileys adapter 模拟短时 QR 绑定，不代表真实 WhatsApp 已连接。',
   },
@@ -17,7 +17,7 @@ export const fakeChannels = [
     runtime: 'google_oauth_pubsub',
     authorization_owner: 'google_oauth',
     ingress_kind: 'pubsub_webhook',
-    status: 'external_authorization_required',
+    status: 'awaiting_authorization',
     test_only: true,
     message: 'TEST_ONLY：由 fake Google OAuth/Pub/Sub seam 模拟授权，不代表真实 Gmail 已连接。',
   },
@@ -28,7 +28,7 @@ export const fakeChannels = [
     runtime: 'outlook_mcp',
     authorization_owner: 'outlook_mcp_entra',
     ingress_kind: 'mcp',
-    status: 'external_authorization_required',
+    status: 'awaiting_authorization',
     test_only: true,
     message: 'TEST_ONLY：由 fake Outlook MCP 模拟个人委派授权，不代表真实 Outlook 已连接。',
   },
@@ -36,29 +36,29 @@ export const fakeChannels = [
 
 export function statusLabel(status) {
   return {
-    not_connected: '未连接',
-    external_authorization_required: '等待外部授权',
-    authorizing: '授权中',
-    connected: '已连接（需区分真实/fake）',
+    not_ready: '尚未准备好',
+    awaiting_authorization: '等待官方授权',
+    connected_pending_inbound: '已授权，等待真实入站',
+    verified_inbound: '真实入站已验收',
     blocked: '平台阻塞',
-    error: '连接错误',
+    system_error: '系统错误',
     revoked: '已撤销',
   }[status]
 }
 
 export function canStartFakeAuthorization(channel) {
-  return channel.status === 'not_connected'
-    || channel.status === 'external_authorization_required'
+  return channel.status === 'not_ready'
+    || channel.status === 'awaiting_authorization'
     || channel.status === 'revoked'
-    || channel.status === 'error'
+    || channel.status === 'system_error'
 }
 
 export function fakeAuthorize(channel) {
   if (!canStartFakeAuthorization(channel)) return channel
   return {
     ...channel,
-    status: 'connected',
-    message: `${channel.display_name} TEST_ONLY fake 连接成功；不代表真实 provider 已验收。`,
+    status: 'connected_pending_inbound',
+    message: `${channel.display_name} TEST_ONLY fake 已授权；不代表真实 provider 已验收。`,
   }
 }
 

@@ -12,7 +12,10 @@ from app.models.business import (  # noqa: F401
     InquiryEvent,
     Message,
     MessageAttachment,
+    OperationLog,
+    WhatsAppGroupBinding,
 )
+from app.models.overview import MessageOverview  # noqa: F401
 
 config = context.config
 target_metadata = Base.metadata

@@ -6,6 +6,11 @@ from sqlalchemy import URL, create_engine
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
+from app.environment import load_project_env
+
+
+load_project_env()
+
 
 def _required_env(name: str) -> str:
     value = os.environ.get(name)

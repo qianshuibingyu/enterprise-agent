@@ -20,6 +20,8 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      whatsapp-bridge:
+        condition: service_started
     environment:
       POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER must be set}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
@@ -28,8 +30,8 @@ services:
       DB_PORT: "5432"
       AUTH_ORIGIN: ${AUTH_ORIGIN:?AUTH_ORIGIN must be set to the canonical HTTPS origin}
       # WhatsApp is handled by the project-owned Baileys adapter.
-      WHATSAPP_ADAPTER_URL: ${WHATSAPP_ADAPTER_URL:-}
-      WHATSAPP_ADAPTER_TOKEN: ${WHATSAPP_ADAPTER_TOKEN:-}
+      WHATSAPP_ADAPTER_URL: ${WHATSAPP_ADAPTER_URL:-http://whatsapp-bridge:8090}
+      WHATSAPP_ADAPTER_TOKEN: ${WHATSAPP_ADAPTER_TOKEN:?WHATSAPP_ADAPTER_TOKEN must be set}
       WHATSAPP_AUTH_STATE_KEY: ${WHATSAPP_AUTH_STATE_KEY:-}
       WHATSAPP_CONNECT_TIMEOUT_SECONDS: ${WHATSAPP_CONNECT_TIMEOUT_SECONDS:-10}
       WHATSAPP_SEND_TIMEOUT_SECONDS: ${WHATSAPP_SEND_TIMEOUT_SECONDS:-15}
@@ -43,15 +45,55 @@ services:
       GMAIL_PUBSUB_SUBSCRIPTION: ${GMAIL_PUBSUB_SUBSCRIPTION:-}
       GMAIL_PUBSUB_PUSH_TOKEN: ${GMAIL_PUBSUB_PUSH_TOKEN:-}
       GMAIL_SCOPES: ${GMAIL_SCOPES:-https://www.googleapis.com/auth/gmail.readonly}
-      GMAIL_TIMEOUT_SECONDS: ${GMAIL_TIMEOUT_SECONDS:-20}
+      GMAIL_TIMEOUT_SECONDS: ${GMAIL_TIMEOUT_SECONDS:-8}
       GMAIL_RECONCILE_INTERVAL_SECONDS: ${GMAIL_RECONCILE_INTERVAL_SECONDS:-600}
       GMAIL_USER_ID: ${GMAIL_USER_ID:-me}
-      # Outlook is an externally hosted MCP + Microsoft Graph/Entra service.
+      GMAIL_CREDENTIAL_ENCRYPTION_KEY: ${GMAIL_CREDENTIAL_ENCRYPTION_KEY:-}
+      # Outlook uses direct Microsoft Graph delegated read access.
       OUTLOOK_ENABLED: ${OUTLOOK_ENABLED:-false}
-      OUTLOOK_MCP_URL: ${OUTLOOK_MCP_URL:-}
-      OUTLOOK_MCP_SERVER_NAME: ${OUTLOOK_MCP_SERVER_NAME:-outlook}
-      OUTLOOK_MCP_TOKEN: ${OUTLOOK_MCP_TOKEN:-}
-      OUTLOOK_MCP_TIMEOUT_SECONDS: ${OUTLOOK_MCP_TIMEOUT_SECONDS:-20}
+      OUTLOOK_TENANT_ID: ${OUTLOOK_TENANT_ID:-}
+      OUTLOOK_AUTHORITY: ${OUTLOOK_AUTHORITY:-${OUTLOOK_TENANT_ID:-common}}
+      OUTLOOK_CLIENT_ID: ${OUTLOOK_CLIENT_ID:-}
+      OUTLOOK_CLIENT_SECRET: ${OUTLOOK_CLIENT_SECRET:-}
+      OUTLOOK_REDIRECT_URI: ${OUTLOOK_REDIRECT_URI:-}
+      OUTLOOK_SCOPES: ${OUTLOOK_SCOPES:-openid profile email offline_access User.Read Mail.Read}
+      OUTLOOK_TIMEOUT_SECONDS: ${OUTLOOK_TIMEOUT_SECONDS:-8}
+      OUTLOOK_CREDENTIAL_ENCRYPTION_KEY: ${OUTLOOK_CREDENTIAL_ENCRYPTION_KEY:-}
+      LLM_BASE_URL: ${LLM_BASE_URL:-}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:-}
+      LLM_TIMEOUT_SECONDS: ${LLM_TIMEOUT_SECONDS:-8}
+
+
+  whatsapp-inbox-permissions:
+    image: busybox:1.37.0
+    user: "0:0"
+    command: ["sh", "-c", "mkdir -p /var/lib/whatsapp-auth /var/lib/whatsapp-inbox && chown -R 10001:10001 /var/lib/whatsapp-auth /var/lib/whatsapp-inbox && chmod 0700 /var/lib/whatsapp-auth /var/lib/whatsapp-inbox"]
+    volumes:
+      - whatsapp_auth:/var/lib/whatsapp-auth
+      - whatsapp_inbox:/var/lib/whatsapp-inbox
+    restart: "no"
+
+  whatsapp-bridge:
+    restart: unless-stopped
+    depends_on:
+      whatsapp-inbox-permissions:
+        condition: service_completed_successfully
+    build:
+      context: ./whatsapp-bridge
+      dockerfile: Dockerfile
+    expose:
+      - "8090"
+    environment:
+      PORT: "8090"
+      BACKEND_URL: http://backend:8000
+      WHATSAPP_ADAPTER_TOKEN: ${WHATSAPP_ADAPTER_TOKEN:?WHATSAPP_ADAPTER_TOKEN must be set}
+      WHATSAPP_AUTH_ROOT: /var/lib/whatsapp-auth
+      WHATSAPP_INBOX_ROOT: /var/lib/whatsapp-inbox
+      WHATSAPP_INBOX_ENCRYPTION_KEY: ${WHATSAPP_INBOX_ENCRYPTION_KEY:?WHATSAPP_INBOX_ENCRYPTION_KEY must be set}
+    volumes:
+      - whatsapp_auth:/var/lib/whatsapp-auth
+      - whatsapp_inbox:/var/lib/whatsapp-inbox
 
   db:
     image: postgres:16
@@ -69,3 +111,5 @@ services:
       retries: 5
 volumes:
   postgres_data:
+  whatsapp_auth:
+  whatsapp_inbox:

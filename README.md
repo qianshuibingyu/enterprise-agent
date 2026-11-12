@@ -4,17 +4,19 @@
 
 ## 当前实现范围
 
-- `backend/app/`：FastAPI 应用、内部用户认证、基于服务端会话的登录/登出、首次登录强制修改密码、首期对象授权和 provider-neutral 渠道连接中心 API。
-- `backend/app/models/`、`backend/migrations/`：SQLAlchemy 用户/会话、渠道账号/授权、询盘/附件/内部通知、统一消息/消息附件模型与 Alembic 迁移（当前 head 为 `0003_messages`）。
-- `backend/app/message_ingestion.py`：provider-neutral 消息 mapping、fake/provider batch 接入、账号/provider/external ID 幂等和附件 metadata 保存服务；已由用户运行相关回归测试。
-- `backend/app/channels/`：provider 合同、能力目录、fake 测试 provider、入站 seam 和凭据引用安全边界；真实 provider 尚未配置。
+- `backend/app/`：FastAPI 应用、内部用户认证、基于服务端会话的登录/登出、首次登录强制修改密码、首期对象授权、三渠道连接/入站路径、运营收件箱和内容处理 API。
+- `backend/app/models/`、`backend/migrations/`：SQLAlchemy 用户/会话、渠道账号/授权、询盘/附件/内部通知、统一消息/消息附件、消息概要、询盘—消息关联及操作日志模型；工作区 Alembic head 为 `0017_message_feed_indexes`。目标环境是否已应用后续迁移，须以用户最新提供的在线核验为准。
+- `backend/app/message_ingestion.py`、`contact_identity.py`、`business_service.py`：provider-specific/provider-neutral 入站、身份规范化、消息幂等、询盘归链/人工关联和人工状态转换服务。当前工作区代码含 Gmail/Outlook/WhatsApp 入站与回源路径；本轮未运行测试，现状不等于最新版本回归通过。
+- `backend/app/channels/`：provider 合同、能力目录、fake 测试 provider、入站 seam 和凭据引用安全边界；三渠道真实入站主链路已有 Day 6 证据，补充重放/撤销/附件/长期运行专项仍待验收。
 - `backend/scripts/create_admin.py`：管理员初始化脚本。
-- `backend/tests/`：健康检查、数据库配置、认证、迁移、首期对象授权和渠道连接中心测试。
-- `frontend/`：Vue 3 + TypeScript + Vite 渠道连接中心最小页面和 API client；已验证构建，尚未完成生产部署/真实 API 联调。
-- `compose.yaml`、`backend/Dockerfile`：开发环境服务和后端镜像配置。
+- `backend/tests/`：健康检查、认证/授权、消息入站与回源、询盘—消息关联、身份规范化、内部只读分析、概要、渠道和迁移测试；测试文件存在不表示本轮或当前工作区版本已执行通过。
+- `frontend/`：Vue 3 + TypeScript + Vite 渠道账号“我的”页、运营收件箱、消息详情、原文预览/展开和人工状态操作；前端单元测试与生产构建已有 Day 8 证据，目标浏览器异常路径仍按 handoff 记录。
+- `backend/app/document_processing.py`：provider-neutral、纯内存、确定性资料清洗与切片；不上传、不持久化、不生成 embedding、不执行检索。
+- `backend/app/overview_service.py`、`backend/app/models/overview.py`：中文概要异步生成、状态/失败回退和概要持久化边界；生产目标环境自动生成仍待完整浏览器证据。
+- `compose.yaml`、`backend/Dockerfile`、`frontend/Dockerfile`、`whatsapp-bridge/`：开发/验收服务和镜像配置。
 - `PROJECT_SPEC.md`、`docs/`、`plan/`：项目范围、架构、交接记录及开发指南。
 
-渠道连接中心的 provider-neutral 内部目录、账号状态 API、fake 状态测试、最小前端页面和三渠道入站 seam 已实现并由用户实际测试验证；Gmail/Outlook/WhatsApp 真实 adapter、授权与真实消息处理、运营收件箱及完整业务工作流尚未实现。设计资料、代码测试和前端构建成功不代表数据库迁移已在目标环境应用、真实渠道已连接或生产部署已验收。当前 Day 3 状态为“已实现，待真实环境验收”，不是整体完成。
+三渠道真实入站主链路及 Day 8 内容处理曾有交接记录；当前工作区另有询盘—消息关联/人工确认、业务类型、官网表单隔离、操作日志、消息列表索引，以及 bridge 持久化加密消息归档等增量。最新这些改动的自动化回归、前端构建、部署和目标环境核验在本轮均未执行，勿沿用早期测试数字作为当前版本结果。知识资料上传/持久化、embedding、pgvector、检索/RAG、回复建议、审批发送仍未形成完整闭环；真实 provider 和生产状态按各 handoff 的证据边界判断。
 
 ## 开发环境
 
@@ -22,5 +24,15 @@
 - 前端依赖与锁文件：`frontend/package.json`、`frontend/package-lock.json`。
 - 本地环境文件使用 `.env`，不得提交；可参考 `.env.example` 配置。
 - `.venv/`、`node_modules/`、缓存和 `frontend/dist/` 均为本地产物，不属于版本控制内容。
+
+## 数据库迁移
+
+生产 Compose 部署中，PostgreSQL 只在 Compose 网络内提供给 `backend` 服务，数据库主机名为 `db`。因此应从运行中的 backend 容器执行迁移：
+
+```bash
+docker compose --env-file .env exec -T backend python -m alembic upgrade head
+```
+
+不要在宿主机上以 `DB_HOST=db` 直接连接数据库。开发机直接运行 Alembic 时，后端会读取仓库根目录 `.env` 中尚未导出的变量；已导出的环境变量优先。若仍提示缺少 `POSTGRES_USER`、`POSTGRES_PASSWORD` 或 `POSTGRES_DB`，请在 `.env` 中配置对应的非空值，且不要把它们输出到终端或提交到版本库。
 
 请按对应阶段指南运行并记录测试、迁移及部署验证结果；历史测试或文档计划不能替代当前运行证据。

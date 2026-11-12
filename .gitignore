@@ -16,6 +16,12 @@ dist/
 .DS_Store
 .vscode/
 
-plan/
 # Local development plans
 plan/
+
+backups/
+.agents/
+.claude/ 
+.taste-skill/
+.workbuddy/
+skills-lock.json

@@ -15,6 +15,17 @@ def test_business_revision_is_the_only_migration_head():
     revisions = list(script.walk_revisions())
 
     assert [revision.revision for revision in revisions] == [
+        "0018_whatsapp_group_bindings",
+        "0017_message_feed_indexes",
+        "0016_operation_logs",
+        "0015_website_form_messages",
+        "0014_inquiry_business_type",
+        "0013_inquiry_messages",
+        "0012_message_overviews",
+        "0011_message_provider_web_link",
+        "0010_message_customer_contact",
+        "0009_outlook_account_credential",
+        "0008_gmail_account_runtime",
         "0007_message_handling_status",
         "0006_manual_handling_status",
         "0005_channel_external_account",
@@ -23,17 +34,28 @@ def test_business_revision_is_the_only_migration_head():
         "0002_business_authorization",
         "0001_auth_sessions",
     ]
-    assert revisions[0].down_revision == "0006_manual_handling_status"
-    assert revisions[1].down_revision == "0005_channel_external_account"
-    assert revisions[2].down_revision == "0004_inquiry_events"
-    assert revisions[3].down_revision == "0003_messages"
-    assert revisions[4].down_revision == "0002_business_authorization"
-    assert revisions[5].down_revision == "0001_auth_sessions"
-    assert revisions[6].down_revision is None
+    assert revisions[0].down_revision == "0017_message_feed_indexes"
+    assert revisions[1].down_revision == "0016_operation_logs"
+    assert revisions[2].down_revision == "0015_website_form_messages"
+    assert revisions[3].down_revision == "0014_inquiry_business_type"
+    assert revisions[4].down_revision == "0013_inquiry_messages"
+    assert revisions[5].down_revision == "0012_message_overviews"
+    assert revisions[6].down_revision == "0011_message_provider_web_link"
+    assert revisions[7].down_revision == "0010_message_customer_contact"
+    assert revisions[8].down_revision == "0009_outlook_account_credential"
+    assert revisions[9].down_revision == "0008_gmail_account_runtime"
+    assert revisions[10].down_revision == "0007_message_handling_status"
+    assert revisions[11].down_revision == "0006_manual_handling_status"
+    assert revisions[12].down_revision == "0005_channel_external_account"
+    assert revisions[13].down_revision == "0004_inquiry_events"
+    assert revisions[14].down_revision == "0003_messages"
+    assert revisions[15].down_revision == "0002_business_authorization"
+    assert revisions[16].down_revision == "0001_auth_sessions"
+    assert revisions[17].down_revision is None
 
 
 def test_auth_migration_contains_only_auth_tables():
-    migration = (BACKEND_DIR / "migrations" / "versions" / "0001_auth_sessions.py").read_text()
+    migration = (BACKEND_DIR / "migrations" / "versions" / "0001_auth_sessions.py").read_text(encoding="utf-8")
 
     assert 'op.create_table(\n        "users"' in migration
     assert 'op.create_table(\n        "user_sessions"' in migration
@@ -44,7 +66,7 @@ def test_auth_migration_contains_only_auth_tables():
 
 
 def test_message_migration_contains_provider_scoped_message_tables():
-    migration = (BACKEND_DIR / "migrations" / "versions" / "0003_messages.py").read_text()
+    migration = (BACKEND_DIR / "migrations" / "versions" / "0003_messages.py").read_text(encoding="utf-8")
 
     assert '"messages"' in migration
     assert '"message_attachments"' in migration
@@ -58,7 +80,7 @@ def test_message_migration_contains_provider_scoped_message_tables():
 
 
 def test_business_migration_contains_only_confirmed_authorization_tables():
-    migration = (BACKEND_DIR / "migrations" / "versions" / "0002_business_authorization.py").read_text()
+    migration = (BACKEND_DIR / "migrations" / "versions" / "0002_business_authorization.py").read_text(encoding="utf-8")
 
     for table in (
         '"channel_accounts"',
@@ -76,7 +98,7 @@ def test_business_migration_contains_only_confirmed_authorization_tables():
 
 
 def test_channel_external_account_migration_adds_runtime_mapping():
-    migration = (BACKEND_DIR / "migrations" / "versions" / "0005_channel_external_account.py").read_text()
+    migration = (BACKEND_DIR / "migrations" / "versions" / "0005_channel_external_account.py").read_text(encoding="utf-8")
 
     assert '"channel_accounts"' in migration
     assert '"external_account_id"' in migration
@@ -86,7 +108,7 @@ def test_channel_external_account_migration_adds_runtime_mapping():
 
 
 def test_inquiry_event_migration_contains_minimal_timeline_schema():
-    migration = (BACKEND_DIR / "migrations" / "versions" / "0004_inquiry_events.py").read_text()
+    migration = (BACKEND_DIR / "migrations" / "versions" / "0004_inquiry_events.py").read_text(encoding="utf-8")
 
     assert '"inquiry_events"' in migration
     assert '"inquiry_id"' in migration
@@ -99,8 +121,8 @@ def test_inquiry_event_migration_contains_minimal_timeline_schema():
 
 
 def test_manual_handling_migrations_add_separate_status_columns():
-    inquiry_migration = (BACKEND_DIR / "migrations" / "versions" / "0006_manual_handling_status.py").read_text()
-    message_migration = (BACKEND_DIR / "migrations" / "versions" / "0007_message_handling_status.py").read_text()
+    inquiry_migration = (BACKEND_DIR / "migrations" / "versions" / "0006_manual_handling_status.py").read_text(encoding="utf-8")
+    message_migration = (BACKEND_DIR / "migrations" / "versions" / "0007_message_handling_status.py").read_text(encoding="utf-8")
 
     assert 'down_revision = "0005_channel_external_account"' in inquiry_migration
     assert '"handling_status"' in inquiry_migration
@@ -113,8 +135,48 @@ def test_manual_handling_migrations_add_separate_status_columns():
     assert "drop_column(\"messages\", \"handling_status\")" in message_migration
 
 
+def test_inquiry_message_migration_uses_expected_unnamed_source_fk():
+    original = (BACKEND_DIR / "migrations" / "versions" / "0002_business_authorization.py").read_text(encoding="utf-8")
+    migration = (BACKEND_DIR / "migrations" / "versions" / "0013_inquiry_messages.py").read_text(encoding="utf-8")
+
+    assert 'sa.ForeignKeyConstraint(["source_channel_account_id"], ["channel_accounts.id"])' in original
+    assert '"inquiries_source_channel_account_id_fkey"' in migration
+    assert "event_type IN" in migration
+    assert "inquiry_reactivated" in migration
+
+
+def test_inquiry_message_migration_has_minimal_link_contract():
+    migration = (BACKEND_DIR / "migrations" / "versions" / "0013_inquiry_messages.py").read_text(encoding="utf-8")
+
+    assert '"inquiry_messages"' in migration
+    assert '"inquiry_id"' in migration
+    assert '"message_id"' in migration
+    assert '"position"' in migration
+    assert '"link_source"' in migration
+    assert '"link_state"' in migration
+    assert '"normalized_customer_contact"' in migration
+    assert '"original_sender_contact"' in migration
+    assert '"contact_identity_state"' in migration
+    assert '"contact_identity_kind"' in migration
+    assert '"ck_messages_contact_identity_state"' in migration
+    assert '"fk_inquiry_events_message_id_messages"' in migration
+    assert "manual_review" in migration
+    assert "ck_messages_link_state" in migration
+    assert (
+        "event_type IN ('inquiry_created', 'inquiry_transferred', "
+        "'inquiry_processed', 'inquiry_ignored', 'inquiry_reactivated', "
+        "'inquiry_message_linked', 'manual_link')"
+    ) in migration
+    assert "SELECT count(*) FROM inquiry_events WHERE event_type IN ('inquiry_message_linked', 'manual_link')" in migration
+    assert "uq_inquiry_messages_message_id" in migration
+    assert "inquiry_reactivated" in migration
+    assert "ondelete=\"CASCADE\"" in migration
+    assert "raw_content" not in migration
+    assert "overview_text" not in migration
+
+
 def test_alembic_offline_environment_does_not_import_database_url():
-    env = (BACKEND_DIR / "migrations" / "env.py").read_text()
+    env = (BACKEND_DIR / "migrations" / "env.py").read_text(encoding="utf-8")
 
     assert 'url="postgresql+psycopg://"' in env
     assert "def run_migrations_online()" in env

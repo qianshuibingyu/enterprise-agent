@@ -42,6 +42,11 @@ def gmail_oauth_configured() -> bool:
     )
 
 
+def gmail_authorization_storage_configured() -> bool:
+    """Return whether server-side encrypted Gmail credential storage is ready."""
+    return bool(os.environ.get("GMAIL_CREDENTIAL_ENCRYPTION_KEY"))
+
+
 def issue_gmail_state(store: OAuthStateStore, *, channel_account_id: int) -> str:
     if not gmail_oauth_configured():
         raise GmailOAuthConfigurationError("Gmail OAuth is not configured")

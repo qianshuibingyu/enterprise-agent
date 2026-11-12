@@ -11,6 +11,10 @@ from sqlalchemy.pool import StaticPool
 from app.channels.inbound import ProviderTemporaryFailure
 from app.database import get_db
 from app.gmail_routes import get_gmail_client
+from app.channel_routes import create_gmail_account, revoke_channel
+from app.provider_auth_routes import _oauth_states, gmail_authorize_callback
+from app.gmail_oauth import GmailAuthorization
+from fastapi import HTTPException
 from app.main import app
 from app.models.base import Base
 from app.models.business import (
@@ -70,7 +74,7 @@ def gmail_client(monkeypatch):
             must_change_password=False,
         ))
         db.flush()
-        account = ChannelAccount(owner_user_id=1, channel_type="gmail", status="connected")
+        account = ChannelAccount(owner_user_id=1, channel_type="gmail", status="connected_pending_inbound")
         db.add(account)
         db.flush()
         db.add(ChannelGrant(
@@ -129,6 +133,7 @@ def gmail_client(monkeypatch):
                 "handling_statuses": db.execute(
                     select(Inquiry.id, Inquiry.handling_status)
                 ).all(),
+                "gmail_status": db.get(ChannelAccount, 1).status,
             }
 
     def override_client():
@@ -147,6 +152,136 @@ def headers(token="test-push-token"):
     return {"X-Gmail-PubSub-Token": token}
 
 
+def test_gmail_revoke_and_reconnect_requires_fresh_oauth():
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with sessionmaker(bind=engine, expire_on_commit=False)() as db:
+        owner = User(username="owner", password_hash="hash", role="staff", is_active=True, must_change_password=False)
+        db.add(owner)
+        db.flush()
+        account = ChannelAccount(owner_user_id=owner.id, channel_type="gmail", status="connected",
+                                 external_account_id="owner@example.com", gmail_credential_ciphertext="old-secret",
+                                 credential_reference="old", gmail_watch_history_id="old-cursor")
+        db.add(account)
+        db.flush()
+        db.add(ChannelGrant(channel_account_id=account.id, channel_type="gmail", owner_user_id=owner.id))
+        db.commit()
+        state = _oauth_states.issue(channel_account_id=account.id).value
+        revoke_channel(account.id, (owner, None), db)
+        assert _oauth_states.validate_any(state) is None
+        assert account.gmail_credential_ciphertext is None
+        assert account.credential_reference is None
+        assert account.gmail_watch_history_id is None
+        result = create_gmail_account((owner, None), db)
+        assert result["id"] == account.id
+        assert result["status"] == "not_ready"
+        assert account.external_account_id == "owner@example.com"
+        assert account.gmail_credential_ciphertext is None
+    engine.dispose()
+
+
+def test_gmail_reconnect_rejects_different_provider_identity(monkeypatch):
+    monkeypatch.setenv("GMAIL_CREDENTIAL_ENCRYPTION_KEY", "configured")
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with sessionmaker(bind=engine, expire_on_commit=False)() as db:
+        owner = User(username="owner", password_hash="hash", role="staff", is_active=True, must_change_password=False)
+        db.add(owner)
+        db.flush()
+        account = ChannelAccount(owner_user_id=owner.id, channel_type="gmail", status="not_ready", external_account_id="original@example.com")
+        db.add(account)
+        db.flush()
+        db.add(ChannelGrant(channel_account_id=account.id, channel_type="gmail", owner_user_id=owner.id))
+        db.commit()
+        state = _oauth_states.issue(channel_account_id=account.id).value
+
+        class OtherAccountOAuth:
+            def exchange_code(self, *, code, state):
+                return GmailAuthorization("access", "fresh", "other@example.com")
+
+        with pytest.raises(HTTPException) as exc:
+            gmail_authorize_callback("code", state, owner, db, OtherAccountOAuth())
+        assert exc.value.status_code == 409
+        assert account.status == "not_ready"
+        assert account.gmail_credential_ciphertext is None
+    engine.dispose()
+
+
+def test_gmail_callback_redacts_query_before_access_log():
+    import asyncio
+    from app.main import RedactGmailCallbackAccessLog
+
+    scope = {"type": "http", "path": "/api/integrations/gmail/authorize/callback", "query_string": b"code=secret-code&state=secret-state"}
+    seen = []
+
+    async def inner(scope, receive, send):
+        assert scope["query_string"] == b"code=secret-code&state=secret-state"
+        await send({"type": "http.response.start", "status": 400, "headers": []})
+
+    async def send(message):
+        seen.append(scope["query_string"])
+
+    asyncio.run(RedactGmailCallbackAccessLog(inner)(scope, None, send))
+    assert seen == [b""]
+
+
+def test_gmail_denied_callback_checks_scope_and_consumes_state(caplog):
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with sessionmaker(bind=engine, expire_on_commit=False)() as db:
+        owner = User(username="owner", password_hash="hash", role="staff", is_active=True, must_change_password=False)
+        other = User(username="other", password_hash="hash", role="staff", is_active=True, must_change_password=False)
+        db.add_all([owner, other])
+        db.flush()
+        account = ChannelAccount(owner_user_id=owner.id, channel_type="gmail", status="not_ready")
+        db.add(account)
+        db.flush()
+        db.add(ChannelGrant(channel_account_id=account.id, channel_type="gmail", owner_user_id=owner.id))
+        db.commit()
+        state = _oauth_states.issue(channel_account_id=account.id).value
+        with pytest.raises(HTTPException) as exc:
+            gmail_authorize_callback(None, state, other, db, object(), error="access_denied")
+        assert exc.value.status_code == 403
+        assert _oauth_states.validate_any(state) is not None
+        with pytest.raises(HTTPException) as exc:
+            gmail_authorize_callback(None, state, owner, db, object(), error="access_denied")
+        assert exc.value.status_code == 400
+        assert _oauth_states.validate_any(state) is None
+        assert account.status == "not_ready"
+        assert state not in caplog.text
+    engine.dispose()
+
+
+def test_gmail_reconnect_does_not_restore_missing_grant():
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with sessionmaker(bind=engine, expire_on_commit=False)() as db:
+        owner = User(username="owner", password_hash="hash", role="staff", is_active=True, must_change_password=False)
+        db.add(owner)
+        db.flush()
+        account = ChannelAccount(owner_user_id=owner.id, channel_type="gmail", status="revoked", gmail_credential_ciphertext="old")
+        db.add(account)
+        db.commit()
+        with pytest.raises(HTTPException) as exc:
+            create_gmail_account((owner, None), db)
+        assert exc.value.status_code == 403
+        assert account.status == "revoked"
+        assert db.query(ChannelGrant).count() == 0
+    engine.dispose()
+
+
+def test_gmail_pubsub_accepts_urlsafe_unpadded_numeric_history_id(gmail_client):
+    client, fake, counts = gmail_client
+    encoded = base64.urlsafe_b64encode(json.dumps({"historyId": 123456}).encode()).decode().rstrip("=")
+    response = client.post(
+        "/api/integrations/gmail/pubsub/1",
+        json={"message": {"data": encoded}},
+        headers=headers(),
+    )
+    assert response.status_code == 202
+    assert fake.history_calls == [(1, "123456")]
+
+
 def test_gmail_pubsub_route_fetches_history_details_and_ingests(gmail_client):
     client, fake, counts = gmail_client
     response = client.post(
@@ -157,9 +292,27 @@ def test_gmail_pubsub_route_fetches_history_details_and_ingests(gmail_client):
     assert response.status_code == 202
     assert response.json() == {"accepted": 1, "created": 1, "cursor": "history-2"}
     assert fake.history_calls == [(1, "history-1")]
+    assert counts()["gmail_status"] == "verified_inbound"
     assert fake.message_calls == [(1, "gmail-message-1")]
 
 
+def test_gmail_pubsub_uses_persisted_cursor_and_advances_it(gmail_client):
+    client, fake, counts = gmail_client
+    first = client.post(
+        "/api/integrations/gmail/pubsub/1",
+        json={"message": {"data": encode_notification("notification-1")}},
+        headers=headers(),
+    )
+    assert first.status_code == 202
+
+    fake.events = [{"history_id": "history-3", "message_id": "gmail-message-2"}]
+    second = client.post(
+        "/api/integrations/gmail/pubsub/1",
+        json={"message": {"data": encode_notification("notification-2")}},
+        headers=headers(),
+    )
+    assert second.status_code == 202
+    assert fake.history_calls == [(1, "notification-1"), (1, "history-2")]
 def test_gmail_pubsub_empty_history_does_not_advance_cursor(gmail_client):
     client, fake, counts = gmail_client
     fake.events = []
@@ -186,7 +339,7 @@ def test_gmail_pubsub_duplicate_delivery_is_idempotent(gmail_client):
 
     assert first.json()["created"] == 1
     assert second.json()["created"] == 0
-    assert fake.history_calls == [(1, "history-1"), (1, "history-1")]
+    assert fake.history_calls == [(1, "history-1"), (1, "history-2")]
     assert fake.message_calls == [(1, "gmail-message-1"), (1, "gmail-message-1")]
     assert counts()["messages"] == 1
 
@@ -274,14 +427,16 @@ def test_gmail_pubsub_provider_failure_does_not_return_cursor(gmail_client):
         raise ProviderTemporaryFailure("provider temporarily unavailable")
 
     fake.list_history = fail_history
-    with pytest.raises(ProviderTemporaryFailure, match="provider temporarily unavailable"):
-        client.post(
-            "/api/integrations/gmail/pubsub/1",
-            json={"message": {"data": encode_notification("history-1")}},
-            headers=headers(),
-        )
+    response = client.post(
+        "/api/integrations/gmail/pubsub/1",
+        json={"message": {"data": encode_notification("history-1")}},
+        headers=headers(),
+    )
 
+    assert response.status_code == 503
+    assert response.headers["Retry-After"] == "60"
     assert fake.message_calls == []
+    assert counts()["gmail_status"] == "connected_pending_inbound"
 
 
 def test_gmail_pubsub_rejects_invalid_payload(gmail_client):

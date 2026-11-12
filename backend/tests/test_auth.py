@@ -70,6 +70,38 @@ def test_anonymous_request_cannot_read_me(auth_client):
     assert auth_client.get("/auth/me").status_code == 401
 
 
+def test_csrf_bootstrap_allows_same_origin_browser_get_without_origin(auth_client):
+    response = auth_client.get("/auth/csrf")
+    assert response.status_code == 200
+    assert response.json()["csrf_token"]
+    assert any(cookie.startswith("ea_csrf=") for cookie in response.headers.get_list("set-cookie"))
+
+
+def test_authenticated_csrf_refresh_remains_usable_for_state_change(auth_client):
+    assert login(auth_client, "staff", "staffpass1").status_code == 200
+    refreshed = auth_client.get("/auth/csrf")
+    assert refreshed.status_code == 200
+    token = refreshed.json()["csrf_token"]
+    logout = auth_client.post(
+        "/auth/logout",
+        headers={"Origin": "https://testserver", "X-CSRF-Token": token},
+    )
+    assert logout.status_code == 204
+
+
+def test_authenticated_csrf_requests_reuse_a_valid_cookie_token(auth_client):
+    assert login(auth_client, "staff", "staffpass1").status_code == 200
+    original = auth_client.cookies.get("ea_csrf")
+    refreshed = auth_client.get("/auth/csrf", headers={"Origin": "https://testserver"})
+    assert refreshed.status_code == 200
+    assert refreshed.json()["csrf_token"] == original
+    logout = auth_client.post(
+        "/auth/logout",
+        headers={"Origin": "https://testserver", "X-CSRF-Token": original},
+    )
+    assert logout.status_code == 204
+
+
 def test_login_sets_secure_session_and_csrf_cookies(auth_client):
     response = login(auth_client, "staff", "staffpass1")
     assert response.status_code == 200

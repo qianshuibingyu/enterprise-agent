@@ -147,6 +147,29 @@ def test_duplicate_delivery_is_idempotent_and_does_not_overwrite_content(db_sess
     assert db_session.query(Message).count() == 1
 
 
+def test_duplicate_delivery_backfills_missing_provider_metadata(db_session):
+    first = ingest_message(db_session, payload(1))
+    db_session.commit()
+
+    duplicate_payload = payload(1)
+    duplicate_payload = InboundMessageInput(
+        **{
+            **duplicate_payload.__dict__,
+            "customer_contact": "customer@example.com",
+            "customer_nickname": "Customer",
+            "provider_web_link": "https://outlook.office.com/mail/inbox/id/message-1",
+        }
+    )
+    duplicate = ingest_message(db_session, duplicate_payload)
+    db_session.commit()
+
+    assert duplicate.created is False
+    assert duplicate.message.id == first.message.id
+    assert duplicate.message.customer_contact == "customer@example.com"
+    assert duplicate.message.customer_nickname == "Customer"
+    assert duplicate.message.provider_web_link.endswith("message-1")
+
+
 def test_existing_database_conflict_is_returned_without_mutating_record(db_session):
     existing = Message(
         channel_account_id=1,

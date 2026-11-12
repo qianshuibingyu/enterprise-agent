@@ -1,0 +1,223 @@
+import httpx
+import pytest
+
+from app.outlook_graph import OutlookGraphClient, OutlookGraphError
+
+
+def client_for(handler):
+    return OutlookGraphClient(
+        refresh_token="fixture-refresh-token",
+        http=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+
+def test_graph_fetches_one_message_after_validating_account_identity(monkeypatch):
+    monkeypatch.setenv("OUTLOOK_CLIENT_ID", "fixture-client")
+    monkeypatch.setenv("OUTLOOK_CLIENT_SECRET", "fixture-secret")
+    monkeypatch.setenv("OUTLOOK_REDIRECT_URI", "https://testserver/callback")
+    calls = []
+
+    def handler(request: httpx.Request):
+        calls.append(str(request.url))
+        if request.url.path.endswith("/token"):
+            return httpx.Response(200, json={"access_token": "fixture-access"})
+        if request.url.path == "/v1.0/me":
+            return httpx.Response(200, json={"id": "ms-subject-1"})
+        return httpx.Response(200, json={
+            "id": "message-1",
+            "body": {"content": "<p>Provider body</p>"},
+        })
+
+    result = client_for(handler).fetch_message(
+        external_account_id="ms-subject-1",
+        message_id="message-1",
+    )
+
+    assert result["id"] == "message-1"
+    assert result["body"]["content"] == "<p>Provider body</p>"
+    assert calls[-1].startswith("https://graph.microsoft.com/v1.0/me/messages/message-1?")
+    assert "%24select=id%2CreceivedDateTime%2CbodyPreview%2Cbody%2Cfrom%2CwebLink%2ChasAttachments" in calls[-1]
+
+
+def test_graph_reads_inbox_and_junk_email_after_account_identity_matches(monkeypatch):
+    monkeypatch.setenv("OUTLOOK_CLIENT_ID", "fixture-client")
+    monkeypatch.setenv("OUTLOOK_CLIENT_SECRET", "fixture-secret")
+    monkeypatch.setenv("OUTLOOK_REDIRECT_URI", "https://testserver/callback")
+    calls = []
+    query_params = []
+
+    def handler(request: httpx.Request):
+        calls.append(str(request.url))
+        query_params.append(dict(request.url.params))
+        if request.url.path.endswith("/token"):
+            return httpx.Response(200, json={"access_token": "fixture-access"})
+        if request.url.path.endswith("/me"):
+            return httpx.Response(200, json={"id": "ms-subject-1"})
+        folder = request.url.path.split("/")[-2]
+        return httpx.Response(
+            200,
+            json={
+                "value": [{
+                    "id": f"graph-{folder}-message-1",
+                    "receivedDateTime": "2026-11-02T10:00:00Z",
+                    "bodyPreview": "fixture outlook preview",
+                    "body": {"contentType": "html", "content": "<p>fixture outlook message</p>"},
+                }],
+            },
+        )
+
+    messages = client_for(handler).list_emails(
+        external_account_id="ms-subject-1", count=10
+    )
+    assert {message["id"] for message in messages} == {
+        "graph-inbox-message-1",
+        "graph-junkemail-message-1",
+    }
+    assert any("/me?" in url for url in calls)
+    assert any("mailFolders/inbox/messages" in url for url in calls)
+    assert any("mailFolders/junkemail/messages" in url for url in calls)
+    message_query_params = [params for params in query_params if "$top" in params]
+    # Unread decides which mail enters the queue, so the provider read keeps the
+    # filter; a missing webLink on an already-ingested row is repaired by
+    # message_web_link() instead of by turning this into a full-history read.
+    assert all(
+        params["$filter"] == "receivedDateTime ge 1970-01-01T00:00:00Z and isRead eq false"
+        for params in message_query_params
+    )
+    assert all("isRead" in params["$select"] for params in message_query_params)
+    assert all("webLink" in params["$select"] for params in message_query_params)
+
+
+def test_graph_reads_the_provider_web_link_for_one_stored_message(monkeypatch):
+    monkeypatch.setenv("OUTLOOK_CLIENT_ID", "fixture-client")
+    monkeypatch.setenv("OUTLOOK_CLIENT_SECRET", "fixture-secret")
+    monkeypatch.setenv("OUTLOOK_REDIRECT_URI", "https://testserver/callback")
+    seen = {}
+
+    def handler(request: httpx.Request):
+        if request.url.path.endswith("/token"):
+            return httpx.Response(200, json={"access_token": "fixture-access"})
+        seen["path"] = request.url.path
+        seen["params"] = dict(request.url.params)
+        return httpx.Response(
+            200,
+            json={"webLink": "https://outlook.live.com/owa/?ItemID=fixture"},
+        )
+
+    client = client_for(handler)
+    # Graph message ids are base64url, so they must survive the path segment.
+    assert client.message_web_link("AAMkAD-_9=AQMkADAw") == (
+        "https://outlook.live.com/owa/?ItemID=fixture"
+    )
+    assert seen["path"].endswith("/me/messages/AAMkAD-_9=AQMkADAw")
+    assert seen["params"] == {"$select": "webLink"}
+
+
+def test_graph_message_web_link_is_absent_when_graph_rejects_the_read(monkeypatch):
+    monkeypatch.setenv("OUTLOOK_CLIENT_ID", "fixture-client")
+    monkeypatch.setenv("OUTLOOK_CLIENT_SECRET", "fixture-secret")
+    monkeypatch.setenv("OUTLOOK_REDIRECT_URI", "https://testserver/callback")
+
+    def handler(request: httpx.Request):
+        if request.url.path.endswith("/token"):
+            return httpx.Response(200, json={"access_token": "fixture-access"})
+        return httpx.Response(404, json={"error": {"code": "ErrorItemNotFound"}})
+
+    assert client_for(handler).message_web_link("missing") is None
+
+
+def test_graph_rejects_account_mapping_mismatch(monkeypatch):
+    monkeypatch.setenv("OUTLOOK_CLIENT_ID", "fixture-client")
+    monkeypatch.setenv("OUTLOOK_CLIENT_SECRET", "fixture-secret")
+    monkeypatch.setenv("OUTLOOK_REDIRECT_URI", "https://testserver/callback")
+
+    def handler(request: httpx.Request):
+        if request.url.path.endswith("/token"):
+            return httpx.Response(200, json={"access_token": "fixture-access"})
+        return httpx.Response(200, json={"id": "other-subject"})
+
+    with pytest.raises(OutlookGraphError):
+        client_for(handler).list_emails(
+            external_account_id="expected-subject", count=10
+        )
+
+
+def test_graph_maps_authorization_identity_from_me(monkeypatch):
+    monkeypatch.setenv("OUTLOOK_CLIENT_ID", "fixture-client")
+    monkeypatch.setenv("OUTLOOK_CLIENT_SECRET", "fixture-secret")
+    monkeypatch.setenv("OUTLOOK_REDIRECT_URI", "https://testserver/callback")
+
+    from app.outlook_oauth import OutlookOAuthClient
+
+    def handler(request: httpx.Request):
+        if request.url.path.endswith("/token"):
+            return httpx.Response(
+                200,
+                json={"access_token": "fixture-access", "refresh_token": "fixture-refresh"},
+            )
+        return httpx.Response(
+            200,
+            json={"id": "ms-subject-1", "mail": "wafutechnology@outlook.com"},
+        )
+
+    authorization = OutlookOAuthClient(
+        http=httpx.Client(transport=httpx.MockTransport(handler))
+    ).exchange_code(code="fixture-code")
+    assert authorization.external_account_id == "ms-subject-1"
+    assert authorization.email == "wafutechnology@outlook.com"
+
+
+def test_oauth_reports_provider_stage_and_code(monkeypatch):
+    monkeypatch.setenv("OUTLOOK_CLIENT_ID", "fixture-client")
+    monkeypatch.setenv("OUTLOOK_CLIENT_SECRET", "fixture-secret")
+    monkeypatch.setenv("OUTLOOK_REDIRECT_URI", "https://testserver/callback")
+
+    def handler(request: httpx.Request):
+        return httpx.Response(
+            400,
+            json={"error": "invalid_grant", "error_description": "code expired"},
+        )
+
+    from app.outlook_oauth import OutlookOAuthClient, OutlookOAuthProviderError
+
+    with pytest.raises(OutlookOAuthProviderError) as error:
+        OutlookOAuthClient(
+            http=httpx.Client(transport=httpx.MockTransport(handler))
+        ).exchange_code(code="fixture-code")
+
+    assert error.value.stage == "token_exchange"
+    assert error.value.provider_code == "invalid_grant"
+
+
+def test_outlook_normalized_body_uses_content_not_structured_body_repr():
+    from app.outlook_routes import _normalized_message
+
+    normalized = _normalized_message({
+        "id": "graph-message-1",
+        "receivedDateTime": "2026-11-02T10:00:00Z",
+        "body": {"contentType": "html", "content": "<p>fixture body</p>"},
+    })
+
+    assert normalized["raw_content"] == "<p>fixture body</p>"
+    assert "contentType" not in normalized["raw_content"]
+
+
+def test_outlook_normalized_body_unwraps_mcp_structured_body_literal_safely():
+    from app.outlook_routes import _normalized_message
+
+    normalized = _normalized_message({
+        "id": "mcp-message-1",
+        "receivedDateTime": "2026-11-02T10:00:00Z",
+        "body": "{'contentType': 'html', 'content': '<p>MCP body</p>'}",
+    })
+
+    assert normalized["raw_content"] == "<p>MCP body</p>"
+
+
+def test_outlook_normalized_body_does_not_execute_or_unpack_arbitrary_literals():
+    from app.outlook_routes import _normalized_message
+
+    payload = "__import__('os').system('touch /tmp/should-not-exist')"
+    normalized = _normalized_message({"id": "unsafe", "body": payload})
+
+    assert normalized["raw_content"] == payload
