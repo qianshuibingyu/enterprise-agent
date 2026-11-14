@@ -103,10 +103,12 @@ export function parseHash(hash: string): AppRoute {
   const logsInquiry = query.get('log')
   const rawGroupJid = query.get('gjid')
   const groupJid = page === 'groupBinding' && rawGroupJid && rawGroupJid.length <= 255 ? rawGroupJid : null
+  const parsedView = isView(query.get('view')) ? (query.get('view') as WorkspaceView) : base.view
+  const view = ['messages', 'review', 'customers', 'customerMessages'].includes(page) ? page as WorkspaceView : parsedView
   return {
     page,
     id,
-    view: isView(query.get('view')) ? (query.get('view') as WorkspaceView) : base.view,
+    view,
     mpage: positiveInt(query.get('mpage'), base.mpage),
     ipage: positiveInt(query.get('ipage'), base.ipage),
     mh: query.get('mh') ?? base.mh,

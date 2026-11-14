@@ -21,9 +21,9 @@ def client():
     factory = sessionmaker(bind=engine, expire_on_commit=False)
     with factory() as db:
         db.add_all([
-            User(username="op-a", password_hash=hash_password("operator1"), role="staff", is_active=True, must_change_password=False),
-            User(username="op-b", password_hash=hash_password("operator2"), role="staff", is_active=True, must_change_password=False),
-            User(username="sale", password_hash=hash_password("salespass1"), role="sales", is_active=True, must_change_password=False),
+            User(username="op-a", password_hash=hash_password("operator1"), role="staff", department="inquiry", is_active=True, must_change_password=False),
+            User(username="op-b", password_hash=hash_password("operator2"), role="staff", department="inquiry", is_active=True, must_change_password=False),
+            User(username="sale", password_hash=hash_password("salespass1"), role="sales", department="inquiry", is_active=True, must_change_password=False),
         ])
         db.flush()
         accounts = [
@@ -47,9 +47,9 @@ def client():
             Message(id=4, channel_account_id=4, provider="whatsapp_web_baileys", external_message_id="m4", direction="inbound", status="received", handling_status="pending", occurred_at=datetime.now(timezone.utc), raw_content="wrong identity type", customer_contact="same@example.com", normalized_customer_contact=None, contact_identity_state="unsupported", contact_identity_kind="whatsapp"),
         ])
         db.add_all([
-            Inquiry(id=1, customer_contact="Same@Example.com", normalized_customer_contact="same@example.com", contact_identity_state="certain", contact_identity_kind="email", customer_nickname="same", raw_message="first", source_channel_account_id=1, status="new", handling_status="pending", message_links=[InquiryMessage(message_id=1, position=1, link_source="fixture")]),
-            Inquiry(id=2, customer_contact="same@example.com", normalized_customer_contact="same@example.com", contact_identity_state="certain", contact_identity_kind="email", customer_nickname="same", raw_message="second chain", source_channel_account_id=2, status="new", handling_status="pending", message_links=[InquiryMessage(message_id=2, position=1, link_source="fixture")]),
-            Inquiry(id=3, customer_contact="other@example.com", normalized_customer_contact="other@example.com", contact_identity_state="certain", contact_identity_kind="email", customer_nickname="other", raw_message="other", source_channel_account_id=1, status="new", handling_status="pending", message_links=[InquiryMessage(message_id=4, position=1, link_source="fixture")]),
+            Inquiry(id=1, customer_contact="Same@Example.com", department="inquiry", normalized_customer_contact="same@example.com", contact_identity_state="certain", contact_identity_kind="email", customer_nickname="same", raw_message="first", source_channel_account_id=1, status="new", handling_status="pending", message_links=[InquiryMessage(message_id=1, position=1, link_source="fixture")]),
+            Inquiry(id=2, customer_contact="same@example.com", department="inquiry", normalized_customer_contact="same@example.com", contact_identity_state="certain", contact_identity_kind="email", customer_nickname="same", raw_message="second chain", source_channel_account_id=2, status="new", handling_status="pending", message_links=[InquiryMessage(message_id=2, position=1, link_source="fixture")]),
+            Inquiry(id=3, customer_contact="other@example.com", department="inquiry", normalized_customer_contact="other@example.com", contact_identity_state="certain", contact_identity_kind="email", customer_nickname="other", raw_message="other", source_channel_account_id=1, status="new", handling_status="pending", message_links=[InquiryMessage(message_id=4, position=1, link_source="fixture")]),
         ])
         db.commit()
 
@@ -90,8 +90,10 @@ def test_candidates_show_multiple_without_linking_and_operator_can_choose(client
     assert linked.status_code == 200
     assert linked.json()["messages"][-1]["provider"] == "gmail_api_pubsub"
     assert [item["id"] for item in linked.json()["messages"]] == [1, 3]
-    assert linked.json()["messages"][0]["overview"] is None
-    assert linked.json()["messages"][1]["overview"] is None
+    # Inquiry-linked message summaries expose overview_status/overview_text,
+    # not the full message-level `overview` object (see _inquiry_view).
+    assert linked.json()["messages"][0]["overview_text"] is None
+    assert linked.json()["messages"][1]["overview_text"] is None
     with factory() as db:
         link_event = db.scalar(select(InquiryEvent).where(InquiryEvent.inquiry_id == 1, InquiryEvent.event_type == "inquiry_message_linked"))
         assert link_event is not None

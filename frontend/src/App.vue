@@ -1,10 +1,12 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import {
   ApiError,
   clearCsrfCache,
   inboxApi,
+  type AdminChannelAccount,
   type ChannelAccount,
+  type EmployeeRecord,
   type Inquiry,
   type InquiryLinkCandidates,
   type InternalAnalysis,
@@ -111,6 +113,13 @@ const linkReviewCandidates = ref<InquiryLinkCandidates | null>(null)
 const linkReviewLoading = ref(false)
 const linkReviewError = ref('')
 let linkReviewRequestId = 0
+/** 查看客户消息：只展示运营同事入站时落库的清洗后原文，不跳页、不再点一次「查看原文」。 */
+type CustomerMessageContent = Awaited<ReturnType<typeof inboxApi.getMessageContent>>
+const customerMessageId = ref<number | null>(null)
+const customerMessageContent = ref<CustomerMessageContent | null>(null)
+const customerMessageLoading = ref(false)
+const customerMessageError = ref('')
+const customerMessageCopied = ref(false)
 const unauthorized = ref(false)
 const unauthorizedStatus = ref<401 | 403 | null>(null)
 const gmailMessage = ref('')
@@ -120,7 +129,300 @@ const whatsappError = ref('')
 const whatsappQr = ref('')
 const whatsappQrExpiresAt = ref('')
 const profileOpen = ref(false)
-const currentUser = ref<{ username: string; role: string } | null>(null)
+const currentUser = ref<{ id?: number; username: string; role: string; department?: string | null; must_change_password?: boolean } | null>(null)
+const employeeAdminOpen = ref(false)
+const employeeRecords = ref<EmployeeRecord[]>([])
+const employeeError = ref('')
+// 员工页的错误是一次性操作反馈：不应长期贴在面板上（尤其下次打开别人的设置时）。
+// 统一在这里自动收起，避免「已经改好了但红条还在」的错觉。
+let employeeErrorTimer: ReturnType<typeof setTimeout> | null = null
+watch(employeeError, (message) => {
+  if (employeeErrorTimer) {
+    clearTimeout(employeeErrorTimer)
+    employeeErrorTimer = null
+  }
+  if (!message) return
+  employeeErrorTimer = setTimeout(() => {
+    employeeError.value = ''
+    employeeErrorTimer = null
+  }, 6000)
+})
+const employeeChannelFeedback = ref<{ kind: 'success' | 'error'; text: string } | null>(null)
+const employeeChannelPending = ref<string | null>(null)
+const employeeCreateFeedback = ref<{ kind: 'success' | 'error'; text: string } | null>(null)
+const employeeCreating = ref(false)
+const employeeCreateFormEl = ref<HTMLFormElement | null>(null)
+const employeeTableCardEl = ref<HTMLElement | null>(null)
+const employeeForm = ref({ full_name: '', username: '', role: 'sales', department: '', manager_overlay_enabled: false, temporary_password: '' })
+const employeeGrantDepartmentById = ref<Record<number, string>>({})
+const employeeManagerTargetById = ref<Record<number, number | ''>>({})
+const employeeManagerPermissionById = ref<Record<number, string>>({})
+const employeeResetPasswordById = ref<Record<number, string>>({})
+// 重置密码是「一次性的定点操作」，结果必须贴着按钮反馈：顶部红字经常在视口外，
+// 点了没反应是这里最容易踩的坑。
+const employeeResetFeedback = ref<{ userId: number; kind: 'success' | 'error'; text: string } | null>(null)
+const employeeResetPendingId = ref<number | null>(null)
+let employeeResetFeedbackTimer: ReturnType<typeof setTimeout> | null = null
+function flashEmployeeReset(userId: number, kind: 'success' | 'error', text: string) {
+  employeeResetFeedback.value = { userId, kind, text }
+  if (employeeResetFeedbackTimer) {
+    clearTimeout(employeeResetFeedbackTimer)
+    employeeResetFeedbackTimer = null
+  }
+  if (kind !== 'success') return
+  // 成功提示会自动收起；失败提示保留，直到下一次操作。
+  employeeResetFeedbackTimer = setTimeout(() => {
+    employeeResetFeedback.value = null
+    employeeResetFeedbackTimer = null
+  }, 10000)
+}
+const employeeSearch = ref('')
+const employeeRoleFilter = ref('all')
+const employeeStatusFilter = ref('all')
+const expandedEmployeeId = ref<number | null>(null)
+const employeeConfirmDeactivateId = ref<number | null>(null)
+const employeeConfirmReactivateId = ref<number | null>(null)
+const adminChannelAccounts = ref<AdminChannelAccount[]>([])
+const adminChannelAccountsLoading = ref(false)
+const adminChannelFeedback = ref<{ kind: 'success' | 'error'; title: string; text: string } | null>(null)
+const regrantingAccountId = ref<number | null>(null)
+const transferTargetUserId = ref<number | ''>('')
+const selectedAdminChannelAccountIds = ref<number[]>([])
+const channelTransferSubmitting = ref(false)
+const adminChannelSelectionInitialized = ref(false)
+
+const adminChannelStatusLabels: Record<string, string> = {
+  not_ready: '待授权', connected: '已连接', connected_pending_inbound: '待入站验证',
+  verified_inbound: '已验证入站', revoked: '已撤销',
+}
+
+const transferableEmployees = computed(() =>
+  employeeRecords.value.filter((item) => item.is_active && isOperatingRole(item.role)),
+)
+const adminOwnedAccountCount = computed(() =>
+  adminChannelAccounts.value.filter((account) => adminChannelOwnerIsAdmin(account.owner_user_id)).length,
+)
+const allAdminChannelAccountsSelected = computed(() =>
+  adminChannelAccounts.value.length > 0 &&
+  selectedAdminChannelAccountIds.value.length === adminChannelAccounts.value.length,
+)
+
+function adminChannelOwnerIsAdmin(ownerId: number) {
+  return employeeRecords.value.find((item) => item.id === ownerId)?.role === 'admin'
+}
+function toggleAdminChannelAccount(accountId: number, checked: boolean) {
+  selectedAdminChannelAccountIds.value = checked
+    ? [...new Set([...selectedAdminChannelAccountIds.value, accountId])]
+    : selectedAdminChannelAccountIds.value.filter((id) => id !== accountId)
+}
+function toggleAllAdminChannelAccounts(checked: boolean) {
+  selectedAdminChannelAccountIds.value = checked ? adminChannelAccounts.value.map((item) => item.id) : []
+}
+function onToggleAdminChannelAccount(event: Event, accountId: number) {
+  toggleAdminChannelAccount(accountId, (event.target as HTMLInputElement).checked)
+}
+function onToggleAllAdminChannelAccounts(event: Event) {
+  toggleAllAdminChannelAccounts((event.target as HTMLInputElement).checked)
+}
+function accountOwnedByTransferTarget(ownerId: number) {
+  const targetId = Number(transferTargetUserId.value)
+  return targetId > 0 && ownerId === targetId
+}
+
+const employeeRoleLabels: Record<string, string> = {
+  admin: '管理员', sales: '业务员', staff: '运营', operations: '运营', ops: '运营', manager: '经理（旧记录）',
+  engineering: '工程', procurement: '采购', production: '生产',
+}
+const employeeChannelOptions = [
+  { key: 'gmail', label: 'Gmail', hint: '邮件渠道' },
+  { key: 'outlook', label: 'Outlook', hint: '邮件渠道' },
+  { key: 'whatsapp', label: 'WhatsApp', hint: '即时消息渠道' },
+]
+const employeeRoleOptions = [
+  { value: 'admin', label: '管理员' }, { value: 'sales', label: '业务员' }, { value: 'staff', label: '运营' },
+  { value: 'engineering', label: '工程' }, { value: 'procurement', label: '采购' }, { value: 'production', label: '生产' },
+]
+
+function employeeRoleLabel(role: string) {
+  return employeeRoleLabels[role] ?? role
+}
+function isOperatingRole(role: string) {
+  return ['staff', 'operations', 'ops'].includes(role)
+}
+const employeeCreateRoleOptions = computed(() =>
+  employeeRoleOptions.filter((option) => option.value !== 'admin'),
+)
+const employeeStats = computed(() => ({
+  total: employeeRecords.value.length,
+  active: employeeRecords.value.filter((item) => item.is_active).length,
+  pendingPassword: employeeRecords.value.filter((item) => item.is_active && item.must_change_password).length,
+  inactive: employeeRecords.value.filter((item) => !item.is_active).length,
+}))
+const departmentSuggestions = computed(() => {
+  const values = new Set<string>()
+  for (const item of employeeRecords.value) {
+    if (item.department) values.add(item.department)
+    for (const grant of item.department_grants) values.add(grant)
+  }
+  return [...values].sort((a, b) => a.localeCompare(b, 'zh-Hans-CN'))
+})
+// 有效员工表只放能登录、能配置的账号；停用账号只出现在下方归档区。
+const filteredEmployees = computed(() => {
+  const keyword = employeeSearch.value.trim().toLowerCase()
+  return employeeRecords.value.filter((item) => {
+    if (!item.is_active) return false
+    if (keyword && !`${item.full_name ?? ''} ${item.username} ${item.department ?? ''}`.toLowerCase().includes(keyword)) return false
+    if (employeeRoleFilter.value !== 'all' && item.role !== employeeRoleFilter.value) return false
+    if (employeeStatusFilter.value === 'pending' && !item.must_change_password) return false
+    return true
+  })
+})
+// 归档区与上方筛选完全独立：筛选岗位或搜索不应让已停用账号的数量和内容跟着跳。
+const activeEmployees = computed(() => filteredEmployees.value)
+const inactiveEmployees = computed(() => employeeRecords.value.filter((item) => !item.is_active))
+const activeEmployeeCount = computed(() => employeeRecords.value.filter((item) => item.is_active).length)
+const employeeFilterActive = computed(() =>
+  employeeSearch.value.trim() !== '' || employeeRoleFilter.value !== 'all' || employeeStatusFilter.value !== 'all',
+)
+function toggleEmployeeDetail(userId: number) {
+  const target = employeeRecords.value.find((item) => item.id === userId)
+  if (!target || !target.is_active) {
+    employeeError.value = '已停用的账号不能修改授权，请先在下方「已停用的员工」里启用账号。'
+    expandedEmployeeId.value = null
+    return
+  }
+  if (expandedEmployeeId.value !== userId) employeeError.value = ''
+  expandedEmployeeId.value = expandedEmployeeId.value === userId ? null : userId
+  employeeConfirmDeactivateId.value = null
+  employeeConfirmReactivateId.value = null
+}
+function clearEmployeeFilters() {
+  employeeSearch.value = ''
+  employeeRoleFilter.value = 'all'
+  employeeStatusFilter.value = 'all'
+}
+const managerPermissionOptions = [
+  { value: 'password_reset', label: '重置密码' },
+  { value: 'deactivate', label: '停用账号' },
+  { value: 'reactivate', label: '恢复账号' },
+  { value: 'adjust_grants', label: '调整经理授权' },
+  { value: 'retry', label: '重试概要生成' },
+]
+const managerEligibleTargets = (manager: EmployeeRecord) => employeeRecords.value.filter((item) =>
+  item.id !== manager.id && item.role !== 'admin' && item.department === manager.department && item.is_active,
+)
+function setEmployeeGrantDepartment(userId: number, event: Event) {
+  const value = (event.target as HTMLInputElement).value
+  employeeGrantDepartmentById.value = { ...employeeGrantDepartmentById.value, [userId]: value }
+}
+function setEmployeeResetPassword(userId: number, event: Event) {
+  const value = (event.target as HTMLInputElement).value
+  employeeResetPasswordById.value = { ...employeeResetPasswordById.value, [userId]: value }
+}
+const isAdmin = computed(() => currentUser.value?.role === 'admin')
+const canOperateChannels = computed(() => ['staff', 'operations', 'ops'].includes(currentUser.value?.role ?? ''))
+
+/** 批量处理：会话分组只是展示合并，以前没有整组/整页入口，运营只能逐条点。 */
+const selectedMessageIds = ref<number[]>([])
+const bulkActionRunning = ref(false)
+const bulkActionNotice = ref('')
+const bulkActionError = ref('')
+const canBulkHandle = computed(() =>
+  !isAdmin.value && (workspaceView.value === 'messages' || workspaceView.value === 'customerMessages'),
+)
+/** 已终态、出站消息不是待办。撤回消息仍可选中：运营需要能一键批量「忽略」。 */
+const selectableMessages = computed(() => {
+  if (!canBulkHandle.value) return []
+  return messages.value.filter((message) =>
+    message.handling_status === 'pending'
+    && message.direction === 'inbound',
+  )
+})
+const selectableMessageIds = computed(() => selectableMessages.value.map((message) => message.id))
+const selectableIdSet = computed(() => new Set(selectableMessageIds.value))
+const selectedMessageCount = computed(() =>
+  selectedMessageIds.value.filter((id) => selectableIdSet.value.has(id)).length,
+)
+const allVisibleSelected = computed(() =>
+  selectableMessageIds.value.length > 0
+  && selectableMessageIds.value.every((id) => selectedMessageIds.value.includes(id)),
+)
+
+function isMessageSelected(messageId: number) {
+  return selectedMessageIds.value.includes(messageId)
+}
+function canBulkSelect(message: Message) {
+  return canBulkHandle.value && selectableIdSet.value.has(message.id)
+}
+function toggleMessageSelection(messageId: number) {
+  selectedMessageIds.value = selectedMessageIds.value.includes(messageId)
+    ? selectedMessageIds.value.filter((id) => id !== messageId)
+    : [...selectedMessageIds.value, messageId]
+}
+function toggleSelectAllVisible() {
+  selectedMessageIds.value = allVisibleSelected.value ? [] : [...selectableMessageIds.value]
+}
+function clearMessageSelection() {
+  selectedMessageIds.value = []
+}
+function groupSelectableIds(group: MessageGroup) {
+  return group.messages.map((message) => message.id).filter((id) => selectableIdSet.value.has(id))
+}
+function isGroupFullySelected(group: MessageGroup) {
+  const ids = groupSelectableIds(group)
+  return ids.length > 0 && ids.every((id) => selectedMessageIds.value.includes(id))
+}
+function toggleSelectGroup(group: MessageGroup) {
+  const ids = groupSelectableIds(group)
+  selectedMessageIds.value = isGroupFullySelected(group)
+    ? selectedMessageIds.value.filter((id) => !ids.includes(id))
+    : [...new Set([...selectedMessageIds.value, ...ids])]
+}
+/** 一次请求处理整页或整组；后端逐条复用单条处理的权限与终态规则。 */
+async function runBulkMessageAction(action: 'processed' | 'ignored', explicitIds?: number[]) {
+  const candidates = [...new Set(explicitIds ?? selectedMessageIds.value)]
+    .filter((id) => selectableIdSet.value.has(id))
+  // 撤回消息没有可处理的正文，不能批量「标记已处理」；但可以批量「忽略」。
+  const targetIds = action === 'processed'
+    ? candidates.filter((id) => messages.value.find((item) => item.id === id)?.content_state !== 'revoked')
+    : candidates
+  if (targetIds.length === 0 || bulkActionRunning.value) {
+    if (candidates.length > 0 && targetIds.length === 0) {
+      bulkActionNotice.value = '选中的都是已撤回消息，不能标记已处理；请使用「批量忽略」清理。'
+    }
+    return
+  }
+  bulkActionRunning.value = true
+  bulkActionNotice.value = ''
+  bulkActionError.value = ''
+  actionError.value = ''
+  try {
+    const csrf = await inboxApi.getCsrf()
+    const result = await inboxApi.bulkUpdateMessageHandling(targetIds, action, csrf.csrf_token)
+    const updatedIds = new Set(result.updated_message_ids)
+    const updatedInquiryIds = new Set(result.updated_inquiry_ids)
+    // 询盘整组处理会连带处理同链路的兄弟消息，一并从待办列表移除。
+    messages.value = messages.value.filter((message) =>
+      !updatedIds.has(message.id)
+      && !(message.inquiry_id !== null && updatedInquiryIds.has(message.inquiry_id)),
+    )
+    selectedMessageIds.value = selectedMessageIds.value.filter((id) => !targetIds.includes(id))
+    const label = action === 'processed' ? '已处理' : '已忽略'
+    const affected = result.updated_message_ids.length + result.updated_inquiry_ids.length
+    const reasons = [...new Set(result.skipped.map((item) => item.detail))].slice(0, 2).join('；')
+    bulkActionNotice.value = result.skipped.length > 0
+      ? `已${label} ${affected} 项；跳过 ${result.skipped.length} 项${reasons ? `（${reasons}）` : ''}。`
+      : `已${label} ${affected} 项。`
+    showActionToast(bulkActionNotice.value, action)
+    if (archiveOpen.value || processedBoxOpen.value) void loadArchive()
+    scheduleAnalysisRefresh()
+  } catch (cause) {
+    bulkActionError.value = cause instanceof Error ? cause.message : '批量处理失败，请稍后重试。'
+  } finally {
+    bulkActionRunning.value = false
+  }
+}
+watch([workspaceView, messageHandlingFilter, messagePage], clearMessageSelection)
 const logoutError = ref('')
 const refetchChecks = ref<Record<number, RefetchCheck>>({})
 const refetchCheckingAccountIds = ref<Set<number>>(new Set())
@@ -179,10 +481,30 @@ const connectionStatusGuidance: Record<string, string> = {
   verified_inbound: '已保存真实入站消息，并通过来源、mapping 和幂等校验。',
   blocked: 'provider 或账号资格暂时无法继续，请确认平台准入和部署配置。',
   system_error: '系统没有完成本次连接，请检查后端配置后重试。',
-  revoked: '连接已断开，历史消息不会被删除。',
+  revoked: '连接已断开并清理；已收集的历史消息会归档保留。',
 }
 
-const realAccounts = computed(() => new Map(accounts.value.map((account) => [account.channel_type, account])))
+// A user can own several shells of the same channel type (revoked leftovers
+// and a live transferred account). Always show the usable one, never the dead
+// shell with the lowest id — that used to make "开始授权" fail with 403.
+const realAccounts = computed(() => {
+  const result = new Map<ChannelType, ChannelAccount>()
+  for (const account of accounts.value) {
+    if (!managedChannelTypes.includes(account.channel_type as ChannelType)) continue
+    const key = account.channel_type as ChannelType
+    const current = result.get(key)
+    if (!current) {
+      result.set(key, account)
+      continue
+    }
+    const currentUsable = current.status !== 'revoked'
+    const nextUsable = account.status !== 'revoked'
+    if ((!currentUsable && nextUsable) || (currentUsable === nextUsable && account.id < current.id)) {
+      result.set(key, account)
+    }
+  }
+  return result
+})
 
 const messageChannelAccounts = computed(() =>
   accounts.value.filter((account) => ['gmail', 'outlook', 'whatsapp'].includes(account.channel_type)),
@@ -213,7 +535,7 @@ async function disconnectChannel(channelType: ChannelType) {
   const account = channelAccount(channelType)
   if (!account) return
   const label = channelDetails[channelType].name
-  if (!window.confirm(`确认撤销本地 ${label} 连接状态？历史消息不会删除。`)) return
+  if (!window.confirm(`确认撤销并清理本地 ${label} 连接？未产生消息的空账号会被彻底删除；已收集的历史消息会归档保留。`)) return
   try {
     const csrf = await inboxApi.getCsrf()
     if (channelType === 'whatsapp') {
@@ -221,10 +543,13 @@ async function disconnectChannel(channelType: ChannelType) {
     } else {
       await channelsApi.revoke(account.id, csrf.csrf_token)
     }
-    await refreshList('full')
-    if (channelType === 'whatsapp') whatsappMessage.value = 'WhatsApp 已断开本地连接，历史消息保留。'
-    if (channelType === 'gmail') gmailMessage.value = 'Gmail 已撤销本地连接状态；如需撤销 Google 授权，请在 Google 账号设置中操作。'
-    if (channelType === 'outlook') outlookAuthorizationMessage.value = 'Outlook 已撤销本地连接状态；如需撤销 Microsoft 授权，请在 Microsoft 账号设置中操作。'
+    // Only the account list needs to change. A full workspace refetch used to
+    // turn an already-successful cleanup into a visible failure.
+    accounts.value = await channelsApi.accounts()
+    const note = '连接已清理；可立即重新授权。如需撤销 provider 侧授权，请到对应账号设置中操作。'
+    if (channelType === 'whatsapp') whatsappMessage.value = `WhatsApp ${note}`
+    if (channelType === 'gmail') gmailMessage.value = `Gmail ${note}`
+    if (channelType === 'outlook') outlookAuthorizationMessage.value = `Outlook ${note}`
   } catch (cause) {
     const message = cause instanceof Error ? cause.message : `${label} 断开失败。`
     if (channelType === 'whatsapp') whatsappError.value = message
@@ -259,6 +584,8 @@ function closeStandalonePage() {
 
 /** Each tab is an addressable page; view state lives in the URL, not only in refs. */
 function switchWorkspaceView(view: WorkspaceView) {
+  if (isAdmin.value && view !== 'customers') return
+  if (['sales', 'engineering', 'procurement', 'production'].includes(currentUser.value?.role ?? '') && view !== 'customers') return
   navigate({
     page: view,
     view,
@@ -277,8 +604,96 @@ function switchWorkspaceView(view: WorkspaceView) {
 }
 
 /** A message opened from logs / an inquiry is its own page, not an in-page jump. */
-function openCustomerMessage(messageId: number) {
-  navigate({ page: 'message', id: messageId })
+/**
+ * 「查看客户消息」= 就地查看这条消息的安全文本（运营同事入站清洗后的原文）。
+ * 之前是跳到消息详情整页，还要再点一次「查看原文」，等于把一步操作拆成两次跳转。
+ */
+/**
+ * 后端回源确认「其实有原文」后，会持久化修复该行。这里同步纠正本地状态，
+ * 否则弹窗显示完整原文、背后的链路却仍写着「已撤回 / 原文不再可用」。
+ */
+function applyRecoveredMessageBody(messageId: number, content: CustomerMessageContent) {
+  if (content.content_state !== 'ready') return
+  const text = content.parsed_content?.display_text || content.preview_text || ''
+  if (!text) return
+  const excerpt = text.length > 280 ? `${text.slice(0, 279).trimEnd()}…` : text
+  const linked = inquiryDetail.value?.messages.find((item) => item.id === messageId)
+  if (linked && linked.content_state === 'revoked') {
+    linked.content_state = 'ready'
+    linked.safe_content_status = 'ready'
+    linked.safe_text = text
+    linked.safe_text_truncated = false
+    linked.overview_status = 'not_generated'
+    linked.overview_text = null
+  }
+  const row = messages.value.find((item) => item.id === messageId)
+  if (row && row.content_state === 'revoked') {
+    row.content_state = 'ready'
+    row.display_text = text
+    row.display_excerpt = excerpt
+    row.overview = null
+  }
+}
+
+async function openCustomerMessage(messageId: number) {
+  customerMessageId.value = messageId
+  customerMessageContent.value = null
+  customerMessageError.value = ''
+  customerMessageCopied.value = false
+  customerMessageLoading.value = true
+  try {
+    const content = await inboxApi.getMessageContent(messageId)
+    if (customerMessageId.value !== messageId) return
+    customerMessageContent.value = content
+    const wasRevoked = inquiryDetail.value?.messages.some(
+      (item) => item.id === messageId && item.content_state === 'revoked',
+    ) || messages.value.some(
+      (item) => item.id === messageId && item.content_state === 'revoked',
+    )
+    if (wasRevoked && content.content_state === 'ready') {
+      applyRecoveredMessageBody(messageId, content)
+      // 后端已重新生成中文概述，拉一次链路详情把小字概要同步回来。
+      if (selectedInquiryId.value !== null) void loadInquiryDetail(selectedInquiryId.value, applyToken)
+    }
+  } catch (cause) {
+    if (customerMessageId.value !== messageId) return
+    customerMessageError.value = cause instanceof Error ? cause.message : '读取客户消息失败，请稍后重试。'
+  } finally {
+    if (customerMessageId.value === messageId) customerMessageLoading.value = false
+  }
+}
+
+function retryCustomerMessage() {
+  if (customerMessageId.value === null) return
+  void openCustomerMessage(customerMessageId.value)
+}
+
+function closeCustomerMessage() {
+  customerMessageId.value = null
+  customerMessageContent.value = null
+  customerMessageError.value = ''
+  customerMessageCopied.value = false
+  customerMessageLoading.value = false
+}
+
+const customerMessageRevoked = computed(() => customerMessageContent.value?.content_state === 'revoked')
+
+const customerMessageText = computed(() => {
+  const content = customerMessageContent.value
+  if (!content) return ''
+  return content.parsed_content?.display_text || content.preview_text || ''
+})
+
+async function copyCustomerMessage() {
+  const text = customerMessageText.value
+  if (!text) return
+  try {
+    await navigator.clipboard.writeText(text)
+    customerMessageCopied.value = true
+  } catch {
+    customerMessageCopied.value = false
+    customerMessageError.value = '浏览器未允许写入剪贴板，请手动选择文本复制。'
+  }
 }
 
 function goToInquiryPage(page: number, preferredIndex?: number) {
@@ -377,6 +792,11 @@ function contentSourceState(payload: MessageContent | null | undefined): Content
   }
 }
 
+/** 全文展开态：只有该消息可展开且用户点了「展示全文」才成立。 */
+function isMessageExpanded(messageId: number) {
+  return Boolean(messageContentFor(messageId)?.can_expand) && fullMessageContentIds.value.has(messageId)
+}
+
 function toggleFullMessageContent(messageId: number) {
   const next = new Set(fullMessageContentIds.value)
   if (next.has(messageId)) next.delete(messageId)
@@ -447,6 +867,368 @@ function showMessageFeedback(messageId: number, text: string, kind: 'success' | 
   messageFeedbackTimers.set(messageId, timer)
 }
 
+async function loadEmployees() {
+  if (!isAdmin.value) return
+  try {
+    employeeRecords.value = await inboxApi.getEmployees()
+    employeeError.value = ''
+  } catch (cause) {
+    employeeError.value = cause instanceof Error ? cause.message : '员工列表加载失败。'
+  }
+  await loadAdminChannelAccounts()
+}
+
+async function loadAdminChannelAccounts() {
+  if (!isAdmin.value) return
+  adminChannelAccountsLoading.value = true
+  try {
+    adminChannelAccounts.value = await inboxApi.listAdminChannelAccounts()
+    const validIds = adminChannelAccounts.value.map((item) => item.id)
+    selectedAdminChannelAccountIds.value = adminChannelSelectionInitialized.value
+      ? validIds.filter((id) => selectedAdminChannelAccountIds.value.includes(id))
+      : adminChannelAccounts.value.filter((item) => adminChannelOwnerIsAdmin(item.owner_user_id)).map((item) => item.id)
+    adminChannelSelectionInitialized.value = true
+  } catch (cause) {
+    adminChannelFeedback.value = { kind: 'error', title: '加载失败', text: cause instanceof Error ? cause.message : '渠道账号列表加载失败。' }
+  } finally {
+    adminChannelAccountsLoading.value = false
+  }
+}
+
+function adminChannelOwner(ownerId: number) {
+  const employee = employeeRecords.value.find((item) => item.id === ownerId)
+  return employee ? `${employee.username} · #${ownerId}` : `用户 #${ownerId}`
+}
+
+async function regrantChannelHistory(account: AdminChannelAccount) {
+  if (!isAdmin.value || regrantingAccountId.value !== null) return
+  regrantingAccountId.value = account.id
+  adminChannelFeedback.value = null
+  try {
+    const csrf = await inboxApi.getCsrf()
+    await inboxApi.regrantChannelHistory(account.id, csrf.csrf_token)
+    await loadEmployees()
+    adminChannelFeedback.value = {
+      kind: 'success',
+      title: '恢复成功',
+      text: `已恢复 ${account.channel_type} 账号 #${account.id} 的历史访问。请让该员工刷新页面后重新点击「开始授权」。`,
+    }
+  } catch (cause) {
+    adminChannelFeedback.value = { kind: 'error', title: '恢复失败', text: cause instanceof Error ? cause.message : '恢复历史访问失败。' }
+  } finally {
+    regrantingAccountId.value = null
+  }
+}
+
+function openEmployeeAdminFromChannels() {
+  profileOpen.value = false
+  navigate({ page: 'customers', view: 'customers', id: null }, true)
+  employeeAdminOpen.value = true
+  void loadEmployees()
+}
+
+async function transferChannelAccountsOwner(accountIds: number[]) {
+  if (!isAdmin.value || channelTransferSubmitting.value) return
+  const targetId = Number(transferTargetUserId.value)
+  const ids = [...new Set(accountIds)]
+  if (!targetId) {
+    adminChannelFeedback.value = { kind: 'error', title: '无法转移', text: '请先在上方选择接收渠道账号的运营员工。' }
+    return
+  }
+  if (ids.length === 0) {
+    adminChannelFeedback.value = { kind: 'error', title: '无法转移', text: '请先勾选需要转移归属的渠道账号。' }
+    return
+  }
+  channelTransferSubmitting.value = true
+  adminChannelFeedback.value = null
+  try {
+    const csrf = await inboxApi.getCsrf()
+    const result = await inboxApi.transferChannelAccountsOwner(ids, targetId, csrf.csrf_token)
+    await loadEmployees()
+    const parts = [`已将 ${result.transferred.length} 个渠道账号转给 ${result.owner_username}。`]
+    if (result.preauthorizations_granted.length > 0) {
+      parts.push(`已自动补齐渠道预授权：${result.preauthorizations_granted.join('、')}。`)
+    }
+    if (result.retired_shells.length > 0) {
+      const removed = result.retired_shells.filter((item) => item.deleted).map((item) => `#${item.id}`)
+      const archived = result.retired_shells.filter((item) => !item.deleted).map((item) => `#${item.id}`)
+      if (removed.length > 0) parts.push(`已彻底清除 ${removed.length} 个未连接/已撤销的旧账号（${removed.join('、')}）。`)
+      if (archived.length > 0) parts.push(`另有 ${archived.length} 个旧账号含历史消息，已停用并归档（${archived.join('、')}），数据保留。`)
+    }
+    if (result.skipped.length > 0) {
+      parts.push(`跳过 ${result.skipped.length} 个（${result.skipped.map((item) => `#${item.id} ${item.reason}`).join('；')}）。`)
+    }
+    parts.push('历史消息无需重连，让该员工刷新页面后即可在渠道工作台看到并处理。')
+    adminChannelFeedback.value = {
+      kind: result.transferred.length > 0 ? 'success' : 'error',
+      title: result.transferred.length > 0 ? '归属转移完成' : '未转移任何账号',
+      text: parts.join(''),
+    }
+  } catch (cause) {
+    adminChannelFeedback.value = { kind: 'error', title: '转移失败', text: cause instanceof Error ? cause.message : '渠道账号归属转移失败。' }
+  } finally {
+    channelTransferSubmitting.value = false
+  }
+}
+
+function focusEmployeeCreateField(name: string) {
+  const field = employeeCreateFormEl.value?.elements.namedItem(name)
+  if (field instanceof HTMLElement) field.focus()
+}
+
+function scrollToEmployeeTable() {
+  employeeTableCardEl.value?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+}
+
+async function createEmployee() {
+  if (!isAdmin.value || employeeCreating.value) return
+  const fullName = employeeForm.value.full_name.trim()
+  const username = employeeForm.value.username.trim()
+  const role = employeeForm.value.role
+  const department = employeeForm.value.department.trim()
+  const temporaryPassword = employeeForm.value.temporary_password
+  if (!fullName) {
+    employeeCreateFeedback.value = { kind: 'error', text: '请先填写员工姓名（例如 张三），它会显示在员工列表和询盘负责人处。' }
+    focusEmployeeCreateField('full_name')
+    return
+  }
+  if (!username) {
+    employeeCreateFeedback.value = { kind: 'error', text: '请先填写用户名（例如 zhang.san），再创建员工。' }
+    focusEmployeeCreateField('username')
+    return
+  }
+  if (!department) {
+    employeeCreateFeedback.value = { kind: 'error', text: '所有账号都必须填写所属部门。' }
+    focusEmployeeCreateField('department')
+    return
+  }
+  if (temporaryPassword.length < 6 || temporaryPassword.length > 15) {
+    employeeCreateFeedback.value = { kind: 'error', text: '临时密码长度必须为 6–15 位，请重新输入。' }
+    focusEmployeeCreateField('temporary_password')
+    return
+  }
+  employeeCreating.value = true
+  employeeCreateFeedback.value = null
+  employeeError.value = ''
+  try {
+    const csrf = await inboxApi.getCsrf()
+    const created = await inboxApi.createEmployee(
+      { full_name: fullName, username, role, department, manager_overlay_enabled: employeeForm.value.manager_overlay_enabled, temporary_password: temporaryPassword },
+      csrf.csrf_token,
+    )
+    employeeForm.value = { full_name: '', username: '', role: 'sales', department: '', manager_overlay_enabled: false, temporary_password: '' }
+    employeeSearch.value = ''
+    employeeRoleFilter.value = 'all'
+    employeeStatusFilter.value = 'all'
+    await loadEmployees()
+    const identity = created?.id ? `（编号 #${created.id}）` : ''
+    const displayName = created?.full_name || created?.username || username
+    employeeCreateFeedback.value = {
+      kind: 'success',
+      text: `员工「${displayName}」${identity}已创建，并已出现在下方员工列表中。请将临时密码通过安全渠道告知本人；对方首次登录须先修改密码。`,
+    }
+  } catch (cause) {
+    employeeCreateFeedback.value = { kind: 'error', text: cause instanceof Error ? cause.message : '创建员工失败，请稍后重试。' }
+  } finally {
+    employeeCreating.value = false
+  }
+}
+
+function changeEmployeeRole(user: EmployeeRecord, event: Event) {
+  const role = (event.target as HTMLSelectElement).value
+  const department = user.department || ''
+  if (!department) {
+    employeeError.value = '所有账号都必须填写所属部门。'
+    return
+  }
+  void updateEmployee(user, role, department, undefined, employee.manager_overlay_enabled)
+}
+
+function changeEmployeeDepartment(user: EmployeeRecord, event: Event) {
+  const department = (event.target as HTMLInputElement).value.trim()
+  if (!department) {
+    employeeError.value = '所有账号都必须填写所属部门。'
+    void loadEmployees()
+    return
+  }
+  void updateEmployee(user, user.role, department, undefined, user.manager_overlay_enabled)
+}
+
+function changeEmployeeManagerOverlay(user: EmployeeRecord, event: Event) {
+  const enabled = (event.target as HTMLInputElement).checked
+  void updateEmployee(user, user.role, user.department, undefined, enabled)
+}
+
+function changeEmployeeFullName(user: EmployeeRecord, event: Event) {
+  const fullName = (event.target as HTMLInputElement).value.trim()
+  if (!fullName) {
+    employeeError.value = '员工姓名不能为空。'
+    void loadEmployees()
+    return
+  }
+  if (fullName === (user.full_name || '')) return
+  void updateEmployee(user, user.role, user.department, fullName, user.manager_overlay_enabled)
+}
+
+async function updateEmployee(user: EmployeeRecord, role: string, department: string | null, fullName?: string, managerOverlayEnabled?: boolean) {
+  if (!isAdmin.value) return
+  employeeError.value = ''
+  try {
+    const csrf = await inboxApi.getCsrf()
+    await inboxApi.mapEmployee(user.id, { role, department, full_name: fullName, manager_overlay_enabled: managerOverlayEnabled ?? user.manager_overlay_enabled }, csrf.csrf_token)
+    await loadEmployees()
+  } catch (cause) {
+    employeeError.value = cause instanceof Error ? cause.message : '更新员工失败。'
+  }
+}
+
+/** 改派下拉的人群标签：姓名为主，账号作为副标识，避免同名人选错。 */
+function transferTargetLabel(target: TransferTarget) {
+  const name = target.full_name || target.username
+  return name === target.username ? name : `${name}（${target.username}）`
+}
+
+/** 员工展示名：优先姓名，回退用户名。 */
+function employeeDisplayName(employee: EmployeeRecord) {
+  return employee.full_name || employee.username
+}
+
+async function grantManagerPermission(manager: EmployeeRecord) {
+  const targetUserId = Number(employeeManagerTargetById.value[manager.id] || 0)
+  const permission = employeeManagerPermissionById.value[manager.id] || ''
+  if (!isAdmin.value || !targetUserId || !permission || !manager.department) return
+  try {
+    const csrf = await inboxApi.getCsrf()
+    await inboxApi.grantManagerPermission(manager.id, targetUserId, manager.department, permission, csrf.csrf_token)
+    await loadEmployees()
+  } catch (cause) {
+    employeeError.value = cause instanceof Error ? cause.message : '经理权限授予失败。'
+  }
+}
+
+async function revokeManagerPermission(manager: EmployeeRecord, grant: EmployeeRecord['manager_grants'][number]) {
+  if (!isAdmin.value) return
+  try {
+    const csrf = await inboxApi.getCsrf()
+    await inboxApi.revokeManagerPermission(manager.id, grant.target_user_id, grant.permission, csrf.csrf_token)
+    await loadEmployees()
+  } catch (cause) {
+    employeeError.value = cause instanceof Error ? cause.message : '经理权限撤销失败。'
+  }
+}
+
+async function grantEmployeeDepartment(userId: number) {
+  const department = employeeGrantDepartmentById.value[userId]?.trim() || ''
+  if (!isAdmin.value || !department) return
+  try {
+    const csrf = await inboxApi.getCsrf()
+    await inboxApi.grantDepartment(userId, department, csrf.csrf_token)
+    employeeGrantDepartmentById.value = { ...employeeGrantDepartmentById.value, [userId]: '' }
+    await loadEmployees()
+  } catch (cause) {
+    employeeError.value = cause instanceof Error ? cause.message : '部门授权失败。'
+  }
+}
+
+async function revokeEmployeeDepartment(userId: number, department: string) {
+  if (!isAdmin.value) return
+  try {
+    const csrf = await inboxApi.getCsrf()
+    await inboxApi.revokeDepartment(userId, department, csrf.csrf_token)
+    await loadEmployees()
+  } catch (cause) {
+    employeeError.value = cause instanceof Error ? cause.message : '撤销部门授权失败。'
+  }
+}
+
+async function changeEmployeeChannel(user: EmployeeRecord, channel: string, grant: boolean) {
+  if (!isAdmin.value) return
+  const operationKey = `${user.id}:${channel}`
+  if (employeeChannelPending.value) return
+  employeeChannelPending.value = operationKey
+  employeeChannelFeedback.value = null
+  try {
+    const csrf = await inboxApi.getCsrf()
+    if (grant) await inboxApi.grantChannel(user.id, channel, csrf.csrf_token)
+    else await inboxApi.revokeChannel(user.id, channel, csrf.csrf_token)
+    await loadEmployees()
+    const channelLabel = employeeChannelOptions.find((item) => item.key === channel)?.label ?? channel
+    employeeChannelFeedback.value = {
+      kind: 'success',
+      text: `已${grant ? '授予' : '撤销'} ${user.username} 的 ${channelLabel} 渠道预授权。`,
+    }
+  } catch (cause) {
+    employeeChannelFeedback.value = {
+      kind: 'error',
+      text: cause instanceof Error ? cause.message : '渠道预授权变更失败。',
+    }
+  } finally {
+    employeeChannelPending.value = null
+  }
+}
+
+async function resetEmployee(user: EmployeeRecord) {
+  if (!isAdmin.value || employeeResetPendingId.value !== null) return
+  const temporaryPassword = employeeResetPasswordById.value[user.id] ?? ''
+  employeeResetFeedback.value = null
+  if (temporaryPassword.length < 6 || temporaryPassword.length > 15) {
+    flashEmployeeReset(user.id, 'error', `请先填写 6–15 位新临时密码，再点击「重置密码」。`)
+    employeeResetPasswordById.value = { ...employeeResetPasswordById.value, [user.id]: '' }
+    return
+  }
+  employeeResetPendingId.value = user.id
+  try {
+    const csrf = await inboxApi.getCsrf()
+    await inboxApi.resetEmployeePassword(user.id, temporaryPassword, csrf.csrf_token)
+    employeeResetPasswordById.value = { ...employeeResetPasswordById.value, [user.id]: '' }
+    await loadEmployees()
+    employeeError.value = ''
+    flashEmployeeReset(
+      user.id,
+      'success',
+      `已重置 ${employeeDisplayName(user)}（${user.username}）的登录密码。请把新临时密码单独告知本人，其下次登录必须先修改密码。`,
+    )
+  } catch (cause) {
+    flashEmployeeReset(user.id, 'error', cause instanceof Error ? cause.message : '密码重置失败，请重试。')
+  } finally {
+    employeeResetPendingId.value = null
+  }
+}
+
+async function deactivateEmployee(user: EmployeeRecord) {
+  if (!isAdmin.value) return
+  if (employeeConfirmDeactivateId.value !== user.id) {
+    employeeConfirmDeactivateId.value = user.id
+    return
+  }
+  try {
+    const csrf = await inboxApi.getCsrf()
+    await inboxApi.deactivateEmployee(user.id, csrf.csrf_token)
+    employeeConfirmDeactivateId.value = null
+    if (expandedEmployeeId.value === user.id) expandedEmployeeId.value = null
+    await loadEmployees()
+  } catch (cause) {
+    employeeError.value = cause instanceof Error ? cause.message : '停用员工失败。'
+  }
+}
+
+async function reactivateEmployee(user: EmployeeRecord) {
+  if (!isAdmin.value) return
+  if (employeeConfirmReactivateId.value !== user.id) {
+    employeeConfirmReactivateId.value = user.id
+    return
+  }
+  try {
+    const csrf = await inboxApi.getCsrf()
+    await inboxApi.reactivateEmployee(user.id, csrf.csrf_token)
+    employeeConfirmReactivateId.value = null
+    employeeError.value = ''
+    await loadEmployees()
+  } catch (cause) {
+    employeeError.value = cause instanceof Error ? cause.message : '启用员工失败。'
+  }
+}
+
 function openOperationLogs(inquiryId?: number) {
   navigate({ page: 'logs', id: null, logsInquiry: inquiryId ?? null })
 }
@@ -464,7 +1246,7 @@ async function fetchOperationLogs(inquiryId: number | null) {
 }
 
 function openOperationLogObject(record: OperationLog) {
-  if (record.object_type !== 'message' || record.object_id === null) return
+  if (isAdmin.value || record.object_type !== 'message' || record.object_id === null) return
   navigate({ page: 'message', id: record.object_id })
 }
 
@@ -478,6 +1260,7 @@ function moveMessageToBox(updated: Message) {
 }
 
 async function loadArchive() {
+  if (!canOperateChannels.value && !isAdmin.value) return
   try {
     const [processed, ignored] = await Promise.all([
       inboxApi.getMessages(queryString({ handling_status: 'processed', page: '1', page_size: '50', sort: 'occurred_at', descending: 'true' })),
@@ -584,7 +1367,7 @@ async function restoreArchivedMessage(messageId: number) {
   try {
     const csrf = await inboxApi.getCsrf()
     await inboxApi.restoreMessage(messageId, csrf.csrf_token)
-    actionMessage.value = '消息已恢复；若它属于已处理/已忽略的客户链路，链路也已同步恢复。'
+    actionMessage.value = '消息已恢复到待处理；链路状态仅在当前账号有权查看该链路时同步恢复。'
     // Archive + list refresh happen in the background; the button returns immediately.
     void loadArchive()
     void refreshList('list')
@@ -672,12 +1455,14 @@ function formatTime(value: string | null | undefined) {
   return new Date(value).toLocaleString('zh-CN', { hour12: false })
 }
 
-function accountLabel(accountId: number) {
+function accountLabel(accountId: number | undefined) {
+  if (accountId === undefined) return '账号不可见'
   const account = accountById.value.get(accountId)
   return account?.external_account_id || (account ? `${channelLabel(account.channel_type)} #${account.id}` : `账号 #${accountId}`)
 }
 
-function accountStatus(accountId: number) {
+function accountStatus(accountId: number | undefined) {
+  if (accountId === undefined) return undefined
   return accountById.value.get(accountId)?.status
 }
 
@@ -860,6 +1645,41 @@ function handlingStatusLabel(status: string) {
   return status
 }
 
+/**
+ * 客户双端删除/撤回的协议消息没有正文，不是「待处理」的工作项。
+ * 列表、链路详情、消息详情共用这一个状态口径。
+ */
+function messageStatusLabel(message: { content_state?: string | null; safe_content_status?: string | null; handling_status: string }) {
+  return message.content_state === 'revoked' || message.safe_content_status === 'revoked'
+    ? '已撤回'
+    : handlingStatusLabel(message.handling_status)
+}
+
+/** 中文概述只是辅助信息：正文之后以一行小字补充，不再作为首屏主内容。 */
+function linkedOverviewText(linkedMessage: Inquiry['messages'][number]) {
+  if (linkedMessage.overview_text) return linkedMessage.overview_text
+  if (linkedMessage.overview_status === 'pending') return '正在生成。'
+  if (linkedMessage.overview_status === 'failed') return '生成失败，可在消息收件箱重试。'
+  return '暂无中文概述。'
+}
+
+function adminMessageStatus(linkedMessage: Inquiry['messages'][number]) {
+  if (linkedMessage.safe_content_status === 'revoked' || linkedMessage.overview_status === 'not_applicable_revoked') {
+    return { text: '用户已撤回，无需生成中文概要。', tone: 'neutral' as const }
+  }
+  if (linkedMessage.safe_content_status === 'ready') {
+    if (linkedMessage.overview_status === 'ready') {
+      return { text: '安全正文展示成功 · 中文概要生成成功。', tone: 'success' as const }
+    }
+    if (linkedMessage.overview_status === 'failed') return { text: '安全正文展示成功 · 中文概要生成失败。', tone: 'failure' as const }
+    if (linkedMessage.overview_status === 'pending') return { text: '安全正文展示成功 · 中文概要生成中。', tone: 'neutral' as const }
+    return { text: '安全正文展示成功 · 中文概要尚未生成。', tone: 'neutral' as const }
+  }
+  if (linkedMessage.overview_status === 'failed') return { text: '中文概要生成失败。', tone: 'failure' as const }
+  if (linkedMessage.overview_status === 'pending') return { text: '中文概要生成中。', tone: 'neutral' as const }
+  return { text: '中文概要状态未知。', tone: 'neutral' as const }
+}
+
 function inquiryEventLabel(eventType: string) {
   const labels: Record<string, string> = {
     inquiry_created: '客户链路已创建',
@@ -891,18 +1711,61 @@ async function runRefetchCheck(accountId: number) {
   }
 }
 
+/** 诊断结果的三种语义：可用 / 尚未关联（非故障）/ 需要处理。 */
+function refetchTone(check: RefetchCheck | undefined) {
+  if (!check) return ''
+  if (check.ready || check.severity === 'ok') return 'ok'
+  return check.severity === 'not_ready' ? 'info' : 'warn'
+}
+
+const refetchFailureTitles: Record<string, string> = {
+  credentials_missing: '尚未保存授权凭据',
+  credential_decrypt_failed: '凭据无法解密',
+  oauth_config_missing: 'OAuth 配置不完整',
+  authorization_expired: '授权已失效，需要重新授权',
+  provider_unavailable: 'provider 返回错误',
+  network_unavailable: '服务器暂时无法访问 provider',
+  session_offline: 'WhatsApp 设备尚未关联',
+  bridge_unreachable: 'WhatsApp bridge 不可达',
+  adapter_not_configured: 'WhatsApp bridge 未配置',
+  unsupported_channel: '该渠道不支持实时回源',
+  unknown: '回源链路出现未知错误',
+}
+
+function refetchTitle(check: RefetchCheck | undefined) {
+  if (!check) return ''
+  if (check.ready) return '实时回源链路可用'
+  return refetchFailureTitles[check.failure_kind || 'unknown'] || '实时回源不可用'
+}
+
+/** 只展示定位所需的非敏感信息：失败域名、错误类型与传输层原因。 */
+function refetchMeta(check: RefetchCheck | undefined) {
+  if (!check || check.ready) return ''
+  const parts: string[] = []
+  if (check.network?.host) parts.push(`失败域名 ${check.network.host}`)
+  if (check.network?.label) parts.push(check.network.label)
+  if (check.error_class) parts.push(check.error_class)
+  return parts.join(' · ')
+}
+
 async function logoutSystemAccount() {
   logoutError.value = ''
   try {
     const csrf = await inboxApi.getCsrf()
     await inboxApi.logout(csrf.csrf_token)
-    clearCsrfCache()
-    // Drop the page fragment so the next login starts on the inbox, not the
-    // previously open detail page.
-    window.location.assign(window.location.pathname + window.location.search)
   } catch (cause) {
-    logoutError.value = cause instanceof Error ? cause.message : '退出登录失败，请稍后重试。'
+    // A session the server already rejects is effectively logged out too.
+    if (!(cause instanceof ApiError && [401, 403, 404].includes(cause.status))) {
+      logoutError.value = cause instanceof Error ? cause.message : '退出登录失败，请稍后重试。'
+      return
+    }
   }
+  clearCsrfCache()
+  currentUser.value = null
+  // Assigning a URL that differs only by the fragment is a same-document
+  // navigation: the SPA would stay mounted and never show the login gate.
+  history.replaceState(null, '', window.location.pathname + window.location.search)
+  window.location.reload()
 }
 
 /**
@@ -923,10 +1786,26 @@ async function loadWorkspace(mode: 'full' | 'list' | 'base' = 'list'): Promise<b
     const emptyInquiryPage = { items: [] as Inquiry[], page: inquiryPage.value, page_size: INQUIRY_PAGE_SIZE, has_more: false, total_count: 0 }
     const loadList = mode !== 'base'
     const needAccounts = mode !== 'list' || accounts.value.length === 0
-    const needUser = mode !== 'list' || currentUser.value === null
-    const needTargets = loadList && isInquiryView.value && (mode === 'full' || transferTargets.value.length === 0)
+    if (currentUser.value === null) {
+      currentUser.value = await inboxApi.getCurrentUser()
+      const role = currentUser.value.role
+      const restrictedRole = role === 'sales' || ['engineering', 'procurement', 'production'].includes(role)
+      const allowedView = role === 'admin'
+        ? route.value.view === 'customers'
+        : restrictedRole ? route.value.view === 'customers' : true
+      const initialListMismatch = !isStandalonePage(route.value.page) && route.value.page !== route.value.view
+      const knownRole = ['admin', 'sales', 'engineering', 'procurement', 'production', 'staff', 'operations', 'ops'].includes(role)
+      if (!knownRole || !allowedView || initialListMismatch
+        || (role === 'admin' && !['customers', 'inquiry', 'settings'].includes(route.value.page))
+        || (restrictedRole && !canOperateChannels.value && !['customers', 'inquiry'].includes(route.value.page))
+        || (!canOperateChannels.value && role !== 'admin' && ['settings', 'groupBinding', 'logs', 'message'].includes(route.value.page))) {
+        navigate({ page: 'customers', view: 'customers', id: null, logsInquiry: null }, true)
+        return false
+      }
+    }
+    const needTargets = loadList && isInquiryView.value && (canOperateChannels.value || isAdmin.value) && (mode === 'full' || transferTargets.value.length === 0)
     const [nextChannelAccounts, nextMessages, nextInquiries, nextTargets, nextUser, nextGroupBindings] = await Promise.all([
-      needAccounts ? channelsApi.accounts() : Promise.resolve(accounts.value),
+      needAccounts && (canOperateChannels.value || isAdmin.value) ? channelsApi.accounts() : Promise.resolve(accounts.value),
       loadList && !isInquiryView.value ? inboxApi.getMessages(queryString({
         handling_status: messageHandlingFilter.value,
         assignment_status: workspaceView.value === 'customerMessages' ? 'assigned' : messageAssignmentFilter.value,
@@ -936,7 +1815,7 @@ async function loadWorkspace(mode: 'full' | 'list' | 'base' = 'list'): Promise<b
         page: String(messagePage.value), page_size: '20', sort: 'occurred_at', descending: 'true',
       })) : Promise.resolve(emptyMessagePage),
       loadList && isInquiryView.value ? inboxApi.getInquiries(queryString({
-        status: workspaceView.value === 'customers' ? 'assigned' : workspaceView.value === 'review' ? 'new' : '',
+        status: isAdmin.value ? '' : workspaceView.value === 'customers' ? 'assigned' : workspaceView.value === 'review' ? 'new' : '',
         handling_status: inquiryHandlingFilter.value,
         page: String(inquiryPage.value), page_size: String(INQUIRY_PAGE_SIZE), sort: 'updated_at', descending: 'true',
       })) : Promise.resolve(emptyInquiryPage),
@@ -944,10 +1823,10 @@ async function loadWorkspace(mode: 'full' | 'list' | 'base' = 'list'): Promise<b
         if (cause instanceof ApiError && cause.status === 403) return [] as TransferTarget[]
         throw cause
       }) : Promise.resolve(transferTargets.value),
-      needUser ? inboxApi.getCurrentUser() : Promise.resolve(currentUser.value!),
+      Promise.resolve(currentUser.value!),
       // Small, cached, fetched in parallel: no extra serial round trip on first paint.
       // The standalone binding page loads bindings + candidates together itself.
-      groupBindingsLoaded || route.value.page === 'groupBinding' || currentUser.value?.role === 'sales'
+      groupBindingsLoaded || route.value.page === 'groupBinding' || !canOperateChannels.value || isAdmin.value
         ? Promise.resolve(null)
         : inboxApi.getWhatsappGroupBindings().catch(() => [] as WhatsappGroupBinding[]),
     ])
@@ -1125,6 +2004,7 @@ async function removeGroupBinding() {
 
 /** A directly opened detail URL never loaded the list, so targets may be empty. */
 async function loadTransferTargets() {
+  if (!canOperateChannels.value && !isAdmin.value) return
   try {
     transferTargets.value = await inboxApi.getTransferTargets()
   } catch (cause) {
@@ -1136,7 +2016,7 @@ async function loadInquiryDetail(id: number, token: number) {
   try {
     const [inquiry] = await Promise.all([
       inboxApi.getInquiry(id),
-      transferTargets.value.length === 0 ? loadTransferTargets() : Promise.resolve(),
+      (canOperateChannels.value || isAdmin.value) && transferTargets.value.length === 0 ? loadTransferTargets() : Promise.resolve(),
     ])
     if (token !== applyToken) return
     inquiryDetail.value = inquiry
@@ -1147,6 +2027,7 @@ async function loadInquiryDetail(id: number, token: number) {
 }
 
 async function loadMessageDetail(id: number, token: number) {
+  if ((!canOperateChannels.value && !isAdmin.value) || (isAdmin.value && !['messages', 'message'].includes(route.value.page))) return
   messageDetailLoading.value = true
   try {
     const message = await inboxApi.getMessage(id)
@@ -1162,7 +2043,7 @@ async function loadMessageDetail(id: number, token: number) {
 
 /** Full original text is fetched only when the operator asks for it. */
 async function loadMessageDetailContent() {
-  if (!messageDetail.value) return
+  if (!messageDetail.value || (!canOperateChannels.value && !isAdmin.value)) return
   const id = messageDetail.value.id
   messageDetailLoading.value = true
   try {
@@ -1221,6 +2102,7 @@ function onInquiryFilterChange() {
 }
 
 function toggleBox(box: 'processed' | 'ignored') {
+  if (!canOperateChannels.value && !isAdmin.value) return
   const next = route.value.box === box ? '' : box
   navigate({ box: next }, true)
   if (next) void loadArchive()
@@ -1243,8 +2125,8 @@ async function applyRoute(r: AppRoute, info: RouteChange) {
   messageAssignmentFilter.value = r.ma
   messageChannelAccountFilter.value = r.mc
   inquiryHandlingFilter.value = r.ih
-  processedBoxOpen.value = r.box === 'processed'
-  archiveOpen.value = r.box === 'ignored'
+  processedBoxOpen.value = (canOperateChannels.value || isAdmin.value) && r.box === 'processed'
+  archiveOpen.value = (canOperateChannels.value || isAdmin.value) && r.box === 'ignored'
   profileOpen.value = r.page === 'settings'
   operationLogOpen.value = r.page === 'logs'
   operationLogInquiryId.value = r.logsInquiry
@@ -1261,6 +2143,37 @@ async function applyRoute(r: AppRoute, info: RouteChange) {
   actionMessage.value = ''
 
   const standalone = isStandalonePage(r.page)
+  const role = currentUser.value?.role ?? ''
+  const restrictedRole = role === 'sales' || ['engineering', 'procurement', 'production'].includes(role)
+  const knownRole = ['admin', 'sales', 'engineering', 'procurement', 'production', 'staff', 'operations', 'ops'].includes(role)
+  const allowedView = role === 'admin'
+    ? r.view === 'customers'
+    : restrictedRole ? r.view === 'customers' : true
+  const listPageMismatch = !standalone && r.page !== r.view
+  if (currentUser.value && (!knownRole || !allowedView || listPageMismatch
+    || (restrictedRole && !canOperateChannels.value && !['customers', 'inquiry'].includes(r.page))
+    || (isAdmin.value && !['customers', 'inquiry', 'settings'].includes(r.page))
+    || (!canOperateChannels.value && !isAdmin.value && ['settings', 'groupBinding', 'logs', 'message'].includes(r.page)))) {
+    navigate({ page: 'customers', view: 'customers', id: null, logsInquiry: null, box: '' }, true)
+    return
+  }
+  if (!currentUser.value) {
+    const ok = await loadWorkspace('base')
+    if (token !== applyToken || !ok || !currentUser.value) return
+    const bootRole = currentUser.value.role
+    const bootRestricted = bootRole === 'sales' || ['engineering', 'procurement', 'production'].includes(bootRole)
+    const bootKnown = ['admin', 'sales', 'engineering', 'procurement', 'production', 'staff', 'operations', 'ops'].includes(bootRole)
+    const bootAllowedView = bootRole === 'admin'
+      ? ['messages', 'customers'].includes(r.view)
+      : bootRestricted ? r.view === 'customers' : true
+    if (!bootKnown || !bootAllowedView
+      || (bootRestricted && !canOperateChannels.value && !['customers', 'inquiry'].includes(r.page))
+      || (isAdmin.value && !['customers', 'inquiry', 'messages', 'message', 'settings'].includes(r.page))
+      || (!canOperateChannels.value && !isAdmin.value && ['settings', 'groupBinding', 'logs', 'message'].includes(r.page))) {
+      navigate({ page: 'customers', view: 'customers', id: null, logsInquiry: null, box: '' }, true)
+      return
+    }
+  }
   const signature = listSignature(r)
   if (!standalone) {
     if (info.initial || signature !== loadedListSignature) {
@@ -1286,7 +2199,7 @@ async function applyRoute(r: AppRoute, info: RouteChange) {
   else if (r.page === 'groupBinding') await loadGroupBindingPage(r.groupJid, token)
   else if (r.page === 'settings' && accounts.value.length === 0) await loadWorkspace('base')
 
-  if (info.initial) window.setTimeout(() => void refreshAnalysisCounts(), 1200)
+  if (info.initial && !isAdmin.value && canOperateChannels.value) window.setTimeout(() => void refreshAnalysisCounts(), 1200)
 }
 
 function authorizeFakeChannel(channelType: FakeChannel['channel_type']) {
@@ -1302,7 +2215,7 @@ function revokeFakeChannel(channelType: FakeChannel['channel_type']) {
 }
 
 async function startWhatsAppPairing() {
-  let account = accounts.value.find((item) => item.channel_type === 'whatsapp')
+  let account = channelAccount('whatsapp')
   whatsappError.value = ''
   whatsappMessage.value = ''
   whatsappQr.value = ''
@@ -1373,20 +2286,23 @@ async function startWhatsAppPairing() {
 }
 
 async function startGmailAuthorization() {
-  let account = accounts.value.find((item) => item.channel_type === 'gmail')
+  let account = channelAccount('gmail')
   gmailError.value = ''
   gmailMessage.value = ''
   try {
     if (!account || account.status === 'revoked') {
       const csrf = await inboxApi.getCsrf()
-      await channelsApi.createGmailAccount(csrf.csrf_token)
-      if (!await refreshList('full')) {
-        gmailError.value = 'Gmail 账号已初始化，但工作台刷新失败，请刷新后重试。'
-        return
-      }
-      account = accounts.value.find((item) => item.channel_type === 'gmail')
-      if (!account) throw new Error('Gmail 账号初始化后不可见，请检查授权范围。')
+      const created = await channelsApi.createGmailAccount(csrf.csrf_token)
+      // The create response already contains the account id. Relying on a full
+      // workspace refetch here used to abort authorization whenever any
+      // unrelated list request failed, even though the account existed.
+      accounts.value = [
+        ...accounts.value.filter((item) => item.id !== created.id && item.channel_type !== 'gmail'),
+        created,
+      ]
+      account = created
     }
+    if (!account) throw new Error('Gmail 账号初始化后不可见，请检查授权范围。')
     const csrf = await inboxApi.getCsrf()
     const result = await channelsApi.startGmailAuthorization(account.id, csrf.csrf_token)
     window.location.assign(result.authorization_url)
@@ -1396,6 +2312,7 @@ async function startGmailAuthorization() {
 }
 
 function readGmailCallbackState() {
+  if (!canOperateChannels.value && !isAdmin.value) return
   const params = new URLSearchParams(window.location.search)
   const gmail = params.get('gmail')
   if (gmail === 'connected') gmailMessage.value = 'Gmail 授权完成。'
@@ -1406,7 +2323,7 @@ function readGmailCallbackState() {
 }
 
 async function startOutlookAuthorization() {
-  let account = accounts.value.find((item) => item.channel_type === 'outlook')
+  let account = channelAccount('outlook')
   outlookAuthorizationError.value = ''
   outlookAuthorizationMessage.value = ''
   if (account && !needsChannelAuthorization(account.status)) {
@@ -1418,9 +2335,12 @@ async function startOutlookAuthorization() {
   try {
     if (!account) {
       const csrf = await inboxApi.getCsrf()
-      await channelsApi.createOutlookAccount(csrf.csrf_token)
-      await refreshList('full')
-      account = accounts.value.find((item) => item.channel_type === 'outlook')
+      const created = await channelsApi.createOutlookAccount(csrf.csrf_token)
+      accounts.value = [
+        ...accounts.value.filter((item) => item.id !== created.id && item.channel_type !== 'outlook'),
+        created,
+      ]
+      account = created
     }
     if (!account) throw new Error('Outlook 账号初始化失败。')
     const csrf = await inboxApi.getCsrf()
@@ -1551,7 +2471,7 @@ function archiveGroupMessages(inquiryId: number) {
 
 async function updateMessageHandling(message: Message, action: 'processed' | 'ignored') {
   // 已归链消息属于询盘会话：按业务规则必须通过询盘统一处理，单独改消息状态会被后端拒绝。
-  if (message.inquiry_id !== null) {
+  if (message.inquiry_id !== null && !isAdmin.value) {
     const group = groupedMessageItems.value.find((item) => item.inquiryId === message.inquiry_id)
     const relatedCount = group?.messages.length ?? 1
     handlingSubmitting.value = true
@@ -1634,7 +2554,7 @@ async function transferSelectedInquiry() {
   try {
     const csrf = await inboxApi.getCsrf()
     await inboxApi.transferInquiry(selectedInquiry.value.id, selectedSalesUserId.value, selectedBusinessType.value, csrf.csrf_token)
-    actionMessage.value = '客户链路已分配。'
+    actionMessage.value = isAdmin.value ? '客户链路已改派。' : '客户链路已分配。'
     selectedSalesUserId.value = null
     selectedBusinessType.value = null
     if (route.value.page === 'inquiry' && route.value.id !== null) {
@@ -1681,26 +2601,34 @@ onMounted(() => {
         <button class="link-button logout-link" type="button" @click="logoutSystemAccount">
           退出登录
         </button>
-        <button class="secondary" type="button" @click="profileOpen ? closeStandalonePage() : navigate({ page: 'settings' })">
-          {{ profileOpen ? '返回工作台' : '我的 / 接入账号' }}
+        <button v-if="isAdmin" class="secondary" type="button" @click="employeeAdminOpen = true; void loadEmployees()">员工管理</button>
+        <button v-if="canOperateChannels || isAdmin" class="secondary" type="button" @click="profileOpen ? closeStandalonePage() : navigate({ page: 'settings' })">
+          {{ profileOpen ? '返回工作台' : isAdmin ? '渠道接入（代连接）' : '我的 / 接入账号' }}
         </button>
         <button class="secondary" type="button" @click="refreshList('full')">刷新</button>
       </div>
     </header>
     <p v-if="logoutError" class="action-error">{{ logoutError }}</p>
 
-    <section v-if="profileOpen" class="profile-view" data-ui="settings">
+    <section v-if="profileOpen && (canOperateChannels || isAdmin)" class="profile-view" data-ui="settings">
       <div class="profile-heading">
         <div>
           <p class="eyebrow">我的 / 账号管理</p>
-          <h2>个人渠道连接</h2>
-          <p class="profile-lede">管理当前登录用户本人的授权和连接状态。所有 provider 调用都经过后端，页面只展示非敏感状态。</p>
+          <h2>{{ isAdmin ? '渠道接入（管理员代连接）' : '个人渠道连接' }}</h2>
+          <p class="profile-lede">{{ isAdmin ? '管理员可代为完成渠道创建、OAuth 授权与扫码配对，但看不到也不处理消息。连接完成后请到「员工管理 → 渠道账号与历史访问」把账号转交给运营。' : '管理当前登录用户本人的授权和连接状态。所有 provider 调用都经过后端，页面只展示非敏感状态。' }}</p>
         </div>
         <button class="link-button back-link" type="button" @click="closeStandalonePage">← 返回上一页</button>
       </div>
 
       <div class="settings-list">
-        <section class="profile-operations">
+        <section v-if="isAdmin" class="profile-operations admin-connect-note">
+          <div>
+            <h3>代连接后请转交给运营</h3>
+            <p>这里只做接入，不展示消息栏。授权/配对完成后，去员工管理把该渠道账号转给在岗运营，运营刷新页面即可看到历史消息并继续处理。</p>
+          </div>
+          <button class="secondary" type="button" @click="openEmployeeAdminFromChannels">去转交账号</button>
+        </section>
+        <section v-else class="profile-operations">
           <div><h3>账号操作记录</h3><p>查看当前账号执行的操作及结果。</p></div>
           <button class="secondary" type="button" @click="openOperationLogs()">查看操作记录</button>
         </section>
@@ -1714,7 +2642,7 @@ onMounted(() => {
             </div>
             <p>{{ channelDetails[channelType].provider }}</p>
             <p>{{ channelDetails[channelType].description }}</p>
-            <p class="next-step">下一步：{{ channelAccount(channelType)?.status === 'verified_inbound' ? '继续在收件箱处理已授权范围内的消息。' : channelDetails[channelType].next }}</p>
+            <p class="next-step">下一步：{{ isAdmin ? '连接完成后到「员工管理 → 渠道账号与历史访问」把账号转交给运营。' : channelAccount(channelType)?.status === 'verified_inbound' ? '继续在收件箱处理已授权范围内的消息。' : channelDetails[channelType].next }}</p>
           </div>
           <div class="setting-panel">
             <div class="setting-facts">
@@ -1733,7 +2661,7 @@ onMounted(() => {
               </button>
               <span v-else class="connection-ready">已连接</span>
               <button
-                v-if="channelType === 'outlook' && channelAccount(channelType)"
+                v-if="channelType === 'outlook' && !isAdmin && channelAccount(channelType)"
                 class="secondary"
                 type="button"
                 :disabled="outlookReading"
@@ -1762,10 +2690,19 @@ onMounted(() => {
             <div
               v-if="refetchChecks[channelAccount(channelType)?.id || 0]"
               class="refetch-check-result"
-              :class="refetchChecks[channelAccount(channelType)?.id || 0]?.ready ? 'ok' : 'warn'"
+              :class="refetchTone(refetchChecks[channelAccount(channelType)?.id || 0])"
             >
-              <strong>{{ refetchChecks[channelAccount(channelType)?.id || 0]?.ready ? '实时回源链路可用' : '实时回源不可用' }}</strong>
+              <strong>{{ refetchTitle(refetchChecks[channelAccount(channelType)?.id || 0]) }}</strong>
               <p>{{ refetchChecks[channelAccount(channelType)?.id || 0]?.recommended_action }}</p>
+              <p v-if="refetchMeta(refetchChecks[channelAccount(channelType)?.id || 0])" class="refetch-meta">
+                {{ refetchMeta(refetchChecks[channelAccount(channelType)?.id || 0]) }}
+              </p>
+              <p
+                v-if="!refetchChecks[channelAccount(channelType)?.id || 0]?.ready && refetchChecks[channelAccount(channelType)?.id || 0]?.history_available"
+                class="refetch-scope"
+              >
+                已入库的历史消息仍可正常查看与处理；此提示只影响实时回源校验，不影响询盘处理。
+              </p>
               <ul>
                 <li v-for="step in refetchChecks[channelAccount(channelType)?.id || 0]?.steps" :key="step.name">
                   {{ step.ok ? '✓' : '✗' }} {{ step.name }}：{{ step.detail }}
@@ -1813,6 +2750,430 @@ onMounted(() => {
       <p class="security-note">浏览器不保存 token、refresh token、client secret、OAuth code、QR 或 auth state；OAuth 只通过后端返回的官方授权地址启动。</p>
     </section>
 
+    <section v-else-if="employeeAdminOpen && isAdmin" class="standalone-page employee-admin-page" role="region" aria-labelledby="employee-admin-title">
+      <header class="ea-hero">
+        <div class="ea-hero-text">
+          <p class="eyebrow">管理员 · 访问控制</p>
+          <h2 id="employee-admin-title">员工与授权</h2>
+          <p class="ea-hero-lede">集中查看全部员工的岗位、部门与授权状态。新建账号后，员工首次登录必须先修改临时密码。</p>
+        </div>
+        <div class="ea-hero-actions">
+          <button class="secondary" type="button" @click="loadEmployees">刷新列表</button>
+          <button class="secondary" type="button" @click="employeeAdminOpen = false">关闭</button>
+        </div>
+      </header>
+
+      <p v-if="employeeError" class="action-error ea-alert" role="alert">{{ employeeError }}</p>
+
+      <div class="ea-stats" aria-label="员工统计">
+        <div class="ea-stat"><span>员工总数</span><strong>{{ employeeStats.total }}</strong><small>含已停用账号</small></div>
+        <div class="ea-stat"><span>有效账号</span><strong>{{ employeeStats.active }}</strong><small>当前可登录</small></div>
+        <div class="ea-stat"><span>待首次改密</span><strong>{{ employeeStats.pendingPassword }}</strong><small>尚未完成激活</small></div>
+        <div class="ea-stat"><span>已停用</span><strong>{{ employeeStats.inactive }}</strong><small>不可登录</small></div>
+      </div>
+
+      <section class="ea-card" aria-labelledby="ea-create-title">
+        <header class="ea-card-head">
+          <div><h3 id="ea-create-title">新建员工</h3><p>填写账号基本信息；创建成功后列表会自动刷新。</p></div>
+          <span class="ea-step">01</span>
+        </header>
+        <form ref="employeeCreateFormEl" class="ea-form" novalidate @submit.prevent="createEmployee">
+          <div v-if="employeeCreateFeedback" class="ea-feedback" :class="employeeCreateFeedback.kind" :role="employeeCreateFeedback.kind === 'error' ? 'alert' : 'status'" aria-live="polite">
+            <span class="ea-feedback-icon" aria-hidden="true">{{ employeeCreateFeedback.kind === 'success' ? '✓' : '!' }}</span>
+            <div class="ea-feedback-body">
+              <strong>{{ employeeCreateFeedback.kind === 'success' ? '创建成功' : '暂时无法创建员工' }}</strong>
+              <p>{{ employeeCreateFeedback.text }}</p>
+            </div>
+            <button v-if="employeeCreateFeedback.kind === 'success'" class="link-button ea-feedback-link" type="button" @click="scrollToEmployeeTable">查看员工 ↓</button>
+            <button class="ea-feedback-close" type="button" aria-label="关闭提示" @click="employeeCreateFeedback = null">×</button>
+          </div>
+          <label class="ea-field">
+            <span class="ea-label">员工姓名 <em>必填</em></span>
+            <input v-model="employeeForm.full_name" name="full_name" required maxlength="64" autocomplete="off" placeholder="例如：张三" />
+            <small class="ea-hint">显示在员工列表与询盘负责人处，便于识别真人</small>
+          </label>
+          <label class="ea-field">
+            <span class="ea-label">用户名 <em>必填</em></span>
+            <input v-model="employeeForm.username" name="username" required maxlength="64" autocomplete="off" placeholder="例如：zhang.san" />
+            <small class="ea-hint">员工登录使用的唯一账号名</small>
+          </label>
+          <label class="ea-field">
+            <span class="ea-label">岗位 <em>必填</em></span>
+            <select v-model="employeeForm.role">
+              <option v-for="option in employeeCreateRoleOptions" :key="option.value" :value="option.value">{{ option.label }}</option>
+            </select>
+            <small class="ea-hint">决定该员工可访问的业务范围</small>
+          </label>
+          <label class="ea-field ea-manager-overlay-field">
+            <span class="ea-label">经理叠加权限</span>
+            <span class="ea-inline-checkbox"><input v-model="employeeForm.manager_overlay_enabled" type="checkbox" /> 启用经理叠加权限</span>
+            <small class="ea-hint">基础岗位的数据范围不变；具体操作仍需逐人授予。</small>
+          </label>
+          <label class="ea-field">
+            <span class="ea-label">所属部门 <em>必填</em></span>
+            <input v-model="employeeForm.department" name="department" list="ea-department-options" maxlength="64" required placeholder="例如：工程部" />
+            <small class="ea-hint">所有岗位账号都必须关联所属部门。</small>
+          </label>
+          <label class="ea-field">
+            <span class="ea-label">临时密码 <em>必填</em></span>
+            <input v-model="employeeForm.temporary_password" name="temporary_password" required minlength="6" maxlength="15" type="password" autocomplete="new-password" placeholder="6–15 位" />
+            <small class="ea-hint">请通过安全渠道单独告知员工</small>
+          </label>
+          <div class="ea-form-submit">
+            <button class="primary" type="submit" :disabled="employeeCreating">{{ employeeCreating ? '创建中…' : '创建员工' }}</button>
+            <span class="ea-hint">{{ employeeCreating ? '正在提交，请勿重复点击' : '创建后员工须在首次登录时改密' }}</span>
+          </div>
+        </form>
+        <datalist id="ea-department-options"><option v-for="department in departmentSuggestions" :key="department" :value="department" /></datalist>
+      </section>
+
+      <section ref="employeeTableCardEl" class="ea-card ea-table-card" aria-labelledby="ea-table-title">
+        <header class="ea-card-head">
+          <div>
+            <h3 id="ea-table-title">有效员工</h3>
+            <p>有效员工 {{ activeEmployeeCount }} 人<span v-if="inactiveEmployees.length">，另有 {{ inactiveEmployees.length }} 个已停用账号归档在下方</span>（共 {{ employeeRecords.length }} 人）。<span v-if="employeeFilterActive">当前筛选命中 {{ activeEmployees.length }} 人。</span>点击「管理授权」展开该员工的详细设置。</p>
+          </div>
+          <span class="ea-step">02</span>
+        </header>
+        <div class="ea-toolbar">
+          <label class="ea-field ea-search">
+            <span class="ea-label">搜索员工</span>
+            <input v-model="employeeSearch" type="search" placeholder="姓名、用户名或部门关键字" />
+          </label>
+          <label class="ea-field ea-toolbar-select">
+            <span class="ea-label">岗位</span>
+            <select v-model="employeeRoleFilter">
+              <option value="all">全部岗位</option>
+              <option v-for="option in employeeRoleOptions" :key="option.value" :value="option.value">{{ option.label }}</option>
+            </select>
+          </label>
+          <label class="ea-field ea-toolbar-select">
+            <span class="ea-label">状态</span>
+            <select v-model="employeeStatusFilter">
+              <option value="all">全部状态</option>
+              <option value="active">有效</option>
+              <option value="pending">待首次改密</option>
+            </select>
+          </label>
+          <span class="ea-hint ea-toolbar-hint">已停用账号不在此表，统一在下方归档区</span>
+          <button class="link-button ea-clear" type="button" @click="clearEmployeeFilters">清除筛选</button>
+          <span class="ea-scroll-hint">← 左右滑动查看完整表格 →</span>
+        </div>
+        <div class="ea-table-wrap">
+          <table class="ea-table">
+            <thead>
+              <tr>
+                <th>员工</th><th>岗位</th><th>所属部门</th><th>账号状态</th><th>部门授权</th><th>渠道预授权</th><th>经理叠加</th><th class="ea-th-action">操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              <template v-for="employee in activeEmployees" :key="employee.id">
+                <tr :class="{ 'is-selected': expandedEmployeeId === employee.id }">
+                  <td>
+                    <div class="ea-person">
+                      <span class="ea-avatar">{{ employee.username.slice(0, 1).toUpperCase() }}</span>
+                      <span class="ea-person-name">
+                      <strong>{{ employeeDisplayName(employee) }}</strong>
+                      <small>{{ employee.username }} · 员工编号 #{{ employee.id }}</small>
+                    </span>
+                    </div>
+                  </td>
+                  <td><span class="ea-role">{{ employeeRoleLabel(employee.role) }}</span></td>
+                  <td>{{ employee.department || '—' }}</td>
+                  <td>
+                    <div class="ea-pills">
+                      <span class="ea-pill is-on">有效</span>
+                      <span v-if="employee.must_change_password" class="ea-pill is-warn">待改密</span>
+                    </div>
+                  </td>
+                  <td>
+                    <div v-if="employee.department_grants.length" class="ea-chips"><span v-for="grant in employee.department_grants" :key="grant" class="ea-chip">{{ grant }}</span></div>
+                    <span v-else class="ea-muted">无</span>
+                  </td>
+                  <td>
+                    <div v-if="employee.channel_preauthorizations.length" class="ea-chips"><span v-for="grant in employee.channel_preauthorizations" :key="grant" class="ea-chip is-blue">{{ grant }}</span></div>
+                    <span v-else class="ea-muted">无</span>
+                  </td>
+                  <td><span class="ea-pill" :class="employee.manager_overlay_enabled ? 'is-warn' : 'is-off'">{{ employee.manager_overlay_enabled ? `叠加 · ${employee.manager_grants.length} 项` : '未启用' }}</span></td>
+                  <td class="ea-th-action">
+                    <button class="secondary ea-manage" type="button" @click="toggleEmployeeDetail(employee.id)">{{ expandedEmployeeId === employee.id ? '收起' : '管理授权' }}</button>
+                  </td>
+                </tr>
+                <tr v-if="expandedEmployeeId === employee.id && employee.is_active" class="ea-detail-row">
+                  <td colspan="8">
+                    <div class="ea-detail">
+                      <header class="ea-detail-head">
+                        <div>
+                          <h4>{{ employeeDisplayName(employee) }} · 授权设置</h4>
+                          <p class="ea-detail-account">
+                            <span>登录账号 <code>{{ employee.username }}</code></span>
+                            <span>员工编号 #{{ employee.id }}</span>
+                            <span v-if="employee.full_name && employee.full_name !== employee.username">姓名 {{ employee.full_name }}</span>
+                          </p>
+                          <p>所有修改即时生效；「所属部门」是账号归属，「部门授权」是额外可访问的部门范围。</p>
+                        </div>
+                        <button class="link-button" type="button" @click="expandedEmployeeId = null">收起设置</button>
+                      </header>
+                      <p v-if="employeeError" class="action-error ea-alert" role="alert">{{ employeeError }}</p>
+                      <div class="ea-detail-grid">
+                        <section class="ea-detail-block">
+                          <h5>基本信息</h5>
+                          <div class="ea-detail-fields">
+                            <label class="ea-field">
+                              <span class="ea-label">员工姓名</span>
+                              <input :value="employee.full_name || employee.username" maxlength="64" placeholder="例如：张三" @change="changeEmployeeFullName(employee, $event)" @keyup.enter="($event.target as HTMLInputElement).blur()" />
+                              <small class="ea-hint">显示在员工列表；改完失焦即保存，可随时纠正错别字</small>
+                            </label>
+                            <label class="ea-field">
+                              <span class="ea-label">岗位</span>
+                              <select :value="employee.role" :disabled="!employee.is_active" @change="changeEmployeeRole(employee, $event)">
+                                <option v-for="option in employeeRoleOptions" :key="option.value" :value="option.value">{{ option.label }}</option>
+                                <option v-if="employee.role === 'manager'" value="operations">运营</option>
+                              </select>
+                            </label>
+                            <label class="ea-field">
+                              <span class="ea-label">所属部门</span>
+                              <input :value="employee.department || ''" list="ea-department-options" required placeholder="例如：工程部" @change="changeEmployeeDepartment(employee, $event)" />
+                            </label>
+                          </div>
+                          <p class="ea-block-note">所有岗位均须绑定部门；调岗或改部门会清除现有授权并使旧会话失效。</p>
+                        </section>
+
+                        <section class="ea-detail-block">
+                          <h5>部门授权</h5>
+                          <p class="ea-block-note">允许该员工访问<strong>其他部门</strong>的内部记录。填写已存在的部门名称，例如「工程部」；留空不会授予任何权限。</p>
+                          <div v-if="employee.department_grants.length" class="ea-chips ea-chips-removable">
+                            <button v-for="grant in employee.department_grants" :key="grant" class="ea-chip is-removable" type="button" :title="`撤销 ${grant} 授权`" @click="revokeEmployeeDepartment(employee.id, grant)">{{ grant }} <span aria-hidden="true">×</span></button>
+                          </div>
+                          <p v-else class="ea-muted">当前没有额外部门授权。</p>
+                          <div class="ea-inline-form">
+                            <label class="ea-field">
+                              <span class="ea-label">新增部门授权</span>
+                              <input :value="employeeGrantDepartmentById[employee.id] || ''" list="ea-department-options" placeholder="输入或选择部门名称，例如：工程部" @input="setEmployeeGrantDepartment(employee.id, $event)" @keyup.enter.prevent="grantEmployeeDepartment(employee.id)" />
+                              <small class="ea-hint">可从下拉中选择已有部门，也可输入新部门名称</small>
+                            </label>
+                            <button class="secondary" type="button" :disabled="!(employeeGrantDepartmentById[employee.id] || '').trim()" @click="grantEmployeeDepartment(employee.id)">授予部门</button>
+                          </div>
+                          <label class="ea-field ea-manager-overlay-toggle">
+                            <span class="ea-inline-checkbox"><input type="checkbox" :checked="employee.manager_overlay_enabled" :disabled="!employee.is_active" @change="changeEmployeeManagerOverlay(employee, $event)" /> 启用经理叠加权限</span>
+                            <small class="ea-hint">权限不会仅因岗位名称自动获得；下方按目标员工逐项授予。</small>
+                          </label>
+                          <div v-if="employee.manager_overlay_enabled" class="ea-manager-grants">
+                            <h5>经理逐人授权</h5>
+                            <p class="ea-block-note">仅对同部门员工授予下列明确操作；基础岗位的原有数据范围不变。</p>
+                            <div v-if="employee.manager_grants.length" class="ea-chips ea-chips-removable">
+                              <button v-for="grant in employee.manager_grants" :key="`${grant.target_user_id}:${grant.permission}`" class="ea-chip is-removable" type="button" :title="`撤销员工 #${grant.target_user_id} 的 ${grant.permission} 授权`" @click="revokeManagerPermission(employee, grant)">#{{ grant.target_user_id }} · {{ managerPermissionOptions.find((item) => item.value === grant.permission)?.label || grant.permission }} <span aria-hidden="true">×</span></button>
+                            </div>
+                            <p v-else class="ea-muted">尚无逐人授权。</p>
+                            <div class="ea-inline-form">
+                              <label class="ea-field">
+                                <span class="ea-label">目标员工</span>
+                                <select v-model="employeeManagerTargetById[employee.id]">
+                                  <option value="">请选择同部门员工</option>
+                                  <option v-for="target in managerEligibleTargets(employee)" :key="target.id" :value="target.id">{{ employeeDisplayName(target) }}（#{{ target.id }}）</option>
+                                </select>
+                              </label>
+                              <label class="ea-field">
+                                <span class="ea-label">允许操作</span>
+                                <select v-model="employeeManagerPermissionById[employee.id]">
+                                  <option value="">请选择明确权限</option>
+                                  <option v-for="permission in managerPermissionOptions" :key="permission.value" :value="permission.value">{{ permission.label }}</option>
+                                </select>
+                              </label>
+                              <button class="secondary" type="button" :disabled="!employeeManagerTargetById[employee.id] || !employeeManagerPermissionById[employee.id]" @click="grantManagerPermission(employee)">授予</button>
+                            </div>
+                          </div>
+                        </section>
+
+                        <section v-if="isOperatingRole(employee.role)" class="ea-detail-block">
+                          <h5>渠道预授权</h5>
+                          <p class="ea-block-note">控制该员工能否<strong>新建</strong>对应类型的渠道账号。已接入的账号和历史消息不受影响。</p>
+                          <p class="ea-block-note">若该员工提示「历史访问已撤销，需管理员重新授权」，请到下方<strong>渠道账号与历史访问</strong>恢复；这里的预授权无法解除该标记。</p>
+                          <p v-if="employeeChannelFeedback" class="ea-channel-feedback" :class="employeeChannelFeedback.kind" :role="employeeChannelFeedback.kind === 'error' ? 'alert' : 'status'" aria-live="polite">{{ employeeChannelFeedback.text }}</p>
+                          <div class="ea-channel-toggles">
+                            <div v-for="channel in employeeChannelOptions" :key="channel.key" class="ea-toggle" :class="{ 'is-granted': employee.channel_preauthorizations.includes(channel.key) }">
+                              <span class="ea-toggle-dot" aria-hidden="true"></span>
+                              <span class="ea-toggle-text"><strong>{{ channel.label }}</strong><small>{{ channel.hint }}</small></span>
+                              <span class="ea-toggle-state">{{ employee.channel_preauthorizations.includes(channel.key) ? '已授权' : '未授权' }}</span>
+                              <button v-if="employee.channel_preauthorizations.includes(channel.key)" class="ea-channel-action ea-channel-revoke" type="button" :disabled="employeeChannelPending !== null" @click="changeEmployeeChannel(employee, channel.key, false)">{{ employeeChannelPending === `${employee.id}:${channel.key}` ? '处理中…' : '撤销' }}</button>
+                              <button v-else class="ea-channel-action" type="button" :disabled="employeeChannelPending !== null" @click="changeEmployeeChannel(employee, channel.key, true)">{{ employeeChannelPending === `${employee.id}:${channel.key}` ? '处理中…' : '授权' }}</button>
+                            </div>
+                          </div>
+                        </section>
+
+                        <section class="ea-detail-block">
+                          <h5>账号操作</h5>
+                          <p class="ea-block-note">重置密码后，员工下次登录必须修改新密码；停用会立即使该账号无法登录并清除授权。</p>
+                          <div class="ea-inline-form">
+                            <label class="ea-field">
+                              <span class="ea-label">新临时密码</span>
+                              <input :value="employeeResetPasswordById[employee.id] || ''" type="password" autocomplete="new-password" minlength="6" maxlength="15" placeholder="6–15 位" @input="setEmployeeResetPassword(employee.id, $event)" @keyup.enter="resetEmployee(employee)" />
+                            </label>
+                            <button class="secondary" type="button" :disabled="!employee.is_active || employeeResetPendingId === employee.id" @click="resetEmployee(employee)">
+                              {{ employeeResetPendingId === employee.id ? '重置中…' : '重置密码' }}
+                            </button>
+                          </div>
+                          <p
+                            v-if="employeeResetFeedback && employeeResetFeedback.userId === employee.id"
+                            class="ea-inline-feedback"
+                            :class="employeeResetFeedback.kind"
+                            :role="employeeResetFeedback.kind === 'error' ? 'alert' : 'status'"
+                            aria-live="polite"
+                          >
+                            <span class="ea-inline-feedback-icon" aria-hidden="true">{{ employeeResetFeedback.kind === 'success' ? '✓' : '!' }}</span>
+                            <span>{{ employeeResetFeedback.text }}</span>
+                          </p>
+                          <div class="ea-danger-row">
+                            <template v-if="employeeConfirmDeactivateId === employee.id">
+                              <span class="ea-confirm-text">确认停用 {{ employeeDisplayName(employee) }}（{{ employee.username }}）？</span>
+                              <button class="ea-danger" type="button" @click="deactivateEmployee(employee)">确认停用</button>
+                              <button class="link-button" type="button" @click="employeeConfirmDeactivateId = null">取消</button>
+                            </template>
+                            <button v-else class="link-button ea-danger-link" type="button" :disabled="!employee.is_active" @click="deactivateEmployee(employee)">停用该账号</button>
+                          </div>
+                        </section>
+                      </div>
+                    </div>
+                  </td>
+                </tr>
+              </template>
+              <tr v-if="activeEmployees.length === 0">
+                <td colspan="8" class="ea-empty">
+                  {{ employeeFilterActive ? '当前筛选下没有符合条件的有效员工。可以清除筛选，或在上方新建员工。' : '还没有有效员工。可以在上方新建员工。' }}
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- 停用账号归档：停用后不能登录、也不能再改岗位/部门/授权，所以不再混在有效员工表里。 -->
+      <section v-if="inactiveEmployees.length" class="ea-card ea-archive-card" aria-labelledby="ea-inactive-title">
+        <header class="ea-card-head">
+          <div>
+            <h3 id="ea-inactive-title">已停用的员工（{{ inactiveEmployees.length }}）</h3>
+            <p>归档区与上方筛选无关，始终列出全部停用账号。停用会清除权限授权并撤销旧会话；重新启用后账号仍需管理员重新授予授权，历史消息与渠道记录不会丢失。</p>
+          </div>
+          <span class="ea-archive-count">归档</span>
+        </header>
+        <div class="ea-table-wrap">
+          <table class="ea-table ea-archive-table">
+            <thead>
+              <tr>
+                <th>员工</th><th>岗位</th><th>所属部门</th><th>停用时已清除的授权</th><th class="ea-th-action">操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="employee in inactiveEmployees" :key="employee.id" class="is-inactive">
+                <td>
+                  <div class="ea-person">
+                    <span class="ea-avatar is-off">{{ employee.username.slice(0, 1).toUpperCase() }}</span>
+                    <span class="ea-person-name">
+                      <strong>{{ employeeDisplayName(employee) }}</strong>
+                      <small><span class="ea-pill is-off">已停用</span> {{ employee.username }} · 员工编号 #{{ employee.id }}</small>
+                    </span>
+                  </div>
+                </td>
+                <td><span class="ea-role">{{ employeeRoleLabel(employee.role) }}</span></td>
+                <td>{{ employee.department || '—' }}</td>
+                <td>
+                  <span class="ea-muted">停用时已撤销；启用后需重新授权</span>
+                </td>
+                <td class="ea-th-action">
+                  <div class="ea-row-actions">
+                    <template v-if="employeeConfirmReactivateId === employee.id">
+                      <span class="ea-confirm-text">确认启用 {{ employeeDisplayName(employee) }}（{{ employee.username }}）？启用后即可重新配置授权。</span>
+                      <button class="primary ea-manage" type="button" @click="reactivateEmployee(employee)">确认启用</button>
+                      <button class="link-button" type="button" @click="employeeConfirmReactivateId = null">取消</button>
+                    </template>
+                    <button v-else class="secondary ea-manage" type="button" @click="reactivateEmployee(employee)">启用账号</button>
+                  </div>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="ea-card" aria-labelledby="ea-channel-accounts-title">
+        <header class="ea-card-head">
+          <div>
+            <h3 id="ea-channel-accounts-title">渠道账号与历史访问</h3>
+            <p>挂在管理员名下的渠道账号，运营看不到也处理不了消息。默认已勾选管理员名下账号，选好接收员工后一键转交，历史消息会随账号一起迁移。转移时会自动清理运营名下未连接/已撤销的旧空壳账号；已撤销但有历史数据的账号需先「恢复历史访问」。</p>
+          </div>
+          <span class="ea-step">03</span>
+        </header>
+        <div v-if="adminChannelFeedback" class="ea-feedback ea-feedback-block" :class="adminChannelFeedback.kind" :role="adminChannelFeedback.kind === 'error' ? 'alert' : 'status'" aria-live="polite">
+          <span class="ea-feedback-icon" aria-hidden="true">{{ adminChannelFeedback.kind === 'success' ? '✓' : '!' }}</span>
+          <div class="ea-feedback-body">
+            <strong>{{ adminChannelFeedback.title }}</strong>
+            <p>{{ adminChannelFeedback.text }}</p>
+          </div>
+          <button class="ea-feedback-close" type="button" aria-label="关闭提示" @click="adminChannelFeedback = null">×</button>
+        </div>
+        <div class="ea-transfer-bar">
+          <label class="ea-transfer-field">
+            <span class="ea-label">接收员工</span>
+            <select v-model.number="transferTargetUserId" :disabled="channelTransferSubmitting">
+              <option value="" disabled>请选择运营员工</option>
+              <option v-for="employee in transferableEmployees" :key="employee.id" :value="employee.id">{{ employee.username }} · #{{ employee.id }} · {{ employeeRoleLabel(employee.role) }}</option>
+            </select>
+          </label>
+          <div class="ea-transfer-copy">
+            <strong>把渠道账号交给运营</strong>
+            <p>只列出在岗的运营岗位员工。转移会同步重建渠道授权、保留全部历史消息，并自动补齐对应渠道的预授权；管理员不再持有该渠道，避免两个账号处理同一批消息。</p>
+          </div>
+          <button class="primary ea-transfer-submit" type="button" :disabled="channelTransferSubmitting || !transferTargetUserId || selectedAdminChannelAccountIds.length === 0" @click="transferChannelAccountsOwner(selectedAdminChannelAccountIds)">
+            {{ channelTransferSubmitting ? '转移中…' : `把选中的 ${selectedAdminChannelAccountIds.length} 个账号转给该员工` }}
+          </button>
+        </div>
+        <p v-if="transferableEmployees.length === 0" class="ea-transfer-empty">当前没有在岗的运营岗位员工。请先在上方新建员工或把岗位调整为「运营」，再来转移渠道账号。</p>
+        <div class="ea-toolbar">
+          <button class="secondary" type="button" :disabled="adminChannelAccountsLoading" @click="loadAdminChannelAccounts">{{ adminChannelAccountsLoading ? '加载中…' : '刷新账号列表' }}</button>
+          <span class="ea-hint">共 {{ adminChannelAccounts.length }} 个渠道账号 · {{ adminOwnedAccountCount }} 个仍归属管理员 · 已选 {{ selectedAdminChannelAccountIds.length }} 个 · {{ adminChannelAccounts.filter((item) => item.history_access_revoked).length }} 个待恢复</span>
+          <span class="ea-scroll-hint">表格可左右滑动，查看外部映射、连接状态与操作按钮 →</span>
+        </div>
+        <div class="ea-table-wrap">
+          <table class="ea-table ea-channel-accounts-table">
+            <thead>
+              <tr>
+                <th class="ea-th-check"><input type="checkbox" :checked="allAdminChannelAccountsSelected" :disabled="adminChannelAccounts.length === 0" aria-label="全选渠道账号" @change="onToggleAllAdminChannelAccounts"></th>
+                <th>账号</th><th>渠道类型</th><th>归属员工</th><th>外部账号映射</th><th>连接状态</th><th>历史访问</th><th class="ea-th-action">操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="account in adminChannelAccounts" :key="account.id" :class="{ 'is-revoked': account.history_access_revoked, 'ea-row-checked': selectedAdminChannelAccountIds.includes(account.id) }">
+                <td class="ea-th-check"><input type="checkbox" :checked="selectedAdminChannelAccountIds.includes(account.id)" :aria-label="`选择渠道账号 #${account.id}`" @change="onToggleAdminChannelAccount($event, account.id)"></td>
+                <td><strong>#{{ account.id }}</strong></td>
+                <td><span class="ea-role">{{ account.channel_type }}</span></td>
+                <td>
+                  <div class="ea-owner">
+                    <span>{{ adminChannelOwner(account.owner_user_id) }}</span>
+                    <span v-if="adminChannelOwnerIsAdmin(account.owner_user_id)" class="ea-pill is-warn">管理员名下</span>
+                  </div>
+                </td>
+                <td>{{ account.external_account_id || '—' }}</td>
+                <td><span class="ea-pill" :class="account.status === 'connected' ? 'is-on' : ''">{{ adminChannelStatusLabels[account.status] || account.status }}</span></td>
+                <td>
+                  <span v-if="account.history_access_revoked" class="ea-pill is-warn">已撤销</span>
+                  <span v-else class="ea-pill is-on">正常</span>
+                </td>
+                <td class="ea-th-action">
+                  <div class="ea-row-actions">
+                    <button v-if="account.history_access_revoked" class="primary ea-regrant" type="button" :disabled="regrantingAccountId !== null" @click="regrantChannelHistory(account)">{{ regrantingAccountId === account.id ? '恢复中…' : '恢复历史访问' }}</button>
+                    <button class="secondary ea-transfer-one" type="button" :disabled="channelTransferSubmitting || !transferTargetUserId || accountOwnedByTransferTarget(account.owner_user_id)" :title="!transferTargetUserId ? '请先在上方选择接收员工' : '把此账号转给所选运营'" @click="transferChannelAccountsOwner([account.id])">单独转移</button>
+                  </div>
+                </td>
+              </tr>
+              <tr v-if="!adminChannelAccountsLoading && adminChannelAccounts.length === 0">
+                <td colspan="8" class="ea-empty">暂无渠道账号。运营首次点击「开始授权」后会自动创建。</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="ea-card-foot">转移只改变归属与授权关系，不会删除历史消息，也不会代替运营完成 OAuth 授权；恢复只解除本地的撤销标记并把账号置回「待授权」。</p>
+      </section>
+    </section>
     <section v-else-if="operationLogOpen" class="standalone-page operation-log-page" role="region" aria-labelledby="operation-log-title">
       <nav class="page-breadcrumb">
         <button class="link-button" type="button" @click="closeStandalonePage">← 返回上一页</button>
@@ -1926,22 +3287,31 @@ onMounted(() => {
       </nav>
       <template v-if="!isStandalone">
       <nav class="workspace-tabs" aria-label="工作台视图">
-        <button type="button" :class="{ active: workspaceView === 'messages' }" @click="switchWorkspaceView('messages')">消息收件箱</button>
-        <button type="button" :class="{ active: workspaceView === 'review' }" @click="switchWorkspaceView('review')">待分配</button>
-        <button type="button" :class="{ active: workspaceView === 'customers' }" @click="switchWorkspaceView('customers')">客户链路</button>
-        <button type="button" :class="{ active: workspaceView === 'customerMessages' }" @click="switchWorkspaceView('customerMessages')">客户消息</button>
+        <button v-if="isAdmin" type="button" class="active" aria-current="page" @click="switchWorkspaceView('customers')">全公司询盘</button>
+        <template v-else-if="canOperateChannels">
+          <button type="button" :class="{ active: workspaceView === 'messages' }" @click="switchWorkspaceView('messages')">消息收件箱</button>
+          <button type="button" :class="{ active: workspaceView === 'review' }" @click="switchWorkspaceView('review')">待分配</button>
+          <button type="button" :class="{ active: workspaceView === 'customers' }" @click="switchWorkspaceView('customers')">客户链路</button>
+          <button type="button" :class="{ active: workspaceView === 'customerMessages' }" @click="switchWorkspaceView('customerMessages')">客户消息</button>
+        </template>
+        <template v-else>
+          <button type="button" :class="{ active: workspaceView === 'customers' }" @click="switchWorkspaceView('customers')">{{ currentUser?.role === 'sales' ? '我负责的客户' : '部门范围' }}</button>
+        </template>
       </nav>
       <section class="inbox-panel panel" :class="{ 'is-refreshing': filterLoading, 'inquiry-sidebar': isInquiryView && selectedInquiry }">
         <div v-if="isInquiryView" class="panel-heading">
           <div>
-            <p class="eyebrow">运营收件箱</p>
-            <h2>{{ workspaceView === 'review' ? '待分配客户' : '已分配客户链路' }}</h2>
-            <p v-if="workspaceView === 'review'">按已确认的邮箱或手机号汇总客户，选择业务类型与负责人完成分配。</p>
+            <p class="eyebrow">{{ isAdmin ? '全公司审阅' : currentUser?.role === 'sales' ? '业务员工作台' : '运营收件箱' }}</p>
+            <h2>{{ isAdmin ? '全公司询盘与处理历史' : workspaceView === 'review' ? '待分配客户' : currentUser?.role === 'sales' ? '转交给我的客户' : '已分配客户链路' }}</h2>
+            <p v-if="isAdmin">只读查看全公司询盘与关联历史，并可明确改派负责人。消息明细与处理由运营账号独占，避免两个账号同时处理同一渠道消息。</p>
+            <p v-else-if="currentUser?.role === 'sales'">运营转交给你的客户链路都在这里。可查看联系人、联系方式、原始内容与来源渠道；负责人由运营改派，业务员不能改派或删除链路。</p>
+            <p v-else-if="!canOperateChannels">当前岗位不参与客户链路处理，这里不展示询盘或客户消息。</p>
+            <p v-else-if="workspaceView === 'review'">按已确认的邮箱或手机号汇总客户，选择业务类型与负责人完成分配。</p>
           </div>
           <span class="count">{{ selectedInquiry ? `第 ${inquiryPage} / ${inquiryTotalPages} 页` : `共 ${inquiryTotalCount} 条 · 第 ${inquiryPage} / ${inquiryTotalPages} 页` }}</span>
         </div>
 
-        <div v-if="isInquiryView" class="inbox-filters">
+        <div v-if="isInquiryView && !isAdmin" class="inbox-filters">
           <div class="filter-group">
             <span>处理状态</span>
             <select v-model="inquiryHandlingFilter" aria-label="询盘人工状态" @change="onInquiryFilterChange">
@@ -1988,7 +3358,7 @@ onMounted(() => {
         <div v-if="!isInquiryView" class="subsection">
           <div class="panel-heading compact message-heading">
             <div>
-              <p class="eyebrow">逐条处理</p>
+              <p class="eyebrow">批量 / 逐条处理</p>
               <h2>{{ workspaceView === 'customerMessages' ? '已分配客户的消息' : '全部消息' }}</h2>
             </div>
             <span class="count">{{ messages.length }} 条</span>
@@ -2027,7 +3397,7 @@ onMounted(() => {
                 </div>
               </div>
             </section>
-            <section class="message-tool-group message-box-set" aria-labelledby="message-box-heading">
+            <section v-if="canOperateChannels" class="message-tool-group message-box-set" aria-labelledby="message-box-heading">
               <h3 id="message-box-heading">消息箱</h3>
               <div class="archive-toolbar">
             <button class="secondary" :class="{ 'is-active': processedBoxOpen }" type="button" :aria-expanded="processedBoxOpen" @click="toggleBox('processed')">
@@ -2038,6 +3408,27 @@ onMounted(() => {
             </button>
               </div>
             </section>
+          </div>
+          <div v-if="canBulkHandle" class="bulk-action-bar">
+            <label class="bulk-select-all">
+              <input
+                type="checkbox"
+                :checked="allVisibleSelected"
+                :disabled="selectableMessageIds.length === 0 || bulkActionRunning"
+                @change="toggleSelectAllVisible"
+              />
+              <span>全选本页 {{ selectableMessageIds.length }} 条</span>
+            </label>
+            <span class="bulk-selection-count">已选 {{ selectedMessageCount }} 条</span>
+            <div class="bulk-action-buttons">
+              <button class="action-button action-primary" type="button" :disabled="bulkActionRunning || selectedMessageCount === 0" @click="runBulkMessageAction('processed')">
+                {{ bulkActionRunning ? '处理中…' : '批量标记已处理' }}
+              </button>
+              <button class="action-button action-secondary" type="button" :disabled="bulkActionRunning || selectedMessageCount === 0" @click="runBulkMessageAction('ignored')">批量忽略</button>
+              <button v-if="selectedMessageCount > 0" class="link-button" type="button" @click="clearMessageSelection">取消选择</button>
+            </div>
+            <p v-if="bulkActionNotice" class="bulk-feedback success" role="status">{{ bulkActionNotice }}</p>
+            <p v-if="bulkActionError" class="bulk-feedback error" role="alert">{{ bulkActionError }}</p>
           </div>
           <p v-if="providerFallback" class="inline-feedback success">
             <a :href="providerFallback.url" target="_blank" rel="noopener noreferrer">{{ providerFallback.label }}</a>
@@ -2076,49 +3467,78 @@ onMounted(() => {
                 <span v-if="group.scope === 'group' && groupBindingFor(group)" class="gb-group-tag is-bound">已归属 {{ groupBindingFor(group)?.normalized_phone }}</span>
                 <span v-else-if="group.scope === 'group'" class="gb-group-tag is-unbound">未确认客户归属</span>
               </span>
-              <button v-if="group.scope === 'group' && currentUser?.role !== 'sales'" class="action-button action-secondary gb-group-entry" type="button" @click="openGroupBinding(group)">
+              <button v-if="group.scope === 'group' && canOperateChannels && currentUser?.role !== 'sales'" class="action-button action-secondary gb-group-entry" type="button" @click="openGroupBinding(group)">
                 {{ groupBindingFor(group) ? '修改客户归属' : '确认群聊客户归属' }}
               </button>
+              <label v-if="groupSelectableIds(group).length > 0" class="group-select-control">
+                <input type="checkbox" :checked="isGroupFullySelected(group)" :disabled="bulkActionRunning" @change="toggleSelectGroup(group)" />
+                <span>全选本组 {{ groupSelectableIds(group).length }} 条</span>
+              </label>
+              <div v-if="groupSelectableIds(group).length > 1" class="group-bulk-actions">
+                <button class="action-button action-primary group-bulk-button" type="button" :disabled="bulkActionRunning" @click="runBulkMessageAction('processed', groupSelectableIds(group))">整组已处理</button>
+                <button class="action-button action-secondary group-bulk-button" type="button" :disabled="bulkActionRunning" @click="runBulkMessageAction('ignored', groupSelectableIds(group))">整组忽略</button>
+              </div>
               <button v-if="group.messages.length > 1" class="link-button" type="button" @click="toggleMessageGroup(group.key)">
                 {{ collapsedGroupKeys.has(group.key) ? `展开组内其他 ${group.messages.length - 1} 条` : '收起组内消息' }}
               </button>
             </div>
             <div v-for="message in messagesForGroup(group)" :id="`message-${message.id}`" :key="message.id" class="message-row" :class="{ 'is-grouped': group.messages.length > 1, 'is-focused-message': selectedMessageId === message.id }">
             <div class="message-meta">
+              <label v-if="canBulkSelect(message)" class="message-select-control">
+                <input
+                  type="checkbox"
+                  :checked="isMessageSelected(message.id)"
+                  :disabled="bulkActionRunning"
+                  :aria-label="`选择消息 #${message.id}`"
+                  @change="toggleMessageSelection(message.id)"
+                />
+                <span>选择</span>
+              </label>
               <span class="channel-mark" :class="`channel-${message.channel_type}`">{{ message.channel_type === 'website_form' ? 'WF' : message.channel_type === 'whatsapp' ? 'WS' : message.channel_type === 'outlook' ? 'OL' : 'GM' }}</span>
               <strong>{{ messageContactLabel(message) }}</strong>
               <span v-if="messageSenderLabel(message)" class="sender">发送人：{{ messageSenderLabel(message) }}</span>
               <span class="meta-time">{{ formatTime(message.occurred_at) }}</span>
               <span v-if="group.messages.length > 1" class="state-label group-badge" :title="`属于「${messageGroupLabel(group)}」`">{{ groupBadgeLabel(group, message) }}</span>
               <span class="state-label ingestion-state">入站：{{ ingestionStatusLabel(message.ingestion_status) }}</span>
-              <span class="state-label">人工：{{ handlingStatusLabel(message.handling_status) }}</span>
+              <span class="state-label" :class="message.content_state === 'revoked' ? 'is-revoked' : ''">人工：{{ messageStatusLabel(message) }}</span>
               <span class="state-label" :class="message.link_state === 'manual_review' || message.contact_identity_state !== 'certain' ? 'status-warning' : ''">身份：{{ contactIdentityLabel(message.contact_identity_state) }}</span>
               <span class="state-label" :class="message.link_state === 'manual_review' ? 'status-warning' : ''">归链：{{ linkStateLabel(message.link_state) }}</span>
-              <span v-if="message.overview?.status === 'pending'" class="state-label">中文概要：生成中</span>
-              <span v-else-if="message.overview?.status === 'failed'" class="status-warning">中文概要：待生成</span>
+              <span v-if="message.content_state !== 'revoked' && message.overview?.status === 'pending'" class="state-label">中文概要：生成中</span>
+              <span v-else-if="message.content_state !== 'revoked' && message.overview?.status === 'failed'" class="status-warning">中文概要：待生成</span>
               <span v-if="accountStatus(message.channel_account_id) === 'blocked'" class="status-warning">渠道阻塞</span><span v-if="accountStatus(message.channel_account_id) === 'revoked'" class="status-warning">渠道已撤销</span>
             </div>
             <template v-if="!expandedMessageIds.has(message.id)">
-              <p v-if="message.overview?.status === 'ready'" class="message-overview">中文概要：{{ message.overview.text }}</p>
-              <p v-else-if="message.overview?.status === 'failed'" class="message-overview fallback">规则摘录，非 AI 概要：{{ message.display_excerpt || '（无正文）' }}</p>
-              <p v-else class="message-preview">{{ message.display_excerpt || '（无正文）' }}</p>
+              <div class="message-brief">
+                <!-- 主内容始终是清洗后的安全原文；中文概述只在下方一行小字补充。 -->
+                <p class="message-preview">{{ message.display_excerpt || '（无正文）' }}</p>
+                <small v-if="message.content_state !== 'revoked' && message.overview?.status === 'ready' && message.overview.text" class="message-overview-inline">中文概述：{{ message.overview.text }}</small>
+                <small v-else-if="message.content_state !== 'revoked' && message.overview?.status === 'pending'" class="message-overview-inline">中文概述生成中…</small>
+                <small v-else-if="message.content_state !== 'revoked' && message.overview?.status === 'failed'" class="message-overview-inline">中文概述生成失败，可在下方重新生成。</small>
+              </div>
             </template>
             <div v-else class="message-content-view">
-              <p v-if="messageContentFor(message.id)" class="message-original-preview">
-                <span class="content-label">安全原文预览</span>
-                {{ messageContentFor(message.id)?.preview_text || '（无正文）' }}
-              </p>
+              <template v-if="messageContentFor(message.id)">
+                <!-- The label sits outside the clamped paragraph: inside it, the
+                     block-level label consumed one of the 8 clamped lines and
+                     clipped the last visible line in half. -->
+                <span class="content-label">{{ isMessageExpanded(message.id) ? '完整原文' : '安全原文预览' }}</span>
+                <!-- Expanded and collapsed are mutually exclusive: rendering the
+                     clamped preview next to the full text showed the body twice. -->
+                <p v-if="isMessageExpanded(message.id)" class="message-full-content">
+                  {{ messageContentFor(message.id)?.full_text || '（无正文）' }}
+                </p>
+                <p v-else class="message-original-preview">
+                  {{ messageContentFor(message.id)?.preview_text || '（无正文）' }}
+                </p>
+              </template>
               <p v-else class="message-preview">{{ message.display_excerpt || '（无正文）' }}</p>
-              <p v-if="messageContentFor(message.id)?.can_expand && fullMessageContentIds.has(message.id)" class="message-full-content">
-                {{ messageContentFor(message.id)?.full_text }}
-              </p>
               <button
                 v-if="messageContentFor(message.id)?.can_expand"
                 class="link-button content-expand-link"
                 type="button"
                 @click="toggleFullMessageContent(message.id)"
               >
-                {{ fullMessageContentIds.has(message.id) ? '收起全文' : '展示全文' }}
+                {{ isMessageExpanded(message.id) ? '收起全文' : '展示全文' }}
               </button>
               <p v-if="messageContentFor(message.id)" class="content-source-note" :class="`tone-${contentSourceState(messageContentFor(message.id)).tone}`" role="status">
                 {{ contentSourceState(messageContentFor(message.id)).text }}
@@ -2126,12 +3546,12 @@ onMounted(() => {
               <p v-if="messageContentFor(message.id) && contentSourceState(messageContentFor(message.id)).tone === 'warn'" class="content-source-hint">
                 可在「我的 / 接入账号」运行「回源自检」定位并按提示重新授权；恢复后查看原文将走实时回源。
               </p>
-              <span v-if="messageContentFor(message.id)?.can_expand" class="content-clamp-hint">预览最多显示 8 行；完整内容请展开全文。</span>
+              <span v-if="messageContentFor(message.id)?.can_expand && !isMessageExpanded(message.id)" class="content-clamp-hint">预览最多显示 8 行；完整内容请展开全文。</span>
             </div>
             <div class="message-actions" :aria-label="`消息 #${message.id} 的操作`">
               <span class="message-action-label">此消息操作</span>
               <button
-                v-if="message.overview?.status === 'failed' || message.overview?.status === 'ready'"
+                v-if="!isAdmin && message.content_state !== 'revoked' && (message.overview?.status === 'failed' || message.overview?.status === 'ready')"
                 class="action-button action-secondary"
                 type="button"
                 :disabled="handlingSubmitting"
@@ -2139,7 +3559,7 @@ onMounted(() => {
               >
                 重新生成中文概要
               </button>
-              <button v-if="workspaceView === 'messages' || workspaceView === 'customerMessages'"
+              <button v-if="!isAdmin && (workspaceView === 'messages' || workspaceView === 'customerMessages')"
                 class="action-button action-secondary"
                 type="button"
                 :disabled="contentLoadingMessageIds.has(message.id)"
@@ -2148,7 +3568,7 @@ onMounted(() => {
                 {{ contentLoadingMessageIds.has(message.id) ? '正在读取…' : expandedMessageIds.has(message.id) ? '收起正文' : '查看原文' }}
               </button>
               <button
-                v-if="message.link_state !== 'linked' && currentUser?.role !== 'sales' && group.scope !== 'group'"
+                v-if="!isAdmin && message.link_state !== 'linked' && currentUser?.role !== 'sales' && group.scope !== 'group'"
                 class="action-button action-secondary"
                 type="button"
                 :disabled="linkReviewLoading || handlingSubmitting"
@@ -2157,6 +3577,7 @@ onMounted(() => {
                 {{ linkReviewLoading && linkReviewMessageId === message.id ? '正在查询…' : linkReviewMessageId === message.id && linkReviewCandidates ? '收起归属候选' : '确认客户归属' }}
               </button>
               <button
+                v-if="!isAdmin"
                 class="action-button action-primary"
                 :class="{ 'is-opening': providerOpeningMessageId === message.id }"
                 type="button"
@@ -2165,7 +3586,7 @@ onMounted(() => {
               >
                 {{ providerOpeningMessageId === message.id ? '正在打开…' : '去渠道处理' }}
               </button>
-              <button v-if="workspaceView === 'messages' || workspaceView === 'customerMessages'"
+              <button v-if="!isAdmin && message.content_state !== 'revoked' && (workspaceView === 'messages' || workspaceView === 'customerMessages')"
                 class="action-button action-secondary"
                 type="button"
                 :disabled="handlingSubmitting || message.handling_status === 'processed'"
@@ -2173,7 +3594,8 @@ onMounted(() => {
               >
                 {{ message.handling_status === 'processed' ? '系统外已处理' : '系统外已处理…' }}
               </button>
-              <button v-if="workspaceView === 'messages' || workspaceView === 'customerMessages'"
+              <!-- 撤回消息也必须能「忽略」：误判或已知的撤回不能永远卡在待办里。 -->
+              <button v-if="!isAdmin && (workspaceView === 'messages' || workspaceView === 'customerMessages')"
                 class="action-button action-secondary"
                 type="button"
                 :disabled="handlingSubmitting || message.handling_status === 'ignored'"
@@ -2215,7 +3637,18 @@ onMounted(() => {
         <div class="facts-grid">
           <div><span>业务类型</span><strong>{{ selectedInquiry.business_type === 'inquiry' ? '询盘' : selectedInquiry.business_type === 'after_sales' ? '售后' : '未分类' }}</strong></div>
           <div><span>阶段/状态</span><strong>{{ selectedInquiry.status === 'new' ? '待人工确认' : statusLabel(selectedInquiry.status) }}</strong></div>
-          <div><span>负责人</span><strong>{{ selectedInquiry.assigned_sales_user_id ? `用户 #${selectedInquiry.assigned_sales_user_id}` : '未分配' }}</strong></div>
+          <div>
+            <span>负责人</span>
+            <strong>{{ selectedInquiry.assigned_sales_name || selectedInquiry.assigned_sales_username || (selectedInquiry.assigned_sales_user_id ? `用户 #${selectedInquiry.assigned_sales_user_id}` : '未分配') }}</strong>
+            <small v-if="selectedInquiry.assigned_sales_username && selectedInquiry.assigned_sales_name && selectedInquiry.assigned_sales_name !== selectedInquiry.assigned_sales_username" class="fact-account">账号 {{ selectedInquiry.assigned_sales_username }}</small>
+          </div>
+          <div>
+            <span>转交人</span>
+            <strong>{{ selectedInquiry.transferred_by_name || selectedInquiry.transferred_by_username || '未转交' }}</strong>
+            <small v-if="selectedInquiry.transferred_by_username" class="fact-account">
+              账号 {{ selectedInquiry.transferred_by_username }}<template v-if="selectedInquiry.transferred_at"> · {{ formatTime(selectedInquiry.transferred_at) }}</template>
+            </small>
+          </div>
           <div><span>来源渠道</span><strong>{{ [...new Set(selectedInquiry.messages.map((source) => source.channel_type).filter(Boolean))].join(' / ') || '当前授权可见来源为空' }}</strong></div>
           <div><span>归链阶段</span><strong>{{ lifecycleStageLabel(selectedInquiry.lifecycle_stage) }}</strong></div>
         </div>
@@ -2259,24 +3692,30 @@ onMounted(() => {
 
         <section class="detail-section">
           <h3>关联客户消息</h3>
-          <p class="muted">客户消息概要、渠道和人工处理状态。</p>
+          <p class="muted">{{ isAdmin ? '管理员仅查看脱敏后的中文概述、渠道、时间与处理状态；不展示正文、联系人信息或渠道账号标识。' : '以运营同事入站时清洗后的安全原文为主，中文概述只在下方以小字补充；「查看客户消息」可就地打开完整原文。' }}</p>
           <p v-if="selectedInquiry.messages.length === 0" class="empty">当前没有可见关联消息。</p>
           <ol v-else class="timeline linked-message-timeline">
-            <li v-for="linkedMessage in selectedInquiry.messages" :key="linkedMessage.id" class="linked-message-item">
+            <li v-for="linkedMessage in selectedInquiry.messages" :key="linkedMessage.id" class="linked-message-item" :class="{ 'is-revoked': linkedMessage.content_state === 'revoked' }">
               <div class="linked-message-copy">
                 <span class="linked-message-origin">
                 {{ channelLabel(linkedMessage.channel_type) }} · {{ linkedMessage.direction === 'inbound' ? '客户入站' : '系统出站' }} · {{ formatTime(linkedMessage.occurred_at) }}
                 </span>
-                <strong>消息 #{{ linkedMessage.id }} · {{ handlingStatusLabel(linkedMessage.handling_status) }}</strong>
-                <small>发送人/联系人：{{ selectedInquiry.contact_sources.find((source) => source.channel_account_id === linkedMessage.channel_account_id)?.customer_nickname || selectedInquiry.contact_sources.find((source) => source.channel_account_id === linkedMessage.channel_account_id)?.raw_customer_contact || '当前来源未提供' }} · 渠道账号：{{ linkedMessage.channel_account_external_id || accountLabel(linkedMessage.channel_account_id) }}</small>
-                <p class="linked-message-overview">{{ linkedMessage.overview_text || (linkedMessage.overview_status === 'pending' ? '中文概要正在生成。' : linkedMessage.overview_status === 'failed' ? '中文概要生成失败，可在消息收件箱重试。' : '暂无中文概要。') }}</p>
+                <strong>消息 #{{ linkedMessage.id }} · <span :class="linkedMessage.content_state === 'revoked' ? 'linked-message-revoked-label' : ''">{{ messageStatusLabel(linkedMessage) }}</span></strong>
+                <small v-if="!isAdmin">发送人/联系人：{{ selectedInquiry.contact_sources.find((source) => source.channel_account_id === linkedMessage.channel_account_id)?.customer_nickname || selectedInquiry.contact_sources.find((source) => source.channel_account_id === linkedMessage.channel_account_id)?.raw_customer_contact || '当前来源未提供' }} · 渠道账号：{{ linkedMessage.channel_account_external_id || accountLabel(linkedMessage.channel_account_id) }}</small>
+                <!-- 主展示 = 清洗后的安全原文。撤回没有可恢复的正文，直接给出撤回说明。 -->
+                <p v-if="isAdmin" class="linked-message-safe-text is-hidden" :class="`is-admin-status-${adminMessageStatus(linkedMessage).tone}`">{{ adminMessageStatus(linkedMessage).text }}</p>
+                <pre v-else-if="linkedMessage.safe_text" class="linked-message-safe-text" :class="{ 'is-revoked': linkedMessage.content_state === 'revoked' }">{{ linkedMessage.safe_text }}</pre>
+                <p v-else class="linked-message-safe-text is-empty">这条消息没有可展示的正文（可能只有附件）。</p>
+                <small v-if="!isAdmin && linkedMessage.safe_text_truncated" class="linked-message-more">仅显示前段原文，完整内容请点「查看客户消息」。</small>
+                <!-- 中文概述降级为下方小字；撤回消息不再输出「消息内容为空」的误导性概述。 -->
+                <small v-if="!isAdmin && linkedMessage.content_state !== 'revoked'" class="linked-message-overview">中文概述：{{ linkedOverviewText(linkedMessage) }}</small>
               </div>
-              <button class="secondary" type="button" @click="openCustomerMessage(linkedMessage.id)">查看客户消息</button>
+              <button v-if="!isAdmin" class="secondary" type="button" title="查看这条消息清洗后的安全原文" @click="openCustomerMessage(linkedMessage.id)">查看客户消息</button>
             </li>
           </ol>
         </section>
 
-        <section class="detail-section">
+        <section v-if="!isAdmin" class="detail-section">
           <h3>确定性分析</h3>
           <p v-if="!analysis" class="empty">当前没有分析结果。</p>
           <template v-else>
@@ -2286,16 +3725,16 @@ onMounted(() => {
           </template>
         </section>
 
-        <section class="detail-section action-section">
-          <h3>当前可执行操作</h3>
-          <button class="secondary operation-log-button" type="button" @click="openOperationLogs(selectedInquiry.id)">查看此链路操作记录</button>
-          <div v-if="selectedInquiry.handling_status !== 'pending'" class="restore-link-banner">
+        <section v-if="canOperateChannels || isAdmin" class="detail-section action-section">
+          <h3>{{ isAdmin ? '管理员改派' : '当前可执行操作' }}</h3>
+          <button v-if="canOperateChannels" class="secondary operation-log-button" type="button" @click="openOperationLogs(selectedInquiry.id)">查看此链路操作记录</button>
+          <div v-if="canOperateChannels && selectedInquiry.handling_status !== 'pending'" class="restore-link-banner">
             <span>当前链路已{{ selectedInquiry.handling_status === 'processed' ? '处理' : '忽略' }}；恢复后才能继续分配或处理。</span>
             <button class="secondary" type="button" :disabled="handlingSubmitting" @click="reactivateSelectedInquiry">恢复链路</button>
           </div>
           <p v-if="actionError" class="action-error">{{ actionError }}</p>
           <p v-if="actionMessage" class="inline-feedback success">{{ actionMessage }}</p>
-          <div v-if="selectedInquiry.status === 'new'" class="transfer-form">
+          <div v-if="selectedInquiry.status === 'new' || (isAdmin && selectedInquiry.status === 'assigned')" class="transfer-form">
             <label for="transfer-business-type">业务类型</label>
             <select id="transfer-business-type" v-model="selectedBusinessType">
               <option :value="null">请选择类型</option><option value="inquiry">询盘</option><option value="after_sales">售后</option>
@@ -2304,7 +3743,7 @@ onMounted(() => {
             <select id="transfer-target" v-model="selectedSalesUserId">
               <option :value="null">请选择业务员</option>
               <option v-for="target in transferTargets" :key="target.id" :value="target.id">
-                {{ target.username }}（用户 #{{ target.id }}）
+                {{ transferTargetLabel(target) }}
               </option>
             </select>
             <button
@@ -2313,12 +3752,12 @@ onMounted(() => {
               :disabled="transferSubmitting || selectedSalesUserId === null || selectedBusinessType === null"
               @click="transferSelectedInquiry"
             >
-              {{ transferSubmitting ? '分配中…' : '确认分配' }}
+              {{ transferSubmitting ? '分配中…' : isAdmin && selectedInquiry.status === 'assigned' ? '确认改派' : '确认分配' }}
             </button>
             <p v-if="transferTargets.length === 0" class="muted">当前没有可用的 active sales 目标。</p>
           </div>
-          <p v-else class="muted">当前询盘已转交；重复转交由后端幂等处理，不在此处自动改派。</p>
-          <div class="actions">
+          <p v-else-if="selectedInquiry.status !== 'assigned' || !isAdmin" class="muted">当前询盘已转交；运营不能自动改派，需管理员在此明确选择新负责人。</p>
+          <div v-if="canOperateChannels" class="actions">
             <button
               class="secondary"
               type="button"
@@ -2352,29 +3791,31 @@ onMounted(() => {
           <div class="facts-grid">
             <div><span>发送人</span><strong>{{ messageSenderLabel(messageDetail) }}</strong></div>
             <div><span>时间</span><strong>{{ formatTime(messageDetail.occurred_at) }}</strong></div>
-            <div><span>人工状态</span><strong>{{ handlingStatusLabel(messageDetail.handling_status) }}</strong></div>
+            <div><span>人工状态</span><strong :class="messageDetail.content_state === 'revoked' ? 'is-revoked-text' : ''">{{ messageStatusLabel(messageDetail) }}</strong></div>
             <div><span>归链状态</span><strong>{{ linkStateLabel(messageDetail.link_state) }}</strong></div>
           </div>
           <section class="detail-section">
-            <h3>中文概要</h3>
-            <p v-if="messageDetail.overview?.status === 'ready'" class="message-overview">{{ messageDetail.overview.text }}</p>
-            <p v-else class="message-preview">{{ messageDetail.display_excerpt || '（无正文）' }}</p>
+            <h3>安全原文（清洗后）</h3>
+            <p v-if="messageDetailContent" class="message-original">{{ messageDetailContent.parsed_content.display_text || messageDetailContent.preview_text }}</p>
+            <p v-else class="message-original">{{ messageDetail.display_excerpt || '（无正文）' }}</p>
+            <button v-if="!isAdmin && !messageDetailContent" class="secondary" type="button" :disabled="messageDetailLoading" @click="loadMessageDetailContent">
+              {{ messageDetailLoading ? '加载中…' : '查看完整原文' }}
+            </button>
           </section>
           <section class="detail-section">
-            <h3>原文</h3>
-            <p v-if="messageDetailContent" class="message-original">{{ messageDetailContent.parsed_content.display_text || messageDetailContent.preview_text }}</p>
-            <button v-else class="secondary" type="button" :disabled="messageDetailLoading" @click="loadMessageDetailContent">
-              {{ messageDetailLoading ? '加载中…' : '查看原文' }}
-            </button>
+            <h3>中文概述（辅助）</h3>
+            <p v-if="messageDetail.content_state === 'revoked'" class="message-overview-inline">客户已撤回这条消息，不再生成中文概述。</p>
+            <p v-else-if="messageDetail.overview?.status === 'ready'" class="message-overview-inline">中文概述：{{ messageDetail.overview.text }}</p>
+            <p v-else class="message-overview-inline">暂无中文概述。</p>
           </section>
           <p v-if="actionError" class="action-error">{{ actionError }}</p>
           <p v-if="actionMessage" class="inline-feedback success">{{ actionMessage }}</p>
           <div class="actions">
-            <button class="secondary" type="button" :disabled="handlingSubmitting" @click="updateDetailMessageHandling('processed')">标记已处理</button>
-            <button class="secondary" type="button" :disabled="handlingSubmitting" @click="updateDetailMessageHandling('ignored')">忽略</button>
-            <button v-if="messageDetail.handling_status !== 'pending'" class="secondary" type="button" :disabled="handlingSubmitting" @click="restoreDetailMessage">恢复到待处理</button>
+            <button v-if="messageDetail.content_state !== 'revoked'" class="secondary" type="button" :disabled="handlingSubmitting || messageDetail.handling_status === 'processed'" @click="updateDetailMessageHandling('processed')">标记已处理</button>
+            <button class="secondary" type="button" :disabled="handlingSubmitting || messageDetail.handling_status === 'ignored'" @click="updateDetailMessageHandling('ignored')">忽略</button>
+            <button v-if="!isAdmin && messageDetail.handling_status !== 'pending'" class="secondary" type="button" :disabled="handlingSubmitting" @click="restoreDetailMessage">恢复到待处理</button>
           </div>
-          <p class="muted">页面不代替后端授权，不会自动发送、自动转交或修改客户数据。</p>
+          <p class="muted">{{ isAdmin ? '管理员仅处理已入站消息；不能发送客户消息或执行渠道授权。' : '页面不代替后端授权，不会自动发送、自动转交或修改客户数据。' }}</p>
         </template>
         <p v-else class="empty">消息不存在，或当前账号无权访问。</p>
       </section>
@@ -2434,6 +3875,45 @@ onMounted(() => {
         <footer class="link-review-footer">
           <span>关闭窗口不会修改消息或客户资料。</span>
           <button class="secondary" type="button" @click="closeLinkReview">关闭</button>
+        </footer>
+      </section>
+    </div>
+  </Transition>
+  <Transition name="link-dialog">
+    <div
+      v-if="customerMessageId !== null"
+      class="link-review-backdrop"
+      @click.self="closeCustomerMessage"
+      @keydown.esc.window="closeCustomerMessage"
+    >
+      <section class="link-review-dialog customer-message-dialog" role="dialog" aria-modal="true" aria-labelledby="customer-message-title" tabindex="-1">
+        <header class="link-review-heading">
+          <div>
+            <p class="eyebrow">消息 #{{ customerMessageId }} · 客户消息<span v-if="customerMessageRevoked" class="customer-message-revoked-tag">已撤回</span></p>
+            <h2 id="customer-message-title">安全文本（清洗后的原文）</h2>
+            <p v-if="customerMessageRevoked" class="link-review-subtitle">客户已双端删除／撤回这条消息，渠道侧也读不回可恢复的正文；这不是「消息为空」，无需按询盘处理。</p>
+            <p v-else class="link-review-subtitle">运营同事入站时落库的清洗后正文，就是这条消息本身的内容。</p>
+          </div>
+          <button class="dialog-close" type="button" aria-label="关闭客户消息窗口" @click="closeCustomerMessage">关闭 <span aria-hidden="true">×</span></button>
+        </header>
+        <div class="link-review-content" aria-live="polite">
+          <p v-if="customerMessageLoading" class="dialog-state">正在读取安全文本…</p>
+          <div v-else-if="customerMessageError" class="dialog-state dialog-error" role="alert">
+            <p>{{ customerMessageError }}</p>
+            <button class="secondary" type="button" @click="retryCustomerMessage">重试</button>
+          </div>
+          <p v-else-if="!customerMessageText" class="dialog-state">这条消息没有可展示的正文（可能只有附件或客户已撤回）。</p>
+          <pre v-else class="customer-message-text" :class="{ 'is-revoked': customerMessageRevoked }">{{ customerMessageText }}</pre>
+          <p v-if="customerMessageContent && customerMessageContent.source.kind === 'cached_safe_text'" class="customer-message-source">
+            渠道实时回读不可用，以上为入站时保存的快照{{ customerMessageContent.source.snapshot_at ? `（${formatTime(customerMessageContent.source.snapshot_at)}）` : '' }}。
+          </p>
+        </div>
+        <footer class="link-review-footer">
+          <span>{{ customerMessageRevoked ? '客户已撤回，原文不可恢复；不能标记已处理，但仍可在消息列表点「忽略」清理。' : '仅显示清洗后的安全文本，不含渠道原始数据；不代替渠道授权。' }}</span>
+          <div class="customer-message-actions">
+            <button class="secondary" type="button" :disabled="!customerMessageText || customerMessageRevoked" @click="copyCustomerMessage">{{ customerMessageCopied ? '已复制' : '复制文本' }}</button>
+            <button class="secondary" type="button" @click="closeCustomerMessage">关闭</button>
+          </div>
         </footer>
       </section>
     </div>
@@ -2524,6 +4004,7 @@ h3 { margin-bottom: 14px; font-size: 15px; }
 .facts-grid div { padding: 14px; background: #f7f9fc; border-radius: 10px; }
 .facts-grid span, .contact-list dt { display: block; color: #758198; font-size: 12px; }
 .facts-grid strong { display: block; margin-top: 7px; font-size: 14px; }
+.facts-grid .fact-account { display: block; margin-top: 4px; color: #9aa5b5; font-size: 12px; }
 .detail-section { padding: 22px 0; border-top: 1px solid #e5eaf2; }
 .contact-list { display: grid; gap: 11px; margin: 0; }
 .contact-list div { display: grid; grid-template-columns: 90px 1fr; gap: 12px; }
@@ -2575,9 +4056,12 @@ h3 { margin-bottom: 14px; font-size: 15px; }
 .setting-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; }
 .refetch-check-result { margin-top: 12px; padding: 10px 12px; border: 1px solid #d7e5e7; border-radius: 4px; background: #f7fafb; font-size: 12px; line-height: 1.6; }
 .refetch-check-result.ok { border-color: #b6d8c4; background: #f2faf5; color: #2f6b4f; }
-.refetch-check-result.warn { border-color: #e8c4c9; background: #fdf5f6; color: #9a2f3b; }
+.refetch-check-result.warn { border-color: #e2c9a4; background: #fdf8f0; color: #7a5220; }
+.refetch-check-result.info { border-color: #c7d8e8; background: #f4f8fc; color: #2c4a67; }
 .refetch-check-result p { margin: 4px 0 0; }
 .refetch-check-result ul { margin: 6px 0 0; padding-left: 18px; }
+.refetch-check-result .refetch-meta { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; letter-spacing: .01em; opacity: .85; overflow-wrap: anywhere; }
+.refetch-check-result .refetch-scope { padding-top: 6px; border-top: 1px dashed currentColor; opacity: .85; }
 .content-source-hint { margin-top: 4px; color: #9a2f3b !important; font-size: 11px !important; }
 .danger-link { color: #9a2f3b; }
 .profile-feedback { margin-top: -8px; }
@@ -2645,10 +4129,16 @@ h3 { color: #20272d; }
 .message-meta .state-label { color: #1d5fbf; font-weight: 700; }
 .message-meta .group-badge { background: #e8f1f8; border: 1px solid #c9dcef; border-radius: 999px; padding: 0 8px; color: #1d5fbf; }
 .message-meta .ingestion-state { color: #68727b; font-weight: 600; }
-.message-row p { grid-column: 2; grid-row: 1; margin: 0; color: #344047; line-height: 1.55; }
+/* Direct children only: .message-content-view is itself a grid, so an
+   unscoped `p` rule put the preview, the source note and the warning into the
+   same row and made the text overlap. */
+.message-row > p { grid-column: 2; grid-row: 1; margin: 0; color: #344047; line-height: 1.55; }
 .message-row .message-actions { grid-column: 3; grid-row: 1 / span 2; justify-content: flex-end; align-items: flex-start; margin-top: 0; }
 .message-row .channel-mark { display: inline-flex; width: fit-content; margin-top: 2px; padding: 3px 6px; color: #1d5fbf; background: #e8f0fb; border-radius: 3px; font-size: 11px; font-weight: 800; }
-.message-row .message-preview { grid-column: 2; }
+.message-row > .message-preview { grid-column: 2; }
+/* 收起态的「安全原文 + 小字概述」作为一个网格项，避免两段 <p> 都落到 row1 col2 重叠。 */
+.message-row > .message-brief { grid-column: 2; grid-row: 1; display: grid; gap: 4px; min-width: 0; }
+.message-brief > .message-preview { margin: 0; color: #344047; font-size: 13px; line-height: 1.55; overflow-wrap: anywhere; }
 .message-actions { gap: 8px; }
 .action-button, .primary, .secondary { min-height: 36px; padding: 8px 12px; border-radius: 4px; font-size: 13px; font-weight: 700; cursor: pointer; }
 .action-button { border: 1px solid #bfc8ce; }
@@ -2678,7 +4168,7 @@ h3 { color: #20272d; }
   .analysis-card:nth-child(2) { border-right: 0; }
   .analysis-card:nth-child(-n + 2) { border-bottom: 1px solid #d7dde1; }
   .message-row { grid-template-columns: 1fr; gap: 7px; }
-  .message-row .message-meta, .message-row p, .message-row .message-preview, .message-row .message-actions, .message-row .channel-mark { grid-column: 1; grid-row: auto; }
+  .message-row .message-meta, .message-row > p, .message-row > .message-preview, .message-row > .message-brief, .message-row .message-actions, .message-row .channel-mark { grid-column: 1; grid-row: auto; }
   .message-row .message-actions { justify-content: flex-start; margin-top: 7px; }
   .message-row .channel-mark { margin-top: 0; }
   .pagination-bar { align-items: stretch; flex-direction: column; }
@@ -2794,7 +4284,7 @@ h3 { font-size: 14px; font-weight: 700; }
   .inbox-panel > .panel-heading, .subsection, .detail-panel { padding-left: 18px; padding-right: 18px; }
   .inbox-filters, .subsection .inbox-filters { margin-left: -18px; margin-right: -18px; padding-left: 18px; padding-right: 18px; }
   .message-row { grid-template-columns: 1fr; gap: 8px; }
-  .message-row .message-meta, .message-row p, .message-row .message-preview, .message-row .message-actions { grid-column: 1; grid-row: auto; }
+  .message-row .message-meta, .message-row > p, .message-row > .message-preview, .message-row > .message-brief, .message-row .message-actions { grid-column: 1; grid-row: auto; }
   .message-row .message-actions { margin-top: 6px; }
   .facts-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .facts-grid div:nth-child(2) { border-right: 0; }
@@ -2952,6 +4442,9 @@ body { min-width: 320px; background: #edf2f3; }
 .profile-operations { display: flex; align-items: center; justify-content: space-between; gap: 18px; padding: 16px 18px; border-bottom: 1px solid #e4ebea; }
 .profile-operations h3, .profile-operations p { margin: 0; }
 .profile-operations p { margin-top: 4px; color: #687782; font-size: 13px; }
+.admin-connect-note { background: #f4f8ff; border: 1px solid #d6e3fb; border-radius: 12px; border-bottom: 1px solid #d6e3fb; }
+.admin-connect-note h3 { color: #1c3f7c; }
+.admin-connect-note p { color: #4b6288; line-height: 1.7; }
 .operation-object-link { padding: 0; color: #176b70; background: transparent; border: 0; font: inherit; text-align: left; text-decoration: underline; text-underline-offset: 3px; cursor: pointer; }
 .operation-object-link:hover { color: #10494d; }
 .operation-log-backdrop { position: fixed; z-index: 1200; inset: 0; display: grid; place-items: center; padding: 20px; background: rgba(22, 34, 37, .42); }
@@ -2971,7 +4464,20 @@ body { min-width: 320px; background: #edf2f3; }
 .message-row { scroll-margin-top: 100px; }
 .message-row.is-focused-message { z-index: 1; background: #e5f3e9; outline: 2px solid #247a57; box-shadow: inset 6px 0 0 #247a57, 0 5px 18px rgba(31, 100, 72, .16); animation: message-focus-arrive 700ms ease-out both; }
 .message-row.is-focused-message::after { content: '当前查看'; position: absolute; top: 8px; right: 8px; padding: 3px 8px; color: #fff; background: #247a57; border-radius: 3px; font-size: 11px; font-weight: 700; }
-.linked-message-overview { margin: 8px 0; padding: 10px 12px; color: #283b39; background: #f1f7f2; border-left: 3px solid #61916e; line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; }
+/* 客户链路：主展示是清洗后的安全原文，中文概述只在下方以小字补充。 */
+.linked-message-safe-text { margin: 4px 0 0; padding: 11px 13px; color: #223439; background: #fff; border: 1px solid #dfe8e9; border-left: 3px solid #367c72; border-radius: 4px; font-family: inherit; font-size: 13.5px; line-height: 1.7; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 16em; overflow: auto; }
+.linked-message-safe-text.is-revoked { color: #8a5a20; background: #fff8ec; border-left-color: #d69a3c; }
+.linked-message-safe-text.is-hidden, .linked-message-safe-text.is-empty { color: #52666b; background: transparent; border-style: dashed; font-size: 12.5px; }
+.linked-message-safe-text.is-hidden.is-admin-status-success { color: #18794e; background: #f0faf4; border-color: #b7e4c7; border-left-color: #23945f; }
+.linked-message-safe-text.is-hidden.is-admin-status-failure { color: #b42318; background: #fff4f2; border-color: #f4c7c3; border-left-color: #d92d20; }
+.linked-message-item.is-revoked { background: #fffaf1; border-color: #eeddbd; }
+.linked-message-revoked-label { color: #a05d16; font-weight: 700; }
+.linked-message-more { display: block; font-size: 11.5px; }
+.linked-message-copy > .linked-message-overview { display: block; margin: 6px 0 0; padding: 0; color: #52666b; background: transparent; border: 0; font-size: 12px; font-weight: 400; line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; }
+.message-overview-inline { margin: 5px 0 0; color: #52666b; font-size: 12px; line-height: 1.55; }
+.state-label.is-revoked, .is-revoked-text { color: #a05d16; }
+.customer-message-revoked-tag { display: inline-block; margin-left: 8px; padding: 1px 6px; color: #8a5a20; background: #fff1d9; border-radius: 3px; font-size: 11px; font-weight: 700; }
+.customer-message-text.is-revoked { color: #8a5a20; background: #fff8ec; border-color: #ead7b4; }
 @keyframes message-focus-arrive { from { background: #d5eddf; transform: translateY(5px); } to { background: #e5f3e9; transform: translateY(0); } }
 .message-meta strong, .inquiry-row strong { color: #24373c; }
 .message-overview { color: #31515a !important; font-weight: 500; }
@@ -3007,7 +4513,7 @@ body { min-width: 320px; background: #edf2f3; }
   .subsection { padding: 15px; }
   .inbox-filters { flex-wrap: wrap; padding: 12px 15px; }
   .message-row { grid-template-columns: 1fr; gap: 8px; }
-  .message-row .message-meta, .message-row p, .message-row .message-preview, .message-row .message-actions { grid-column: 1; grid-row: auto; }
+  .message-row .message-meta, .message-row > p, .message-row > .message-preview, .message-row > .message-brief, .message-row .message-actions { grid-column: 1; grid-row: auto; }
   .message-row .message-actions { justify-content: flex-start; margin-top: 4px; }
   .transfer-form { grid-template-columns: 1fr; }
   .transfer-form .primary { grid-column: 1; }
@@ -3038,13 +4544,17 @@ body { min-width: 320px; background: #edf2f3; }
 .link-review-footer { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 14px 24px; background: #fafcfc; border-top: 1px solid #e8edef; }
 .link-review-footer span { color: #718085; font-size: 12px; }
 .link-review-footer .secondary { min-width: 74px; min-height: 36px; }
+.customer-message-dialog { width: min(720px, 100%); }
+.customer-message-text { margin: 0; padding: 16px 18px; color: #202d31; background: #f8fafb; border: 1px solid #e2e9eb; border-radius: 6px; font-family: inherit; font-size: 14px; line-height: 1.75; white-space: pre-wrap; overflow-wrap: anywhere; }
+.customer-message-source { margin: 12px 0 0; color: #718085; font-size: 12px; line-height: 1.6; }
+.customer-message-actions { display: flex; gap: 8px; flex: 0 0 auto; }
 .link-dialog-enter-active, .link-dialog-leave-active { transition: opacity 180ms ease; }
 .link-dialog-enter-active .link-review-dialog, .link-dialog-leave-active .link-review-dialog { transition: transform 180ms cubic-bezier(.2,.75,.25,1); }
 .link-dialog-enter-from, .link-dialog-leave-to { opacity: 0; }
 .link-dialog-enter-from .link-review-dialog, .link-dialog-leave-to .link-review-dialog { transform: translateY(10px); }
 @media (max-width: 700px) {
   .message-row { grid-template-columns: 1fr; gap: 8px; }
-  .message-row .message-meta, .message-row p, .message-row .message-preview, .message-row .message-actions { grid-column: 1; grid-row: auto; }
+  .message-row .message-meta, .message-row > p, .message-row > .message-preview, .message-row > .message-brief, .message-row .message-actions { grid-column: 1; grid-row: auto; }
   .link-review-backdrop { align-items: end; padding: 8px; }
   .link-review-dialog { width: 100%; max-height: 88vh; border-radius: 10px 10px 6px 6px; }
   .link-review-heading, .link-review-content { padding-right: 16px; padding-left: 16px; }
@@ -3068,6 +4578,215 @@ body { min-width: 320px; background: #edf2f3; }
 @media (max-width: 700px) {
   .page-breadcrumb { padding: 10px 12px; }
   .restore-link-banner { flex-direction: column; align-items: flex-start; }
+}
+
+/* Admin employee management: labelled forms, roomy cards and a full roster table. */
+.employee-admin-page { display: grid; grid-template-columns: minmax(0, 1fr); gap: 20px; margin-bottom: 48px; }
+.ea-hero { display: flex; align-items: flex-start; justify-content: space-between; gap: 24px; padding: 26px 28px; background: #fff; border: 1px solid #e2e7f0; border-radius: 16px; box-shadow: 0 10px 30px rgba(30, 45, 75, .06); }
+.ea-hero-text h2 { margin: 0 0 8px; font-size: 26px; font-weight: 650; letter-spacing: -.02em; }
+.ea-hero-lede { max-width: 640px; margin: 0; color: #667287; font-size: 14px; line-height: 1.7; }
+.ea-hero-actions { display: flex; flex: 0 0 auto; flex-wrap: wrap; gap: 10px; }
+.ea-hero-actions .secondary { padding: 10px 16px; }
+.ea-alert { margin: 0; }
+.ea-stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; }
+.ea-stat { display: grid; gap: 6px; padding: 18px 20px; background: #fff; border: 1px solid #e2e7f0; border-radius: 14px; box-shadow: 0 6px 18px rgba(30, 45, 75, .04); }
+.ea-stat > span { color: #6c7890; font-size: 12px; font-weight: 650; }
+.ea-stat strong { color: #172033; font-size: 28px; line-height: 1.15; }
+.ea-stat small { color: #8a95a8; font-size: 12px; }
+.ea-card { overflow: hidden; background: #fff; border: 1px solid #e2e7f0; border-radius: 16px; box-shadow: 0 10px 30px rgba(30, 45, 75, .06); }
+.ea-card-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; padding: 22px 26px 18px; border-bottom: 1px solid #edf0f5; }
+.ea-card-head h3 { margin: 0 0 6px; color: #172033; font-size: 17px; font-weight: 650; }
+.ea-card-head p { margin: 0; color: #758198; font-size: 13px; line-height: 1.6; }
+.ea-step { display: grid; flex: 0 0 auto; width: 34px; height: 34px; place-items: center; color: #3158c9; background: #edf2ff; border-radius: 10px; font-size: 12px; font-weight: 700; }
+.ea-form { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); align-items: start; gap: 18px 20px; padding: 24px 26px 26px; }
+.ea-field { display: flex; flex-direction: column; gap: 7px; min-width: 0; }
+.ea-label { color: #3f4b5e; font-size: 12px; font-weight: 650; }
+.ea-label em { margin-left: 6px; padding: 2px 6px; color: #7a4d00; background: #fff1c7; border-radius: 4px; font-size: 10px; font-style: normal; font-weight: 700; }
+.ea-field input, .ea-field select { width: 100%; min-height: 42px; padding: 10px 12px; color: #172033; background: #fff; border: 1px solid #d7dfe9; border-radius: 9px; font: inherit; font-size: 14px; outline: none; transition: border-color .15s, box-shadow .15s; }
+.ea-field input:focus, .ea-field select:focus { border-color: #3158c9; box-shadow: 0 0 0 3px rgba(49, 88, 201, .12); }
+.ea-field input::placeholder { color: #a3adbd; }
+.ea-field input:disabled, .ea-field select:disabled { color: #8b96a8; background: #f5f7fa; cursor: not-allowed; }
+.ea-hint { color: #8a95a8; font-size: 11.5px; line-height: 1.5; }
+.ea-form-submit { display: flex; grid-column: 1 / -1; align-items: center; gap: 16px; padding-top: 4px; }
+.ea-form-submit .primary { padding: 11px 22px; font-weight: 650; }
+.ea-form-submit .primary:disabled { opacity: .6; cursor: not-allowed; }
+.ea-feedback { display: flex; grid-column: 1 / -1; align-items: flex-start; gap: 12px; padding: 14px 16px; margin: 0 0 2px; border: 1px solid; border-radius: 11px; font-size: 13px; line-height: 1.65; }
+.ea-feedback.success { color: #14603f; background: #f0fbf5; border-color: #b9e6cf; }
+.ea-inline-feedback { display: flex; align-items: flex-start; gap: 8px; margin: 10px 0 0; padding: 9px 12px; border: 1px solid; border-radius: 9px; font-size: 12.5px; line-height: 1.65; }
+.ea-inline-feedback.success { color: #14603f; background: #f0fbf5; border-color: #b9e6cf; }
+.ea-inline-feedback.error { color: #8f2f3c; background: #fff7f8; border-color: #f2c9cf; }
+.ea-inline-feedback-icon { display: grid; flex: 0 0 auto; width: 18px; height: 18px; margin-top: 1px; place-items: center; color: #fff; border-radius: 50%; font-size: 11px; font-weight: 700; }
+.ea-inline-feedback.success .ea-inline-feedback-icon { background: #1f9d63; }
+.ea-inline-feedback.error .ea-inline-feedback-icon { background: #d1495b; }
+.ea-feedback.error { color: #8f2f3c; background: #fff7f8; border-color: #f2c9cf; }
+.ea-feedback-icon { display: grid; flex: 0 0 auto; width: 22px; height: 22px; place-items: center; color: #fff; border-radius: 50%; font-size: 13px; font-weight: 700; }
+.ea-feedback.success .ea-feedback-icon { background: #1f9d63; }
+.ea-feedback.error .ea-feedback-icon { background: #d1495b; }
+.ea-feedback-body { flex: 1 1 auto; min-width: 0; }
+.ea-feedback-body strong { display: block; margin-bottom: 2px; font-size: 13px; font-weight: 700; }
+.ea-feedback-body p { margin: 0; }
+.ea-feedback-link { flex: 0 0 auto; padding-top: 2px; font-size: 12px; white-space: nowrap; }
+.ea-feedback-close { flex: 0 0 auto; width: 24px; height: 24px; padding: 0; color: inherit; background: transparent; border: 0; border-radius: 6px; font-size: 18px; line-height: 1; cursor: pointer; opacity: .6; }
+.ea-feedback-close:hover { opacity: 1; background: rgba(0, 0, 0, .05); }
+.ea-feedback-block { grid-column: auto; margin: 18px 26px 0; }
+.ea-channel-accounts-table { min-width: 960px; }
+.ea-regrant { padding: 8px 13px; font-size: 12px; font-weight: 600; white-space: nowrap; }
+.ea-regrant:disabled { opacity: .6; cursor: not-allowed; }
+.ea-transfer-bar { display: grid; grid-template-columns: minmax(210px, 260px) minmax(0, 1fr) auto; align-items: end; gap: 18px 22px; padding: 22px 26px; background: #f7f9ff; border-bottom: 1px solid #e6ebf7; }
+.ea-transfer-field { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.ea-transfer-field select { width: 100%; min-height: 44px; padding: 10px 12px; color: #172033; background: #fff; border: 1px solid #cfd9ec; border-radius: 9px; font: inherit; font-size: 14px; outline: none; }
+.ea-transfer-field select:focus { border-color: #3158c9; box-shadow: 0 0 0 3px rgba(49, 88, 201, .12); }
+.ea-transfer-copy { padding-bottom: 2px; }
+.ea-transfer-copy strong { display: block; margin-bottom: 5px; color: #253550; font-size: 13px; font-weight: 650; }
+.ea-transfer-copy p { margin: 0; color: #73819a; font-size: 12px; line-height: 1.7; }
+.ea-transfer-submit { min-height: 44px; padding: 11px 20px; font-size: 13px; font-weight: 650; white-space: nowrap; }
+.ea-transfer-submit:disabled, .ea-transfer-one:disabled { opacity: .55; cursor: not-allowed; }
+.ea-transfer-empty { margin: 0; padding: 12px 26px; color: #8a5a00; background: #fff8e8; border-bottom: 1px solid #f0e0bb; font-size: 12.5px; line-height: 1.6; }
+.ea-table tbody tr.ea-row-checked:not(.is-revoked) { background: #fbfcff; }
+.ea-th-check { width: 44px; text-align: center; white-space: nowrap; }
+.ea-th-check input[type="checkbox"] { width: 16px; height: 16px; accent-color: #3158c9; cursor: pointer; }
+.ea-owner { display: flex; flex-direction: column; align-items: flex-start; gap: 5px; }
+.ea-row-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
+.ea-transfer-one { padding: 8px 12px; font-size: 12px; font-weight: 600; white-space: nowrap; }
+.ea-card-foot { margin: 0; padding: 14px 26px 20px; color: #8a95a8; border-top: 1px solid #edf0f5; font-size: 12px; line-height: 1.65; }
+.ea-table tbody tr.is-revoked { background: #fff9f9; }
+.ea-toolbar { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 14px; padding: 20px 26px; background: #fafbfd; border-bottom: 1px solid #edf0f5; }
+.ea-search { flex: 1 1 260px; max-width: 340px; }
+.ea-toolbar-select { width: 160px; }
+.ea-toolbar-hint { flex: 0 0 auto; max-width: 170px; padding-bottom: 12px; }
+.ea-clear { padding-bottom: 12px; font-size: 12px; }
+.ea-scroll-hint { display: none; width: 100%; color: #8a95a8; font-size: 11.5px; }
+.ea-table-wrap { overflow-x: auto; }
+.ea-table { width: 100%; min-width: 940px; border-collapse: collapse; font-size: 13px; text-align: left; }
+.ea-table th, .ea-table td { padding: 15px 18px; border-bottom: 1px solid #edf0f5; vertical-align: middle; }
+.ea-table th { position: sticky; top: 0; z-index: 1; color: #5c6b80; background: #f5f7fb; font-size: 12px; font-weight: 650; white-space: nowrap; }
+.ea-table tbody tr:not(.ea-detail-row):hover { background: #f8faff; }
+.ea-table tbody tr.is-selected { background: #eef3ff; }
+.ea-table tbody tr.is-inactive { color: #98a2b3; }
+.ea-th-action { text-align: right; white-space: nowrap; }
+.ea-person { display: flex; align-items: center; gap: 11px; }
+.ea-avatar { display: grid; flex: 0 0 36px; width: 36px; height: 36px; place-items: center; color: #3158c9; background: #eaf0ff; border-radius: 10px; font-size: 15px; font-weight: 700; }
+.ea-person-name { display: grid; gap: 2px; min-width: 0; }
+.ea-person-name strong { font-size: 14px; font-weight: 650; overflow-wrap: anywhere; }
+.ea-person-name small { color: #8a95a8; font-size: 11px; }
+.ea-role { display: inline-block; padding: 4px 10px; color: #165d68; background: #eaf5f5; border-radius: 6px; font-size: 12px; font-weight: 600; white-space: nowrap; }
+.ea-pills, .ea-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.ea-pill { padding: 3px 9px; border-radius: 999px; font-size: 11px; font-weight: 650; white-space: nowrap; }
+.ea-pill.is-on { color: #176b43; background: #e4f6eb; }
+.ea-pill.is-off { color: #5f6368; background: #e9ecef; }
+.ea-pill.is-warn { color: #8a5a00; background: #fff2cc; }
+.ea-chip { padding: 3px 9px; color: #3d4b5c; background: #eef1f6; border-radius: 6px; font-size: 11px; font-weight: 600; white-space: nowrap; }
+.ea-chip.is-blue { color: #2450a6; background: #e9f0ff; }
+.ea-chip.is-purple { color: #6a3fa0; background: #f1eafb; }
+.ea-chip.is-removable { border: 1px solid #d7dfe9; cursor: pointer; }
+.ea-chip.is-removable:hover { color: #9a2f3b; background: #fff0f2; border-color: #efc7cd; }
+.ea-chip.is-removable span { margin-left: 4px; font-size: 13px; }
+.ea-muted { color: #9aa5b5; font-size: 12px; }
+.ea-archive-card { border-color: #e4e8f0; background: #fbfcfe; }
+.ea-archive-card .ea-table { min-width: 760px; }
+.ea-archive-card .ea-table th { background: #f1f3f8; }
+.ea-archive-count { flex: 0 0 auto; padding: 5px 12px; color: #5f6368; background: #eceff4; border-radius: 999px; font-size: 12px; font-weight: 650; }
+.ea-avatar.is-off { color: #7b8494; background: #eceff4; }
+.ea-manage { padding: 8px 14px; font-size: 12px; }
+.ea-detail-row > td { padding: 0; background: #f7f9fd; border-bottom: 2px solid #dfe6f5; }
+.ea-detail { padding: 24px 26px 28px; }
+.ea-detail-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin-bottom: 18px; }
+.ea-detail-head h4 { margin: 0 0 5px; font-size: 16px; font-weight: 650; }
+.ea-detail-head p { margin: 0; color: #758198; font-size: 12.5px; line-height: 1.6; }
+/* 账户名是唯一登录凭据，展开设置后必须一眼能看到，否则改错人也不知道。 */
+.ea-detail-account { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 14px; margin: 0 0 6px !important; color: #4a5568; font-size: 12.5px; }
+.ea-detail-account code { padding: 2px 8px; color: #172033; background: #eef1f7; border: 1px solid #e2e7f0; border-radius: 6px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px; font-weight: 650; letter-spacing: .01em; }
+.ea-detail-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+.ea-detail-block { display: flex; flex-direction: column; gap: 12px; padding: 20px; background: #fff; border: 1px solid #e4e9f2; border-radius: 12px; }
+.ea-detail-block h5 { margin: 0; color: #172033; font-size: 14px; font-weight: 650; }
+.ea-block-note { margin: 0; color: #6c7890; font-size: 12px; line-height: 1.7; }
+.ea-block-note strong { color: #3158c9; }
+.ea-detail-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+.ea-inline-form { display: flex; align-items: flex-end; gap: 10px; }
+.ea-inline-form .ea-field { flex: 1 1 auto; }
+.ea-inline-form .secondary { flex: 0 0 auto; min-height: 42px; }
+.ea-chips-removable { margin: 2px 0; }
+.ea-channel-toggles { display: grid; gap: 9px; }
+.ea-channel-feedback { margin: 0; padding: 9px 11px; border: 1px solid; border-radius: 8px; font-size: 12px; }
+.ea-channel-feedback.success { color: #176b43; background: #f0faf4; border-color: #8fc9ae; }
+.ea-channel-feedback.error { color: #9a2f3b; background: #fff5f6; border-color: #efc7cd; }
+.ea-toggle { display: flex; align-items: center; gap: 12px; width: 100%; padding: 11px 13px; color: #3f4b5e; background: #fafbfd; border: 1px solid #dfe5ee; border-radius: 10px; text-align: left; }
+.ea-toggle.is-granted { background: #f0faf4; border-color: #8fc9ae; }
+.ea-channel-action { flex: 0 0 auto; padding: 6px 11px; color: #2450a6; background: #fff; border: 1px solid #cbd6e8; border-radius: 7px; cursor: pointer; font-size: 12px; }
+.ea-channel-action:hover:not(:disabled) { background: #f2f6ff; border-color: #3158c9; }
+.ea-channel-action:disabled { cursor: wait; opacity: .65; }
+.ea-channel-revoke { color: #9a2f3b; border-color: #efc7cd; }
+.ea-channel-revoke:hover:not(:disabled) { background: #fff5f6; border-color: #d98c96; }
+.ea-toggle-dot { flex: 0 0 12px; width: 12px; height: 12px; background: #cbd4e1; border-radius: 50%; box-shadow: inset 0 0 0 2px #fff; }
+.ea-toggle.is-granted .ea-toggle-dot { background: #2e9c68; }
+.ea-toggle-text { display: grid; flex: 1; gap: 2px; }
+.ea-toggle-text strong { font-size: 13px; font-weight: 650; }
+.ea-toggle-text small { color: #8a95a8; font-size: 11px; }
+.ea-toggle-state { color: #7b8798; font-size: 11px; font-weight: 650; white-space: nowrap; }
+.ea-toggle.is-granted .ea-toggle-state { color: #176b43; }
+.ea-danger-row { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; padding-top: 4px; border-top: 1px dashed #e6ebf2; }
+.ea-danger-link, .ea-danger { color: #9a2f3b; }
+.ea-danger { padding: 9px 14px; font-size: 13px; font-weight: 650; background: #fff5f6; border: 1px solid #efc7cd; border-radius: 9px; cursor: pointer; }
+.ea-danger:hover { background: #ffe9ec; }
+.ea-confirm-text { color: #9a2f3b; font-size: 12.5px; font-weight: 600; }
+.ea-empty { padding: 46px 20px; color: #8a95a8; text-align: center; }
+@media (max-width: 980px) {
+  .ea-form { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .ea-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .ea-detail-grid { grid-template-columns: 1fr; }
+  .ea-transfer-bar { grid-template-columns: minmax(200px, 260px) minmax(0, 1fr); }
+  .ea-transfer-submit { grid-column: 1 / -1; justify-self: start; }
+}
+@media (max-width: 620px) {
+  .employee-admin-page { gap: 14px; padding: 0 12px; }
+  .ea-hero { flex-direction: column; padding: 20px; }
+  .ea-form { grid-template-columns: 1fr; padding: 20px; }
+  .ea-card-head, .ea-toolbar, .ea-detail { padding-left: 18px; padding-right: 18px; }
+  .ea-transfer-bar { grid-template-columns: 1fr; gap: 14px; padding: 18px; }
+  .ea-transfer-submit { grid-column: 1; width: 100%; white-space: normal; }
+  .ea-transfer-empty { padding: 12px 18px; }
+  .ea-row-actions { justify-content: flex-start; }
+  .ea-detail-fields, .ea-inline-form { flex-direction: column; align-items: stretch; }
+  .ea-inline-form .secondary { width: 100%; }
+  .ea-stat { padding: 14px 16px; }
+  .ea-scroll-hint { display: block; }
+  .ea-feedback { flex-wrap: wrap; gap: 8px 10px; padding: 12px 14px; }
+  .ea-feedback-body { flex: 1 1 calc(100% - 60px); }
+  .ea-feedback-link { margin-left: 34px; }
+  .ea-feedback-block { margin: 14px 16px 0; }
+  .ea-card-foot { padding-left: 18px; padding-right: 18px; }
+}
+@media (max-width: 700px) {
+  /* Higher specificity than the shared stylesheet so header buttons wrap instead of overflowing. */
+  .workspace > .topbar { flex-direction: column; flex-wrap: wrap; align-items: flex-start; gap: 12px; }
+  .workspace > .topbar .topbar-actions { width: 100%; flex-wrap: wrap; gap: 8px; }
+}
+
+/* Conversation group headers: give the label room to breathe. */
+.message-group .message-group-bar { gap: 16px; }
+.message-group .message-group-bar .group-label { display: inline-flex; align-items: center; flex-wrap: wrap; gap: 8px; font-size: 13px; line-height: 1.65; }
+.message-group .message-group-bar .gb-group-tag { margin-left: 0; }
+
+/* 批量处理：整页 / 整组一次提交，同一会话不再需要逐条点。 */
+.bulk-action-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 16px; margin: 14px 0 4px; padding: 10px 14px; background: #f1f7f8; border: 1px solid #d7e5e7; border-radius: 6px; }
+.bulk-select-all, .group-select-control, .message-select-control { display: inline-flex; align-items: center; gap: 6px; color: #165d68; font-size: 12px; font-weight: 700; cursor: pointer; }
+.bulk-select-all input, .group-select-control input, .message-select-control input { flex: 0 0 auto; width: 15px; height: 15px; margin: 0; accent-color: #247a57; cursor: pointer; }
+.bulk-select-all input:disabled + span, .group-select-control input:disabled + span, .message-select-control input:disabled + span { opacity: .55; }
+.bulk-selection-count { color: #314b50; font-size: 12px; font-weight: 700; white-space: nowrap; }
+.bulk-action-buttons { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-left: auto; }
+.bulk-feedback { flex-basis: 100%; margin: 0; font-size: 12px; line-height: 1.6; }
+.bulk-feedback.success { color: #176b43; }
+.bulk-feedback.error { color: #9a2f3b; }
+.message-group .message-group-bar { flex-wrap: wrap; }
+.message-group .message-group-bar .group-label { flex: 1 1 240px; }
+.group-bulk-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.group-bulk-button { min-height: 28px; padding: 4px 10px; font-size: 12px; }
+.message-select-control { color: #314b50; font-size: 11px; font-weight: 600; }
+.message-select-control input { width: 14px; height: 14px; }
+@media (max-width: 720px) {
+  .bulk-action-bar { gap: 8px 12px; }
+  .bulk-action-buttons { width: 100%; margin-left: 0; }
+  .message-group .message-group-bar .group-label { flex-basis: 100%; }
 }
 </style>
 

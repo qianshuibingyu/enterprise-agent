@@ -20,6 +20,7 @@ from app.models.business import (
     WhatsAppGroupBinding,
 )
 from app.models.user import User
+from app.models.permissions import UserChannelPreauthorization
 
 GROUP_JID = "120363000000000000@g.us"
 GROUP_JID_OTHER = "120363000000000001@g.us"
@@ -73,9 +74,9 @@ def env():
     factory = sessionmaker(bind=engine, expire_on_commit=False)
     with factory() as db:
         db.add_all([
-            User(id=1, username="op-a", password_hash=hash_password("operator1"), role="staff", is_active=True, must_change_password=False),
-            User(id=2, username="op-b", password_hash=hash_password("operator2"), role="staff", is_active=True, must_change_password=False),
-            User(id=3, username="sale", password_hash=hash_password("salespass1"), role="sales", is_active=True, must_change_password=False),
+            User(id=1, username="op-a", password_hash=hash_password("operator1"), role="staff", department="inquiry", is_active=True, must_change_password=False),
+            User(id=2, username="op-b", password_hash=hash_password("operator2"), role="staff", department="inquiry", is_active=True, must_change_password=False),
+            User(id=3, username="sale", password_hash=hash_password("salespass1"), role="sales", department="inquiry", is_active=True, must_change_password=False),
         ])
         db.flush()
         db.add_all([
@@ -88,6 +89,10 @@ def env():
             ChannelGrant(channel_account_id=1, channel_type="whatsapp", owner_user_id=1),
             ChannelGrant(channel_account_id=2, channel_type="whatsapp", owner_user_id=2),
             ChannelGrant(channel_account_id=3, channel_type="whatsapp", owner_user_id=1),
+        ])
+        db.add_all([
+            UserChannelPreauthorization(user_id=1, channel_type="whatsapp", granted_by_user_id=1),
+            UserChannelPreauthorization(user_id=2, channel_type="whatsapp", granted_by_user_id=1),
         ])
         # Group rows carry normalized contacts = NULL (matching the bridge contract).
         # The other rows are already-obtained customer phone numbers.
@@ -426,7 +431,7 @@ def test_delete_removes_binding_and_records_operation_log(env):
         assert log.object_id == binding_id
 
 
-def test_null_channel_account_binding_is_visible_and_deletable(env):
+def test_null_channel_account_binding_is_hidden_and_not_mutable(env):
     http, factory = env
     login(http, "op-a", "operator1")
     with factory() as db:
@@ -442,15 +447,13 @@ def test_null_channel_account_binding_is_visible_and_deletable(env):
 
     listed = http.get("/api/whatsapp-group-bindings")
     assert listed.status_code == 200
-    item = next(it for it in listed.json() if it["id"] == row_id)
-    assert item["channel_account_id"] is None
-    assert item["bound_by"] is None
+    assert all(item["id"] != row_id for item in listed.json())
 
     response = http.delete(
         f"/api/whatsapp-group-bindings/{row_id}",
         headers=csrf_headers(http),
     )
-    assert response.status_code == 200
-    assert response.json() == {"ok": True}
+    assert response.status_code == 403
     with factory() as db:
-        assert binding_count(db) == 0
+        assert binding_count(db) == 1
+        assert db.get(WhatsAppGroupBinding, row_id) is not None

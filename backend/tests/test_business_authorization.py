@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from fastapi.testclient import TestClient
@@ -21,7 +21,10 @@ from app.models.business import (
     Message,
     MessageAttachment,
 )
+from app.models.overview import MessageOverview
 from app.models.user import User
+from app.models.permissions import UserChannelPreauthorization, UserDepartmentGrant
+from app.authorization import department_read_scope, has_department_identity, scoped_inquiries, scoped_messages
 
 
 @pytest.fixture
@@ -36,15 +39,22 @@ def business_client():
     with testing_session() as db:
         db.add_all(
             [
-                User(username="operator", password_hash=hash_password("operator1"), role="staff", is_active=True, must_change_password=False),
-                User(username="other-operator", password_hash=hash_password("otherop1"), role="staff", is_active=True, must_change_password=False),
-                User(username="sales", password_hash=hash_password("salespass1"), role="sales", is_active=True, must_change_password=False),
-                User(username="other-sales", password_hash=hash_password("othersale1"), role="sales", is_active=True, must_change_password=False),
-                User(username="empty-operator", password_hash=hash_password("emptyop1"), role="staff", is_active=True, must_change_password=False),
-                User(username="admin", password_hash=hash_password("adminpass1"), role="admin", is_active=True, must_change_password=False),
+                User(username="operator", password_hash=hash_password("operator1"), role="staff", department="inquiry", is_active=True, must_change_password=False),
+                User(username="other-operator", password_hash=hash_password("otherop1"), role="staff", department="inquiry", is_active=True, must_change_password=False),
+                User(username="sales", password_hash=hash_password("salespass1"), role="sales", department="inquiry", is_active=True, must_change_password=False),
+                User(username="other-sales", password_hash=hash_password("othersale1"), role="sales", department="inquiry", is_active=True, must_change_password=False),
+                User(username="empty-operator", password_hash=hash_password("emptyop1"), role="staff", department="inquiry", is_active=True, must_change_password=False),
+                User(username="admin", password_hash=hash_password("adminpass1"), role="admin", department="administration", is_active=True, must_change_password=False),
             ]
         )
         db.flush()
+        db.add_all([
+            UserChannelPreauthorization(user_id=1, channel_type="gmail", granted_by_user_id=6),
+            UserChannelPreauthorization(user_id=1, channel_type="outlook", granted_by_user_id=6),
+            UserChannelPreauthorization(user_id=2, channel_type="outlook", granted_by_user_id=6),
+            UserChannelPreauthorization(user_id=5, channel_type="gmail", granted_by_user_id=6),
+            UserChannelPreauthorization(user_id=5, channel_type="whatsapp", granted_by_user_id=6),
+        ])
         first_account = ChannelAccount(owner_user_id=1, channel_type="gmail", status="connected")
         blocked_account = ChannelAccount(owner_user_id=1, channel_type="outlook", status="blocked")
         other_account = ChannelAccount(owner_user_id=2, channel_type="outlook", status="connected")
@@ -160,6 +170,7 @@ def business_client():
                 ),
                 Inquiry(
                     customer_contact="customer@example.com",
+                    department="inquiry",
                     normalized_customer_contact="customer@example.com",
                     contact_identity_state="certain",
                     contact_identity_kind="email",
@@ -182,6 +193,7 @@ def business_client():
                 ),
                 Inquiry(
                     customer_contact="other@example.com",
+                    department="inquiry",
                     normalized_customer_contact="other@example.com",
                     contact_identity_state="certain",
                     contact_identity_kind="email",
@@ -193,6 +205,7 @@ def business_client():
                 ),
                 Inquiry(
                     customer_contact="mine@example.com",
+                    department="inquiry",
                     normalized_customer_contact="mine@example.com",
                     contact_identity_state="certain",
                     contact_identity_kind="email",
@@ -231,6 +244,7 @@ def business_client():
                 ),
                 Inquiry(
                     customer_contact="revoked@example.com",
+                    department="inquiry",
                     normalized_customer_contact="revoked@example.com",
                     contact_identity_state="certain",
                     contact_identity_kind="email",
@@ -269,12 +283,50 @@ def login(client, username, password):
     return response
 
 
+def test_department_reader_identity_and_scope_contract(business_client):
+    with business_client.testing_session() as db:
+        readers = {
+            role: User(username=f"{role}-reader", password_hash=hash_password("readerpass1"),
+                       role=role, department=role.title(), is_active=True, must_change_password=False)
+            for role in ("engineering", "production", "procurement")
+        }
+        db.add_all(readers.values())
+        db.flush()
+        db.add(UserDepartmentGrant(user_id=readers["engineering"].id, department="Production", granted_by_user_id=6))
+        db.commit()
+        assert all(has_department_identity(user) for user in readers.values())
+        assert not has_department_identity(User(role="engineering", department="  "))
+        assert not has_department_identity(User(role="procurement", department="  "))
+        assert not has_department_identity(User(role="engineering", department="unassigned"))
+        assert set(db.scalars(department_read_scope(readers["engineering"])).all()) == {"Production", "Engineering"}
+
+
+def test_department_readers_are_denied_customer_message_scopes(business_client):
+    with business_client.testing_session() as db:
+        user = User(username="engineering-reader", password_hash=hash_password("readerpass1"), role="engineering", department="Engineering", is_active=True, must_change_password=False)
+        db.add(user)
+        db.commit()
+        assert db.scalars(scoped_inquiries(user)).all() == []
+        assert db.scalars(scoped_messages(user)).all() == []
+
+
 def test_business_resources_require_authentication(business_client):
     assert business_client.get("/api/inquiry-transfer-targets").status_code == 401
     assert business_client.get("/api/channel-accounts").status_code == 401
     assert business_client.get("/api/messages").status_code == 401
     assert business_client.get("/api/inquiries").status_code == 401
     assert business_client.post("/api/internal-ai/query", json={"query": "inquiries"}).status_code == 401
+
+
+def test_channel_account_list_allows_null_external_account_id(business_client):
+    login(business_client, "operator", "operator1")
+
+    response = business_client.get("/api/channels/accounts")
+
+    assert response.status_code == 200
+    accounts = response.json()
+    assert accounts
+    assert any(account["external_account_id"] is None for account in accounts)
 
 
 def test_gmail_account_initialization_is_idempotent_and_not_provider_connected(business_client):
@@ -294,11 +346,212 @@ def test_gmail_account_initialization_is_idempotent_and_not_provider_connected(b
     assert second.json()["status"] == "not_ready"
 
 
+def test_legacy_owned_account_stays_readable_without_channel_preauthorization(business_client):
+    """Accounts created before the 0019 grant table must not be locked out.
+
+    Preauthorization gates onboarding a *new* channel, not reading history that
+    was already collected under an account the operator owns (ChannelGrant).
+    """
+    with business_client.testing_session() as db:
+        legacy = User(
+            username="legacy-operator",
+            password_hash=hash_password("legacyop1"),
+            role="staff",
+            department="inquiry",
+            is_active=True,
+            must_change_password=False,
+        )
+        db.add(legacy)
+        db.flush()
+        account = ChannelAccount(owner_user_id=legacy.id, channel_type="gmail", status="connected")
+        db.add(account)
+        db.flush()
+        db.add(ChannelGrant(
+            channel_account_id=account.id,
+            channel_type="gmail",
+            owner_user_id=legacy.id,
+        ))
+        db.add(Message(
+            channel_account_id=account.id,
+            provider="gmail_api_pubsub",
+            external_message_id="legacy-preauth-free",
+            direction="inbound",
+            status="received",
+            handling_status="pending",
+            occurred_at=datetime(2026, 10, 23, tzinfo=timezone.utc),
+            raw_content="legacy account message",
+            customer_contact="legacy@example.com",
+            normalized_customer_contact="legacy@example.com",
+            contact_identity_state="certain",
+            contact_identity_kind="email",
+            link_state="unmatched",
+        ))
+        db.commit()
+
+    login(business_client, "legacy-operator", "legacyop1")
+    accounts = business_client.get("/api/channel-accounts")
+    assert accounts.status_code == 200
+    assert any(item["channel_type"] == "gmail" for item in accounts.json())
+    messages = business_client.get("/api/messages")
+    assert messages.status_code == 200
+    assert "legacy-preauth-free" in {item["external_message_id"] for item in messages.json()["items"]}
+
+    # Onboarding a different channel still requires an admin grant.
+    csrf = business_client.cookies.get("ea_csrf")
+    denied = business_client.post(
+        "/api/channels/whatsapp/accounts",
+        headers={"Origin": "https://testserver", "X-CSRF-Token": csrf},
+    )
+    assert denied.status_code == 403
+
+
+def test_first_login_user_cannot_write_business_state_with_valid_csrf(business_client):
+    """Stage 1 step 3: require_csrf and current_user must agree during forced password change."""
+    def headers():
+        return {"Origin": "https://testserver", "X-CSRF-Token": business_client.cookies.get("ea_csrf")}
+
+    with business_client.testing_session() as db:
+        pending = User(
+            username="pending-operator",
+            password_hash=hash_password("pendingop1"),
+            role="staff",
+            department="inquiry",
+            is_active=True,
+            must_change_password=True,
+        )
+        db.add(pending)
+        db.flush()
+        db.add(UserChannelPreauthorization(
+            user_id=pending.id,
+            channel_type="gmail",
+            granted_by_user_id=6,
+        ))
+        db.commit()
+        pending_id = pending.id
+        before = db.get(Inquiry, 1)
+        snapshot = (before.status, before.handling_status, before.assigned_sales_user_id)
+
+    login(business_client, "pending-operator", "pendingop1")
+    read = business_client.get("/api/messages", headers=headers())
+    assert read.status_code == 403
+    assert read.json()["detail"] == "首次登录必须修改密码"
+
+    writes = [
+        business_client.post("/api/channels/gmail/accounts", headers=headers()),
+        business_client.post("/api/inquiries/1/transfer", json={"sales_user_id": 3}, headers=headers()),
+        business_client.post("/api/inquiries/1/action", json={"action": "ignored"}, headers=headers()),
+    ]
+    assert [response.status_code for response in writes] == [403, 403, 403]
+    assert all(response.json()["detail"] == "首次登录必须修改密码" for response in writes)
+
+    with business_client.testing_session() as db:
+        assert db.scalars(
+            select(ChannelAccount).where(ChannelAccount.owner_user_id == pending_id)
+        ).all() == []
+        current = db.get(Inquiry, 1)
+        assert (current.status, current.handling_status, current.assigned_sales_user_id) == snapshot
+
+    # The two necessary exceptions still work: change password, then use the API.
+    assert business_client.patch(
+        "/auth/password", json={"new_password": "changedpass1"}, headers=headers()
+    ).status_code == 200
+    login(business_client, "pending-operator", "changedpass1")
+    assert business_client.post("/api/channels/gmail/accounts", headers=headers()).status_code == 200
+
+
+def test_first_login_user_can_logout_before_password_change(business_client):
+    with business_client.testing_session() as db:
+        db.add(User(
+            username="pending-logout",
+            password_hash=hash_password("pendinglo1"),
+            role="staff",
+            department="inquiry",
+            is_active=True,
+            must_change_password=True,
+        ))
+        db.commit()
+
+    login(business_client, "pending-logout", "pendinglo1")
+    headers = {"Origin": "https://testserver", "X-CSRF-Token": business_client.cookies.get("ea_csrf")}
+    assert business_client.post("/auth/logout", headers=headers).status_code == 204
+    assert business_client.get("/auth/me").status_code == 401
+
+
+def test_channel_creation_requires_operating_role_and_admin_preauthorization(business_client):
+    """Stage 1 step 3: a valid session/CSRF alone must never authorize onboarding."""
+    def headers():
+        return {"Origin": "https://testserver", "X-CSRF-Token": business_client.cookies.get("ea_csrf")}
+
+    with business_client.testing_session() as db:
+        before_ids = set(db.scalars(select(ChannelAccount.id)).all())
+
+    login(business_client, "sales", "salespass1")
+    assert business_client.post("/api/channels/gmail/accounts", headers=headers()).status_code == 403
+    business_client.post("/auth/logout", headers=headers())
+
+    # Administrators may connect channels on their own behalf (then transfer
+    # the account to an operator). They are exempt from operator preauthorization
+    # but still cannot touch any message read/write endpoint.
+    login(business_client, "admin", "adminpass1")
+    admin_created = business_client.post("/api/channels/gmail/accounts", headers=headers())
+    assert admin_created.status_code == 200
+    assert admin_created.json()["id"] == 5
+    assert admin_created.json()["owner_user_id"] == 6
+    assert {item["channel_type"] for item in business_client.get("/api/channels").json()} == {"gmail", "outlook", "whatsapp"}
+    business_client.post("/auth/logout", headers=headers())
+
+    login(business_client, "operator", "operator1")
+    assert business_client.post("/api/channels/whatsapp/accounts", headers=headers()).status_code == 403
+    assert {item["channel_type"] for item in business_client.get("/api/channels").json()} == {"gmail", "outlook"}
+    business_client.post("/auth/logout", headers=headers())
+
+    login(business_client, "empty-operator", "emptyop1")
+    assert business_client.post("/api/channels/gmail/accounts", headers=headers()).status_code == 200
+    assert business_client.post("/api/channels/outlook/accounts", headers=headers()).status_code == 403
+
+    with business_client.testing_session() as db:
+        new_ids = set(db.scalars(select(ChannelAccount.id)).all()) - before_ids
+        assert len(new_ids) == 1
+        created = db.get(ChannelAccount, new_ids.pop())
+        assert (created.owner_user_id, created.channel_type) == (5, "gmail")
+
+
+def test_legacy_unlinked_inquiry_is_not_exposed_without_visible_messages(business_client):
+    """Stage 1 step 3: old records without links are not guessed into a reader's scope."""
+    with business_client.testing_session() as db:
+        assert list(db.get(Inquiry, 2).message_links) == []
+
+    login(business_client, "operator", "operator1")
+    headers = {"Origin": "https://testserver", "X-CSRF-Token": business_client.cookies.get("ea_csrf")}
+    listing = business_client.get("/api/inquiries")
+    assert 2 not in {item["id"] for item in listing.json()["items"]}
+    assert business_client.get("/api/inquiries/2").status_code == 404
+    assert business_client.post(
+        "/api/inquiries/2/action", json={"action": "ignored"}, headers=headers
+    ).status_code == 403
+    business_client.post("/auth/logout", headers=headers)
+
+    # Admin keeps the confirmed company-wide inquiry scope even for unlinked rows.
+    login(business_client, "admin", "adminpass1")
+    headers = {"Origin": "https://testserver", "X-CSRF-Token": business_client.cookies.get("ea_csrf")}
+    admin_listing = business_client.get("/api/inquiries")
+    assert 2 in {item["id"] for item in admin_listing.json()["items"]}
+    assert business_client.get("/api/inquiries/2").status_code == 200
+    assert business_client.post(
+        "/api/inquiries/2/action", json={"action": "ignored"}, headers=headers
+    ).status_code == 200
+
+    with business_client.testing_session() as db:
+        assert db.get(Inquiry, 2).handling_status == "ignored"
+        assert db.scalars(select(InquiryMessage).where(InquiryMessage.inquiry_id == 2)).all() == []
+
+
 def test_gmail_account_initialization_requires_authentication(business_client):
     assert business_client.post("/api/channels/gmail/accounts").status_code == 401
 
 
-def test_whatsapp_account_initialization_repairs_scope_after_revoke(business_client):
+def test_whatsapp_revoke_removes_empty_shell_and_allows_fresh_pairing(business_client):
+    """撤销 = 清理干净: an empty shell must be deleted, not left as a zombie."""
     login(business_client, "empty-operator", "emptyop1")
     csrf = business_client.cookies.get("ea_csrf")
     headers = {"Origin": "https://testserver", "X-CSRF-Token": csrf}
@@ -313,20 +566,73 @@ def test_whatsapp_account_initialization_repairs_scope_after_revoke(business_cli
         headers=headers,
     )
     assert revoked.status_code == 200
-    assert revoked.json()["status"] == "revoked"
+    assert revoked.json()["status"] == "removed"
+    assert revoked.json()["cleanup"] == "removed"
+    assert business_client.get("/api/channel-accounts").json() == []
+    with business_client.testing_session() as db:
+        assert db.get(ChannelAccount, account_id) is None
+        assert db.scalars(select(ChannelGrant).where(ChannelGrant.channel_account_id == account_id)).all() == []
 
-    repaired = business_client.post("/api/channels/whatsapp/accounts", headers=headers)
-    assert repaired.status_code == 200
-    assert repaired.json()["id"] == account_id
-    assert repaired.json()["status"] == "not_ready"
-    assert business_client.get("/api/channel-accounts").json() == [
-        {
-            "id": account_id,
-            "owner_user_id": 5,
-            "channel_type": "whatsapp",
-            "status": "not_ready",
-        }
-    ]
+    fresh = business_client.post("/api/channels/whatsapp/accounts", headers=headers)
+    assert fresh.status_code == 200
+    # SQLite may reuse the deleted row's id; what matters is that the new
+    # record is a clean, unbound shell with no revoked-history marker.
+    assert fresh.json()["status"] == "not_ready"
+    assert fresh.json()["external_account_id"] is None
+
+
+def test_admin_history_regrant_restores_revoked_account_for_operator(business_client):
+    """Channel preauthorization is unrelated to a revoked history marker."""
+    def headers():
+        return {"Origin": "https://testserver", "X-CSRF-Token": business_client.cookies.get("ea_csrf")}
+
+    login(business_client, "empty-operator", "emptyop1")
+    created = business_client.post("/api/channels/whatsapp/accounts", headers=headers())
+    assert created.status_code == 200
+    account_id = created.json()["id"]
+    # Shells with collected history are archived, never deleted silently.
+    with business_client.testing_session() as db:
+        db.add(Message(
+            channel_account_id=account_id,
+            provider="whatsapp_baileys",
+            external_message_id="wa-history-1",
+            direction="inbound",
+            status="received",
+            handling_status="pending",
+            occurred_at=datetime(2026, 11, 1, tzinfo=timezone.utc),
+            raw_content="collected before disconnect",
+            link_state="linked",
+        ))
+        db.commit()
+    revoked = business_client.post(f"/api/channels/accounts/{account_id}/revoke", headers=headers())
+    assert revoked.status_code == 200
+    assert revoked.json()["cleanup"] == "archived_with_history"
+    assert business_client.post("/api/channels/whatsapp/accounts", headers=headers()).status_code == 403
+    assert business_client.get("/api/channel-accounts").json() == []
+    business_client.post("/auth/logout", headers=headers())
+
+    login(business_client, "admin", "adminpass1")
+    listing = business_client.get("/auth/admin/channel-accounts")
+    assert listing.status_code == 200
+    target = next(item for item in listing.json() if item["id"] == account_id)
+    assert target["history_access_revoked"] is True
+    assert target["status"] == "revoked"
+
+    regranted = business_client.post(
+        f"/auth/admin/channel-accounts/{account_id}/history-access", headers=headers()
+    )
+    assert regranted.status_code == 200
+    assert regranted.json()["account_status"] == "not_ready"
+    target = next(item for item in business_client.get("/auth/admin/channel-accounts").json() if item["id"] == account_id)
+    assert target["history_access_revoked"] is False
+    assert target["status"] == "not_ready"
+    business_client.post("/auth/logout", headers=headers())
+
+    login(business_client, "empty-operator", "emptyop1")
+    assert account_id in {item["id"] for item in business_client.get("/api/channel-accounts").json()}
+    reused = business_client.post("/api/channels/whatsapp/accounts", headers=headers())
+    assert reused.status_code == 200
+    assert reused.json()["id"] == account_id
 
 
 def test_revoked_channel_is_not_readable_but_history_is_retained(business_client):
@@ -435,19 +741,19 @@ def test_operator_reads_only_granted_owned_channel_and_inquiries(business_client
     inquiries = business_client.get("/api/inquiries")
     assert inquiries.status_code == 200
     inquiry_data = inquiries.json()["items"][0]
-    assert inquiry_data["timeline_complete"] is False
+    assert inquiry_data["timeline_complete"] is True
     assert inquiry_data["attachments"] == []
     assert inquiry_data["source_channel_account_id"] is None
     assert inquiry_data["contact_sources"][0]["raw_customer_contact"] == "Customer <customer@example.com>"
     assert inquiry_data["messages"][0]["id"] == 1
     assert inquiry_data["messages"][0]["provider"] == "gmail_api_pubsub"
     assert inquiry_data["messages"][0]["external_message_id"] == "fixture-gmail-1"
-    assert inquiry_data["messages"][0]["overview_status"] is None
+    assert inquiry_data["messages"][0]["overview_status"] == "not_generated"
     assert "raw_content" not in inquiry_data["messages"][0]
-    assert "overview_text" not in inquiry_data["messages"][0]
+    assert inquiry_data["messages"][0]["overview_text"] is None
     assert "raw_content" not in inquiry_data
     assert "display_text" not in inquiry_data
-    assert "overview_text" not in str(inquiry_data)
+    assert all(message["overview_text"] is None for message in inquiry_data["messages"])
     assert "Revoked account historical message" not in str(inquiries.json()["items"][0])
     assert "secret-revoked@example.com" not in str(inquiries.json()["items"][0])
     assert len(inquiries.json()["items"][0]["messages"]) == 1
@@ -474,8 +780,9 @@ def test_sales_reads_only_assigned_inquiry_and_notification(business_client):
     assert inquiries.status_code == 200
     assert [inquiry["id"] for inquiry in inquiries.json()["items"]] == [3]
     assert [message["id"] for message in inquiries.json()["items"][0]["messages"]] == [6]
-    assert inquiries.json()["items"][0]["attachments"][0]["media_type"] == "image/png"
-    assert "storage_reference" not in inquiries.json()["items"][0]["attachments"][0]
+    # Inquiry responses never aggregate message/inquiry attachment metadata;
+    # authorized attachments are available only from the scoped message endpoint.
+    assert inquiries.json()["items"][0]["attachments"] == []
     assert inquiries.json()["items"][0]["timeline_complete"] is True
     assert [event["event_type"] for event in inquiries.json()["items"][0]["timeline"]] == [
         "inquiry_created",
@@ -525,21 +832,33 @@ def test_operator_can_list_transfer_targets(business_client):
 
     assert response.status_code == 200
     assert response.json() == [
-        {"id": 3, "username": "sales", "role": "sales"},
-        {"id": 4, "username": "other-sales", "role": "sales"},
+        {"id": 3, "username": "sales", "full_name": None, "name": "sales", "role": "sales"},
+        {"id": 4, "username": "other-sales", "full_name": None, "name": "other-sales", "role": "sales"},
     ]
 
 
-def test_sales_cannot_list_transfer_targets(business_client):
+def test_non_operator_roles_cannot_list_transfer_targets(business_client):
+    with business_client.testing_session() as db:
+        db.add(User(username="manager", password_hash=hash_password("manager1"), role="operations", manager_overlay_enabled=True, department="inquiry", is_active=True, must_change_password=False))
+        db.commit()
     login(business_client, "sales", "salespass1")
 
     response = business_client.get("/api/inquiry-transfer-targets")
 
     assert response.status_code == 403
     assert response.json()["detail"] == "没有权限访问"
+    business_client.post("/auth/logout", headers={"Origin": "https://testserver", "X-CSRF-Token": business_client.cookies.get("ea_csrf")})
+    login(business_client, "manager", "manager1")
+    assert business_client.get("/api/inquiry-transfer-targets").status_code == 403
 
 
 def test_operator_transfer_is_idempotent_for_same_target(business_client):
+    # 负责人对外展示的是员工姓名，账号只是登录凭据；转交人则是点「分配」的运营账号。
+    with business_client.testing_session() as db:
+        db.get(User, 3).full_name = "销售一"
+        db.get(User, 1).full_name = "运营一"
+        db.commit()
+
     login(business_client, "operator", "operator1")
     csrf = business_client.cookies.get("ea_csrf")
     headers = {"Origin": "https://testserver", "X-CSRF-Token": csrf}
@@ -557,6 +876,13 @@ def test_operator_transfer_is_idempotent_for_same_target(business_client):
     assert second.status_code == 200
     assert second.json()["status"] == "assigned"
     assert second.json()["assigned_sales_user_id"] == 3
+    # 详情头部显示「员工姓名」，账号仅作副标识，绝不出现「用户 #3」。
+    assert second.json()["assigned_sales_name"] == "销售一"
+    assert second.json()["assigned_sales_username"] == "sales"
+    # 转交人 = 点「分配」的运营，与负责人分开记录。
+    assert second.json()["transferred_by_name"] == "运营一"
+    assert second.json()["transferred_by_username"] == "operator"
+    assert second.json()["transferred_at"] is not None
     assert different_target.status_code == 403
     assert len(second.json()["timeline"]) == 2
     assert [event["event_type"] for event in second.json()["timeline"]].count("inquiry_transferred") == 1
@@ -870,18 +1196,25 @@ def test_internal_analysis_excludes_revoked_only_inquiry_and_manual_review_is_sc
     response = business_client.post("/api/internal-analysis", json={"operation": "read"})
     assert response.status_code == 200
     data = response.json()
-    assert all(row["id"] != 4 for row in data["unlinked_messages"])
+    assert all(row["id"] != 2 for row in data["unlinked_messages"])
     assert all(row["id"] != 2 for row in data["messages_needing_manual_review"])
     # Blocked account remains an authorized account and is surfaced distinctly.
     assert any(row["channel_account_id"] == 2 and row["status"] == "blocked" for row in data["channel_statuses"])
 
 
-def test_internal_analysis_exposes_only_assigned_scope_to_sales_and_admin_scope_is_not_global(business_client):
+def test_internal_analysis_exposes_admin_inquiry_aggregate_and_sales_scope(business_client):
     login(business_client, "admin", "adminpass1")
     admin_data = business_client.post("/api/internal-analysis", json={"operation": "read"}).json()
-    assert admin_data["query_scope"] == "current_user_authorized_objects"
-    assert admin_data["pending_message_count"] == 0
-    assert admin_data["inquiries_by_status"] == {"new": 0, "assigned": 0}
+    assert admin_data["query_scope"] == "company_wide_inquiry_inspection"
+    assert admin_data["pending_message_count"] == 4
+    assert admin_data["inquiries_by_status"] == {"new": 2, "assigned": 2}
+    for key in ("unlinked_messages", "messages_needing_manual_review"):
+        for row in admin_data[key]:
+            assert "provider" not in row
+            assert "external_message_id" not in row
+            assert "channel_account_id" not in row
+    for row in admin_data["channel_statuses"]:
+        assert "channel_account_id" not in row
 
     business_client.post("/auth/logout", headers={"Origin": "https://testserver", "X-CSRF-Token": business_client.cookies.get("ea_csrf")})
     login(business_client, "sales", "salespass1")
@@ -1068,7 +1401,8 @@ def test_internal_ai_is_read_only_and_returns_operation_guidance(business_client
     assert read.json()["mode"] == "read_only"
     assert read.json()["actor_id"] == 1
     assert read.json()["read_only"] is True
-    assert [item["display_text"] for item in read.json()["data"]] == ["Fake fixture message"]
+    assert "display_text" not in read.json()["data"][0]
+    assert read.json()["data"][0]["messages"][0]["id"] == 1
     assert "Revoked account historical message" not in str(read.json()["data"])
     assert "secret-revoked@example.com" not in str(read.json()["data"])
     assert read.json()["data"][0]["timeline_complete"] is True
@@ -1180,21 +1514,229 @@ def test_inbox_rejects_invalid_filters_and_paging_before_query_execution(busines
 
 
 
-def test_admin_does_not_bypass_object_scope(business_client):
+def test_admin_reads_company_inquiries_and_handles_messages_without_sending(business_client, monkeypatch):
+    """Admins inspect inquiries and handle messages, but cannot send as customers."""
+    import app.business_routes as business_routes
+
+    monkeypatch.setattr(business_routes, "schedule_message_overview", lambda *args, **kwargs: None)
+    with business_client.testing_session() as db:
+        db.add(MessageOverview(
+            message_id=1,
+            status="ready",
+            overview_text="Customer <customer@example.com> called +1 (650) 253-0000 about an order.",
+        ))
+        db.commit()
     login(business_client, "admin", "adminpass1")
 
     accounts = business_client.get("/api/channel-accounts")
-    messages = business_client.get("/api/messages")
     inquiries = business_client.get("/api/inquiries")
+    assert accounts.status_code == 200
+    assert {row["id"] for row in accounts.json()} == {1, 2, 3, 4, 5}
+    assert inquiries.status_code == 200
+    assert {row["id"] for row in inquiries.json()["items"]} == {1, 2, 3, 4}
+    assert business_client.get("/api/inquiries/1").status_code == 200
+    assert business_client.get("/api/inquiries/4").status_code == 200
+    assert business_client.get("/api/inquiries/1").json()["messages"]
 
-    assert accounts.status_code == messages.status_code == inquiries.status_code == 200
-    assert accounts.json() == [
-        {"id": 5, "owner_user_id": 6, "channel_type": "gmail", "status": "connected"}
-    ]
-    assert messages.json()["items"] == []
-    assert inquiries.json()["items"] == []
-    assert business_client.get("/api/messages/1").status_code == 403
-    assert business_client.get("/api/inquiries/1").status_code == 404
+    admin_messages = business_client.get("/api/messages?handling_status=all")
+    assert admin_messages.status_code == 200
+    assert {row["id"] for row in admin_messages.json()["items"]} == {1, 3, 4, 5, 6}
+    for row in admin_messages.json()["items"]:
+        assert row["direction"] == "inbound"
+        assert row["attachments"] == []
+        for key in ("customer_contact", "normalized_customer_contact", "original_sender_contact", "provider", "external_message_id", "channel_account_id", "channel_account_external_id"):
+            assert key not in row
+    message_detail = business_client.get("/api/messages/1")
+    assert message_detail.status_code == 403
+    message_content = business_client.get("/api/messages/1/content")
+    assert message_content.status_code == 403
+    message_overview = business_client.get("/api/messages/1/overview")
+    assert message_overview.status_code == 200
+    assert "Fake fixture message" not in message_overview.text
+    assert "customer@example.com" not in message_overview.text
+    assert "fixture-gmail-1" not in message_overview.text
+    admin_message_row = next(row for row in admin_messages.json()["items"] if row["id"] == 1)
+    assert "display_text" not in admin_message_row
+    assert "display_excerpt" not in admin_message_row
+    assert "customer_contact" not in admin_message_row
+    assert "external_message_id" not in admin_message_row
+    assert admin_message_row["safe_content_status"] == "ready"
+    assert admin_message_row["overview_status"] == "ready"
+    assert admin_message_row["overview"]["text"] == "[redacted] [email redacted] called [phone redacted] about an order."
+    assert "failure_code" not in admin_message_row["overview"]
+    ungenerated_admin_row = next(row for row in admin_messages.json()["items"] if row["id"] == 3)
+    assert ungenerated_admin_row["overview_status"] == "not_generated"
+    assert ungenerated_admin_row["overview"] is None
+    assert business_client.get("/api/messages/2").status_code == 403
+    assert business_client.get("/api/messages/2/content").status_code == 403
+    assert business_client.get("/api/messages/2/overview").status_code == 403
+    assert business_client.get("/api/messages/1/provider-action").status_code == 403
+    assert business_client.get("/api/messages/1/inquiry-candidates").status_code == 403
+    assert business_client.get("/api/messages/999").status_code == 403
+    admin_logs = business_client.get("/api/operation-logs", params={"inquiry_id": 1})
+    assert admin_logs.status_code == 200
+    assert isinstance(admin_logs.json(), list)
+    admin_ai = business_client.post("/api/internal-ai/query", json={"query": "inquiries"})
+    assert admin_ai.status_code == 200
+    assert "customer@example.com" not in admin_ai.text
+    assert "fixture-gmail-1" not in admin_ai.text
+    assert "external_message_id" not in admin_ai.text
+    assert "channel_account_external_id" not in admin_ai.text
+
+    csrf = business_client.cookies.get("ea_csrf")
+    headers = {"Origin": "https://testserver", "X-CSRF-Token": csrf}
+    # Channel onboarding is open to admins on their OWN accounts, but the
+    # personal account list must not turn into a company-wide message view.
+    assert {row["id"] for row in business_client.get("/api/channels/accounts").json()} == {5}
+    assert business_client.post(
+        "/api/integrations/gmail/authorize/start", params={"account_id": 5}, headers=headers
+    ).status_code != 403
+    with business_client.testing_session() as db:
+        overview = db.get(MessageOverview, 1)
+        overview.status = "failed"
+        overview.failure_code = "fixture-failure"
+        db.commit()
+    failed_admin_row = next(
+        row for row in business_client.get("/api/messages?handling_status=all").json()["items"]
+        if row["id"] == 1
+    )
+    assert failed_admin_row["overview_status"] == "failed"
+    assert failed_admin_row["overview"]["status"] == "failed"
+    assert failed_admin_row["overview"]["text"] is None
+    assert "failure_code" not in failed_admin_row["overview"]
+    assert business_client.post("/api/messages/1/action", json={"action": "processed"}, headers=headers).status_code == 409
+    assert business_client.post("/api/messages/1/overview/retry", headers=headers).status_code == 200
+    assert business_client.post("/api/inquiries/1/action", json={"action": "processed"}, headers=headers).status_code == 200
+    with business_client.testing_session() as db:
+        db.get(Inquiry, 1).last_activity_at = datetime.now(timezone.utc) - timedelta(days=45)
+        db.commit()
+    assert business_client.post("/api/inquiries/1/reactivate", headers=headers).status_code == 200
+    assert business_client.post("/api/messages/2/overview/retry", headers=headers).status_code == 403
+    with business_client.testing_session() as db:
+        outbound = Message(
+            channel_account_id=1,
+            provider="gmail_api_pubsub",
+            external_message_id="fixture-outbound-1",
+            direction="outbound",
+            status="processed",
+            handling_status="pending",
+            occurred_at=datetime.now(timezone.utc),
+            raw_content="fixture outbound",
+            link_state="linked",
+        )
+        db.add(outbound)
+        db.flush()
+        db.add(MessageOverview(message_id=outbound.id, status="failed", failure_code="fixture-failure"))
+        db.commit()
+        outbound_id = outbound.id
+    assert business_client.post(f"/api/messages/{outbound_id}/overview/retry", headers=headers).status_code == 403
+    assert business_client.post("/api/messages/1/send", json={"text": "not allowed"}, headers=headers).status_code in {404, 405}
+    # Reassignment is the one inquiry write an admin keeps.
+    assert business_client.post(
+        "/api/inquiries/3/transfer",
+        json={"sales_user_id": 4, "business_type": "inquiry"},
+        headers=headers,
+    ).status_code == 200
+
+
+def test_operator_scope_excludes_outbound_messages_and_hides_mixed_chain_logs(business_client):
+    from app.models.business import OperationLog
+
+    login(business_client, "operator", "operator1")
+    csrf = business_client.cookies.get("ea_csrf")
+    headers = {"Origin": "https://testserver", "X-CSRF-Token": csrf}
+
+    handled = business_client.post(
+        "/api/inquiries/1/action", json={"action": "processed"}, headers=headers
+    )
+    assert handled.status_code == 200
+    logs = business_client.get("/api/operation-logs", params={"inquiry_id": 1})
+    assert logs.status_code == 200
+    assert any(row["object_type"] == "inquiry" and row["object_id"] == 1 for row in logs.json())
+
+    with business_client.testing_session() as db:
+        outbound = Message(
+            channel_account_id=1,
+            provider="gmail_api_pubsub",
+            external_message_id="operator-outbound-linked",
+            direction="outbound",
+            status="processed",
+            handling_status="pending",
+            occurred_at=datetime.now(timezone.utc),
+            raw_content="fixture outbound",
+            link_state="linked",
+        )
+        db.add(outbound)
+        db.flush()
+        db.add(InquiryMessage(inquiry_id=1, message_id=outbound.id, position=2, link_source="fixture"))
+        db.add(MessageOverview(message_id=outbound.id, status="failed", failure_code="fixture-failure"))
+        db.add(OperationLog(
+            actor_user_id=1,
+            actor_name="operator",
+            operation_name="outbound-only-log",
+            object_type="message",
+            object_id=outbound.id,
+            result="success",
+        ))
+        db.commit()
+        outbound_id = outbound.id
+
+    listed_messages = business_client.get("/api/messages?handling_status=all")
+    assert listed_messages.status_code == 200
+    assert outbound_id not in {row["id"] for row in listed_messages.json()["items"]}
+    assert business_client.get(f"/api/messages/{outbound_id}").status_code == 403
+    assert business_client.get(f"/api/messages/{outbound_id}/content").status_code == 403
+    assert business_client.post(
+        f"/api/messages/{outbound_id}/action",
+        json={"action": "processed"},
+        headers=headers,
+    ).status_code == 403
+    assert business_client.post(
+        f"/api/messages/{outbound_id}/archive/restore", headers=headers
+    ).status_code == 403
+    assert business_client.post(
+        f"/api/messages/{outbound_id}/overview/retry", headers=headers
+    ).status_code == 403
+    inquiry = business_client.get("/api/inquiries/1")
+    assert inquiry.status_code == 200
+    assert outbound_id not in {row["id"] for row in inquiry.json()["messages"]}
+    logs = business_client.get("/api/operation-logs", params={"inquiry_id": 1})
+    assert logs.status_code == 200
+    assert all(not (row["object_type"] == "inquiry" and row["object_id"] == 1) for row in logs.json())
+    assert all(row["operation_name"] != "outbound-only-log" for row in logs.json())
+
+
+def test_admin_can_reassign_and_handle_company_inquiries(business_client):
+    login(business_client, "admin", "adminpass1")
+    csrf = business_client.cookies.get("ea_csrf")
+    headers = {"Origin": "https://testserver", "X-CSRF-Token": csrf}
+
+    targets = business_client.get("/api/inquiry-transfer-targets")
+    reassigned = business_client.post(
+        "/api/inquiries/3/transfer",
+        json={"sales_user_id": 4, "business_type": "inquiry"},
+        headers=headers,
+    )
+    handled = business_client.post(
+        "/api/inquiries/1/action", json={"action": "processed"}, headers=headers
+    )
+
+    assert targets.status_code == 200
+    assert {row["id"] for row in targets.json()} == {3, 4}
+    assert reassigned.status_code == 200
+    assert reassigned.json()["assigned_sales_user_id"] == 4
+    assert [event["event_type"] for event in reassigned.json()["timeline"]].count("inquiry_transferred") == 2
+    assert handled.status_code == 200
+
+    db = business_client.testing_session()
+    try:
+        from app.models.business import InquiryEvent, OperationLog
+        events = db.scalars(select(InquiryEvent).where(InquiryEvent.inquiry_id == 3)).all()
+        logs = db.scalars(select(OperationLog).where(OperationLog.object_type == "inquiry", OperationLog.object_id == 3)).all()
+        assert sum(event.event_type == "inquiry_transferred" for event in events) == 2
+        assert any(log.operation_name == "分配客户链路" and log.actor_user_id == 6 for log in logs)
+    finally:
+        db.close()
 
 
 def test_blocked_account_is_in_scope_but_revoked_account_is_not(business_client):
@@ -1300,6 +1842,21 @@ def test_repeated_same_terminal_action_is_idempotent_without_extra_inquiry_event
         "inquiry_created", "inquiry_processed"
     ]
 
+
+
+def test_unassigned_department_has_no_department_identity_or_scope(business_client):
+    with business_client.testing_session() as db:
+        user = User(username="legacy-unassigned", password_hash=hash_password("legacy1"), role="engineering", department="unassigned", is_active=True, must_change_password=False)
+        db.add(user)
+        db.flush()
+        db.add(UserDepartmentGrant(user_id=user.id, department="unassigned", granted_by_user_id=6))
+        inquiry = Inquiry(customer_contact="legacy@example.invalid", normalized_customer_contact="legacy@example.invalid", contact_identity_state="certain", contact_identity_kind="email", customer_nickname="Legacy", raw_message="legacy", department="unassigned", source_channel_account_id=1, status="new", handling_status="pending")
+        db.add(inquiry)
+        db.commit()
+        assert has_department_identity(user) is False
+        assert db.scalars(department_read_scope(user)).all() == []
+        assert db.scalars(scoped_inquiries(user)).all() == []
+        assert db.scalars(scoped_messages(user)).all() == []
 
 
 def test_cross_function_authorization_contract_matches_for_sales_and_operator(business_client):
@@ -1433,3 +1990,33 @@ def test_website_form_channel_excludes_mislabeled_and_forwarded_messages(busines
     assert by_id["wf-stale-165"]["channel_type"] == "gmail"
     assert by_id["wf-stale-165"]["customer_contact"] == "noreply@medium.com"
     assert by_id["wf-forwarded"]["is_website_form"] is True
+
+
+def test_null_department_resources_are_denied_for_sales_and_operations(business_client):
+    """Customer resources without a department mapping are deny-by-default."""
+    with business_client.testing_session() as db:
+        sales = db.get(User, 3)
+        operator = db.get(User, 1)
+        sales.department = "  "
+        operator.department = "  "
+        db.get(Inquiry, 3).department = "  "
+        db.flush()
+        assert db.scalars(scoped_inquiries(sales)).all() == []
+        assert db.scalars(scoped_messages(sales)).all() == []
+        assert db.scalars(scoped_inquiries(operator)).all() == []
+        linked_operator_messages = db.scalars(scoped_messages(operator)).all()
+        assert [message.id for message in linked_operator_messages] == [3, 4]
+
+
+def test_departmentless_engineering_roles_remain_data_dark(business_client):
+    with business_client.testing_session() as db:
+        readers = [
+            User(username=f"blank-{role}", password_hash="unused", role=role, department="  ", is_active=True)
+            for role in ("engineering", "production", "procurement")
+        ]
+        db.add_all(readers)
+        db.flush()
+        for reader in readers:
+            assert not has_department_identity(reader)
+            assert db.scalars(scoped_inquiries(reader)).all() == []
+            assert db.scalars(scoped_messages(reader)).all() == []

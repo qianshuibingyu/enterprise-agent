@@ -21,7 +21,8 @@ def load_project_env(env_path: Path | None = None) -> None:
             continue
         if line.startswith("export "):
             line = line[7:].lstrip()
-        name, separator, value = line.partition("=")
+        raw_name, separator, value = line.partition("=")
+        name = raw_name.strip()
         if not separator or not name or not name.replace("_", "").isalnum():
             continue
         value = value.strip()

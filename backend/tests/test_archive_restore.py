@@ -52,9 +52,9 @@ def client():
     Base.metadata.create_all(engine)
     with factory() as db:
         db.add_all([
-            User(username="op1", password_hash=hash_password("operator1"), role="staff", is_active=True, must_change_password=False),
-            User(username="op2", password_hash=hash_password("operator2"), role="staff", is_active=True, must_change_password=False),
-            User(username="sale", password_hash=hash_password("salespass1"), role="sales", is_active=True, must_change_password=False),
+            User(username="op1", password_hash=hash_password("operator1"), role="staff", department="inquiry", is_active=True, must_change_password=False),
+            User(username="op2", password_hash=hash_password("operator2"), role="staff", department="inquiry", is_active=True, must_change_password=False),
+            User(username="sale", password_hash=hash_password("salespass1"), role="sales", department="inquiry", is_active=True, must_change_password=False),
         ])
         db.flush()
         db.add_all([
@@ -80,6 +80,7 @@ def client():
             Inquiry(
                 id=1,
                 customer_contact="chain@example.com",
+                department="inquiry",
                 normalized_customer_contact="chain@example.com",
                 contact_identity_state="certain",
                 contact_identity_kind="email",
@@ -98,6 +99,7 @@ def client():
             Inquiry(
                 id=3,
                 customer_contact="mixed@example.com",
+                department="inquiry",
                 normalized_customer_contact="mixed@example.com",
                 contact_identity_state="certain",
                 contact_identity_kind="email",

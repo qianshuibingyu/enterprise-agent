@@ -49,6 +49,7 @@ def gmail_authorization_client(monkeypatch):
             username="gmail-owner",
             password_hash=hash_password("operator1"),
             role="staff",
+            department="inquiry",
             is_active=True,
             must_change_password=False,
         )

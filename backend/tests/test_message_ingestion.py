@@ -33,8 +33,8 @@ def db_session():
     with testing_session() as db:
         db.add_all(
             [
-                User(username="one", password_hash="hash-one", role="staff", is_active=True, must_change_password=False),
-                User(username="two", password_hash="hash-two", role="staff", is_active=True, must_change_password=False),
+                User(username="one", password_hash="hash-one", role="staff", department="inquiry", is_active=True, must_change_password=False),
+                User(username="two", password_hash="hash-two", role="staff", department="inquiry", is_active=True, must_change_password=False),
             ]
         )
         db.flush()

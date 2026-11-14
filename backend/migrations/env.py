@@ -16,6 +16,7 @@ from app.models.business import (  # noqa: F401
     WhatsAppGroupBinding,
 )
 from app.models.overview import MessageOverview  # noqa: F401
+from app.models.permissions import UserCapabilityGrant, UserChannelPreauthorization, UserDepartmentGrant  # noqa: F401
 
 config = context.config
 target_metadata = Base.metadata

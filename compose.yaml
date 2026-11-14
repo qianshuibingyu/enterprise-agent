@@ -8,7 +8,7 @@ services:
       - "127.0.0.1:8080:80"
     depends_on:
       backend:
-        condition: service_started
+        condition: service_healthy
 
   backend:
     restart: unless-stopped
@@ -17,6 +17,12 @@ services:
       dockerfile: Dockerfile
     ports:
       - "127.0.0.1:8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
     depends_on:
       db:
         condition: service_healthy
@@ -84,6 +90,12 @@ services:
       dockerfile: Dockerfile
     expose:
       - "8090"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8090/healthz').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
     environment:
       PORT: "8090"
       BACKEND_URL: http://backend:8000

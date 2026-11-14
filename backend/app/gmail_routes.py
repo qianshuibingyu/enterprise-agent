@@ -111,6 +111,7 @@ def _connected_gmail_account(db: Session, account_id: int) -> ChannelAccount:
             ChannelAccount.id == account_id,
             ChannelAccount.channel_type == "gmail",
             ChannelAccount.status.in_(("connected", "connected_pending_inbound", "verified_inbound")),
+            ChannelAccount.history_access_revoked_at.is_(None),
             select(ChannelGrant.channel_account_id).where(
                 ChannelGrant.channel_account_id == ChannelAccount.id,
                 ChannelGrant.channel_type == ChannelAccount.channel_type,

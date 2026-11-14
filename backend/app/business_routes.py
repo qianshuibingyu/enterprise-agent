@@ -1,4 +1,4 @@
-from typing import Annotated, Literal, Mapping
+from typing import Annotated, Any, Literal, Mapping
 from datetime import datetime, timedelta, timezone
 import logging
 import re
@@ -11,11 +11,14 @@ from sqlalchemy import and_, exists, func, or_, select
 from sqlalchemy.orm import Session, selectinload
 
 from app.auth import current_user, require_csrf
-from app.content_security import content_view, full_content_view, legacy_contact_view
+from app.content_security import legacy_contact_view, redact_contact_text
 from app.contact_identity import normalize_email, normalize_whatsapp
 from app.business_service import InquiryAction, _operator_has_all_message_scopes, as_utc, lifecycle_stage, transition_inquiry
 from app.authorization import (
-    can_transfer_inquiry,
+    can_operate_channels,
+    channel_onboarding_account_ids,
+    deny,
+    inquiry_message_account_scope,
     get_scoped_inquiry,
     get_scoped_message,
     get_scoped_notification,
@@ -26,6 +29,15 @@ from app.authorization import (
 )
 from app.database import get_db
 from app.message_ingestion import WEBSITE_FORM_EMAIL, effective_website_form
+from app.message_semantics import (
+    CONTENT_STATE_HIDDEN,
+    CONTENT_STATE_READY,
+    content_state,
+    inline_safe_text,
+    is_revoked_content,
+    needs_body_repair,
+    safe_content_view,
+)
 from app.gmail_client import GmailApiClient, GmailConfigurationError
 from app.gmail_credentials import GmailCredentialError, decrypt_refresh_token
 from app.models.business import (
@@ -38,6 +50,7 @@ from app.models.business import (
     OperationLog,
 )
 from app.models.overview import MessageOverview
+from app.models.permissions import ManagerPermissionGrant
 from app.overview_service import ensure_message_overview, schedule_message_overview
 from app.outlook_graph import OutlookGraphError, outlook_graph_client_for_ciphertext
 from app.outlook_credentials import OutlookCredentialError, decrypt_refresh_token as decrypt_outlook_refresh_token
@@ -53,6 +66,7 @@ from app.provider_links import (
     outlook_inbox_url,
     outlook_web_link,
 )
+from app.provider_transport import classify_network_failure, provider_proxy_summary
 from app.models.user import User, UserSession
 
 router = APIRouter(prefix="/api", tags=["business"])
@@ -90,7 +104,7 @@ def _whatsapp_phone(value: str | None) -> str | None:
 
 class TransferBody(BaseModel):
     sales_user_id: int = Field(gt=0)
-    business_type: Literal["inquiry", "after_sales"]
+    business_type: Literal["inquiry", "after_sales"] = "inquiry"
 
 
 class InquiryMessageLinkBody(BaseModel):
@@ -103,6 +117,13 @@ class MessageLinkCandidatesBody(BaseModel):
 
 
 class InquiryActionBody(BaseModel):
+    action: Literal["processed", "ignored"]
+
+
+class MessageBulkActionBody(BaseModel):
+    """One operator action applied to a bounded selection of visible messages."""
+
+    message_ids: list[int] = Field(min_length=1, max_length=100)
     action: Literal["processed", "ignored"]
 
 
@@ -134,6 +155,19 @@ def _account_view(account: ChannelAccount) -> dict[str, int | str]:
 
 
 def _visible_inquiry_events(db: Session, user: User, inquiry: Inquiry) -> list[InquiryEvent]:
+    if user.role == "admin":
+        visible_ids = _visible_linked_message_ids(db, user, inquiry)
+        all_ids = set(db.scalars(
+            select(InquiryMessage.message_id).where(InquiryMessage.inquiry_id == inquiry.id)
+        ).all())
+        event_filter = InquiryEvent.message_id.in_(visible_ids)
+        if all_ids == visible_ids and visible_ids:
+            event_filter = or_(InquiryEvent.message_id.is_(None), event_filter)
+        return db.scalars(
+            select(InquiryEvent)
+            .where(InquiryEvent.inquiry_id == inquiry.id, event_filter)
+            .order_by(InquiryEvent.occurred_at, InquiryEvent.id)
+        ).all()
     visible_ids = _visible_linked_message_ids(db, user, inquiry)
     all_ids = set(db.scalars(
         select(InquiryMessage.message_id).where(InquiryMessage.inquiry_id == inquiry.id)
@@ -162,10 +196,12 @@ def _batch_visible_message_ids(
         .where(
             InquiryMessage.inquiry_id.in_(inquiry_ids),
             ChannelAccount.status != "revoked",
+            ChannelAccount.history_access_revoked_at.is_(None),
         )
     )
-    if user.role != "sales":
-        query = query.where(Message.channel_account_id.in_(scoped_channel_account_ids(user)))
+    if user.role == "admin":
+        query = query.where(Message.direction == "inbound")
+    query = query.where(Message.channel_account_id.in_(inquiry_message_account_scope(user)))
     visible: dict[int, set[int]] = {}
     for inquiry_id, message_id in db.execute(query):
         visible.setdefault(inquiry_id, set()).add(message_id)
@@ -183,6 +219,92 @@ def _loaded_inquiry_events(inquiry: Inquiry, visible_message_ids: set[int]) -> l
     ]
 
 
+def _assignee_labels(db: Session, inquiries: list[Inquiry]) -> dict[int, dict[str, str]]:
+    """Resolve owner ids to display labels in one query per page, not per inquiry.
+
+    负责人对外显示的是「员工姓名」（真人可读），用户名只是登录凭据、作为副标识。
+    """
+    owner_ids = {inquiry.assigned_sales_user_id for inquiry in inquiries if inquiry.assigned_sales_user_id is not None}
+    if not owner_ids:
+        return {}
+    rows = db.execute(
+        select(User.id, User.username, User.full_name).where(User.id.in_(owner_ids))
+    ).all()
+    return {
+        user_id: {"username": username, "name": full_name or username}
+        for user_id, username, full_name in rows
+    }
+
+
+def _transfer_labels(db: Session, inquiries: list[Inquiry]) -> dict[int, dict[str, object]]:
+    """Resolve the latest "who handed this over" per inquiry in one query.
+
+    转交人 = 点了「分配」的那个运营账号（`inquiry_transferred` 事件的 actor），
+    与负责人（target）是两个人，必须分开显示。
+    """
+    inquiry_ids = [inquiry.id for inquiry in inquiries]
+    if not inquiry_ids:
+        return {}
+    rows = db.execute(
+        select(
+            InquiryEvent.inquiry_id,
+            InquiryEvent.actor_user_id,
+            InquiryEvent.occurred_at,
+            User.username,
+            User.full_name,
+        )
+        .join(User, User.id == InquiryEvent.actor_user_id, isouter=True)
+        .where(
+            InquiryEvent.inquiry_id.in_(inquiry_ids),
+            InquiryEvent.event_type == "inquiry_transferred",
+        )
+        .order_by(InquiryEvent.inquiry_id, InquiryEvent.occurred_at.desc(), InquiryEvent.id.desc())
+    ).all()
+    latest: dict[int, dict[str, object]] = {}
+    for inquiry_id, actor_id, occurred_at, username, full_name in rows:
+        if inquiry_id in latest:
+            continue  # 只保留最近一次转交
+        latest[inquiry_id] = {
+            "name": (full_name or username) if actor_id is not None else None,
+            "username": username,
+            "at": occurred_at,
+        }
+    return latest
+
+
+def _assignee_label(db: Session, user_id: int | None) -> dict[str, str] | None:
+    if user_id is None:
+        return None
+    row = db.execute(
+        select(User.username, User.full_name).where(User.id == user_id)
+    ).first()
+    if row is None:
+        return None
+    username, full_name = row
+    return {"username": username, "name": full_name or username}
+
+
+def _linked_message_content_view(message: Message, user: User) -> dict[str, object]:
+    """Sanitized body shown as the primary text of a customer-chain message.
+
+    Administrators keep their read-only inquiry view but never receive message
+    bodies, even through this embedded channel.
+    """
+    if user.role == "admin":
+        return {
+            "content_state": CONTENT_STATE_HIDDEN,
+            "safe_content_status": content_state(message.raw_content),
+            "safe_text": None,
+            "safe_text_truncated": False,
+        }
+    text, truncated = inline_safe_text(message.raw_content)
+    return {
+        "content_state": content_state(message.raw_content),
+        "safe_text": text,
+        "safe_text_truncated": truncated,
+    }
+
+
 def _inquiry_view(
     db: Session,
     user: User,
@@ -190,6 +312,8 @@ def _inquiry_view(
     *,
     visible_message_ids: set[int] | None = None,
     visible_events: list[InquiryEvent] | None = None,
+    assignee_labels: dict[int, dict[str, str]] | None = None,
+    transfer_labels: dict[int, dict[str, object]] | None = None,
 ) -> dict[str, object]:
     visible_message_ids = visible_message_ids if visible_message_ids is not None else _visible_linked_message_ids(db, user, inquiry)
     linked_messages = [
@@ -199,22 +323,34 @@ def _inquiry_view(
     ]
     visible_events = visible_events if visible_events is not None else _visible_inquiry_events(db, user, inquiry)
     all_linked_ids = {link.message_id for link in inquiry.message_links}
-    if all_linked_ids != visible_message_ids:
+    if user.role == "admin" and all_linked_ids != visible_message_ids:
+        visible_events = [event for event in visible_events if event.message_id in visible_message_ids]
+    elif user.role != "admin" and all_linked_ids != visible_message_ids:
         # Generic Inquiry events may reflect activity from a hidden source.
         # For partial views expose only events explicitly tied to a visible message.
         visible_events = [event for event in visible_events if event.message_id in visible_message_ids]
     contact_sources = [
         {
-            "raw_customer_contact": message.customer_contact,
-            "normalized_customer_contact": message.normalized_customer_contact,
-            "contact_identity_state": message.contact_identity_state,
-            "contact_identity_kind": message.contact_identity_kind,
-            "customer_nickname": message.customer_nickname,
-            "channel_account_id": message.channel_account_id,
+            "raw_customer_contact": None if user.role == "admin" else message.customer_contact,
+            "normalized_customer_contact": None if user.role == "admin" else message.normalized_customer_contact,
+            "contact_identity_state": "unsupported" if user.role == "admin" else message.contact_identity_state,
+            "contact_identity_kind": None if user.role == "admin" else message.contact_identity_kind,
+            "customer_nickname": None if user.role == "admin" else message.customer_nickname,
+            **({} if user.role == "admin" else {"channel_account_id": message.channel_account_id}),
             "channel_type": "website_form" if effective_website_form(message) else message.channel_account.channel_type,
         }
         for message in linked_messages
     ]
+    assignee = (
+        (assignee_labels or {}).get(inquiry.assigned_sales_user_id)
+        or _assignee_label(db, inquiry.assigned_sales_user_id)
+        or {}
+    )
+    transfer = (
+        (transfer_labels or {}).get(inquiry.id)
+        or _transfer_labels(db, [inquiry]).get(inquiry.id)
+        or {}
+    )
     return {
         "id": inquiry.id,
         "contact_sources": contact_sources,
@@ -223,6 +359,13 @@ def _inquiry_view(
         "handling_status": inquiry.handling_status,
         "business_type": inquiry.business_type,
         "assigned_sales_user_id": inquiry.assigned_sales_user_id,
+        # 负责人按「员工姓名」展示，用户名作为辅助标识；绝不显示「用户 #3」。
+        "assigned_sales_name": assignee.get("name"),
+        "assigned_sales_username": assignee.get("username"),
+        # 转交人：点「分配」的运营账号，与负责人不是同一个人。
+        "transferred_by_name": transfer.get("name"),
+        "transferred_by_username": transfer.get("username"),
+        "transferred_at": transfer.get("at"),
         "last_activity_at": inquiry.last_activity_at if visible_message_ids else None,
         "lifecycle_stage": lifecycle_stage(inquiry) if visible_message_ids else "unknown",
         "created_at": inquiry.created_at,
@@ -235,16 +378,33 @@ def _inquiry_view(
         "messages": [
             {
                 "id": message.id,
-                "channel_account_id": message.channel_account_id,
-                "channel_account_external_id": message.channel_account.external_account_id,
+                **({} if user.role == "admin" else {"channel_account_id": message.channel_account_id}),
+                **({} if user.role == "admin" else {
+                    "channel_account_external_id": message.channel_account.external_account_id,
+                    "provider": message.provider,
+                    "external_message_id": message.external_message_id,
+                }),
                 "channel_type": "website_form" if effective_website_form(message) else message.channel_account.channel_type,
-                "provider": message.provider,
-                "external_message_id": message.external_message_id,
                 "direction": message.direction,
                 "handling_status": message.handling_status,
                 "occurred_at": message.occurred_at,
-                "overview_status": message.overview.status if message.overview else None,
-                "overview_text": message.overview.overview_text if message.overview else None,
+                # Admin inquiry view exposes masked summary only, never body text.
+                **_linked_message_content_view(message, user),
+                "overview_status": (
+                    "not_applicable_revoked" if is_revoked_content(message.raw_content)
+                    else message.overview.status if message.overview
+                    else "not_generated"
+                ),
+                "safe_content_status": content_state(message.raw_content),
+                "overview_text": (
+                    redact_contact_text(
+                        message.overview.overview_text,
+                        (message.customer_contact, message.normalized_customer_contact, message.original_sender_contact, message.customer_nickname),
+                    )
+                    if user.role == "admin" and message.overview and message.overview.status == "ready" and not is_revoked_content(message.raw_content)
+                    else None if user.role == "admin" or is_revoked_content(message.raw_content)
+                    else message.overview.overview_text if message.overview else None
+                ),
             }
             for message in linked_messages
         ],
@@ -293,23 +453,37 @@ def list_operation_logs(
     limit: int = Query(default=100, ge=1, le=200),
     inquiry_id: int | None = Query(default=None, gt=0),
 ) -> list[dict[str, object]]:
+    if user.role != "admin" and not can_operate_channels(user):
+        raise deny()
     query = select(OperationLog)
+    if inquiry_id is None and user.role == "admin":
+        query = query.where(OperationLog.actor_user_id == user.id)
     if inquiry_id is not None:
         inquiry = db.scalar(scoped_inquiries(user).where(Inquiry.id == inquiry_id))
         if inquiry is None:
             raise deny()
-        linked_message_ids = (
+        all_linked_message_ids = set(db.scalars(
+            select(InquiryMessage.message_id).where(InquiryMessage.inquiry_id == inquiry_id)
+        ).all())
+        visible_linked_message_ids = set(db.scalars(
             select(InquiryMessage.message_id)
             .join(Message, Message.id == InquiryMessage.message_id)
             .where(
                 InquiryMessage.inquiry_id == inquiry_id,
                 Message.id.in_(scoped_messages(user).with_only_columns(Message.id)),
             )
+        ).all())
+        linked_message_logs = and_(
+            OperationLog.object_type == "message",
+            OperationLog.object_id.in_(visible_linked_message_ids),
         )
-        query = query.where(or_(
-            and_(OperationLog.object_type == "inquiry", OperationLog.object_id == inquiry_id),
-            and_(OperationLog.object_type == "message", OperationLog.object_id.in_(linked_message_ids)),
-        ))
+        if all_linked_message_ids == visible_linked_message_ids:
+            query = query.where(or_(
+                linked_message_logs,
+                and_(OperationLog.object_type == "inquiry", OperationLog.object_id == inquiry_id),
+            ))
+        else:
+            query = query.where(linked_message_logs)
     else:
         query = query.where(OperationLog.actor_user_id == user.id)
     rows = db.scalars(
@@ -323,7 +497,7 @@ def list_operation_logs(
             "object_type": row.object_type,
             "object_id": row.object_id,
             "result": row.result,
-            "detail": row.detail,
+            "detail": None if user.role == "admin" else row.detail,
             "created_at": row.created_at,
         }
         for row in rows
@@ -410,6 +584,40 @@ def _manual_confirmation_candidates(db: Session, message: Message, user: User, l
 
 def _message_view(message: Message, db: Session | None = None, user: User | None = None) -> dict[str, object]:
     account = message.channel_account
+    if user is not None and user.role == "admin":
+        # Admin message APIs are a summary/status surface only. Inquiry detail
+        # uses its separate redacted projection; never return message bodies,
+        # contacts, source IDs, attachments, or provider links here.
+        overview = message.overview
+        return {
+            "id": message.id,
+            "channel_type": "website_form" if effective_website_form(message) else account.channel_type,
+            "direction": message.direction,
+            "ingestion_status": message.status,
+            "handling_status": message.handling_status,
+            "occurred_at": message.occurred_at,
+            "created_at": message.created_at,
+            "inquiry_id": message.inquiry_link.inquiry_id if message.inquiry_link else None,
+            "link_state": message.link_state,
+            "safe_content_status": content_state(message.raw_content),
+            "overview_status": (
+                "not_applicable_revoked" if is_revoked_content(message.raw_content)
+                else overview.status if overview is not None
+                else "not_generated"
+            ),
+            "overview": (
+                {
+                    "status": overview.status,
+                    "text": redact_contact_text(
+                        overview.overview_text,
+                        (message.customer_contact, message.normalized_customer_contact, message.original_sender_contact, message.customer_nickname),
+                    ) if overview.status == "ready" else None,
+                }
+                if overview is not None and not is_revoked_content(message.raw_content)
+                else None
+            ),
+            "attachments": [],
+        }
     contact = message.customer_contact
     nickname = message.customer_nickname
     if not contact and not nickname:
@@ -432,7 +640,8 @@ def _message_view(message: Message, db: Session | None = None, user: User | None
         "handling_status": message.handling_status,
         "occurred_at": message.occurred_at,
         "created_at": message.created_at,
-        **content_view(message.raw_content),
+        # 清洗后的安全原文（含撤回语义），中文概述只是辅助信息。
+        **safe_content_view(message.raw_content),
         "inquiry_id": message.inquiry_link.inquiry_id if message.inquiry_link else None,
         "link_state": message.link_state,
         "is_website_form": form,
@@ -446,7 +655,7 @@ def _message_view(message: Message, db: Session | None = None, user: User | None
                 "model_name": message.overview.model_name,
                 "prompt_version": message.overview.prompt_version,
             }
-            if message.overview is not None
+            if message.overview is not None and not is_revoked_content(message.raw_content)
             else None
         ),
         "attachments": [_attachment_view(attachment) for attachment in message.attachments],
@@ -458,9 +667,12 @@ def list_channel_accounts(
     user: Annotated[User, Depends(current_user)],
     db: Session = Depends(get_db),
 ) -> list[dict[str, int | str]]:
+    if user.role != "admin" and not can_operate_channels(user):
+        return []
+    account_scope = inquiry_message_account_scope(user) if user.role == "admin" else scoped_channel_account_ids(user)
     accounts = db.scalars(
         select(ChannelAccount)
-        .where(ChannelAccount.id.in_(scoped_channel_account_ids(user)))
+        .where(ChannelAccount.id.in_(account_scope))
         .order_by(ChannelAccount.id)
     ).all()
     return [_account_view(account) for account in accounts]
@@ -472,13 +684,19 @@ REFETCH_CHECK_ACTIONS = {
     "oauth_config_missing": "服务端缺少 OAuth CLIENT_ID / CLIENT_SECRET，请检查 .env 后重新授权。",
     "authorization_expired": "授权已失效，请重新授权该渠道。",
     "provider_unavailable": "provider 返回错误，请查看 backend 日志中的具体错误类型。",
-    "network_unavailable": "服务器无法访问 provider，请检查出站网络或代理设置。",
-    "session_offline": "WhatsApp 会话离线，请重新扫码关联设备。",
+    "network_unavailable": "实时回源需要后端直连 provider，当前出站链路不可用。",
+    "session_offline": "点「开始关联」重新扫码即可，历史消息不受影响。",
     "bridge_unreachable": "whatsapp-bridge 不可达，请检查容器状态与 WHATSAPP_ADAPTER_URL。",
     "adapter_not_configured": "WHATSAPP_ADAPTER_URL / WHATSAPP_ADAPTER_TOKEN 未配置。",
     "unsupported_channel": "该渠道不支持实时回源。",
     "unknown": "回源链路出现未知错误，请查看 backend 日志。",
 }
+
+# A failure the operator cannot fix by looking at the page: the account is
+# simply not linked yet. These are informational, not errors.
+NOT_READY_FAILURES = {"session_offline", "unsupported_channel"}
+
+_classify_network_failure = classify_network_failure
 
 
 @router.get("/channel-accounts/{account_id}/refetch-check")
@@ -491,11 +709,14 @@ def check_channel_refetch(
 
     Each step performs an actual credential/token/provider call. No token,
     secret, or customer content is returned; only fixed diagnostic labels.
+    An administrator who connected a channel themselves may run the same
+    diagnostic on their own account before handing it to an operator.
     """
     account = db.scalar(
         select(ChannelAccount).where(
             ChannelAccount.id == account_id,
-            ChannelAccount.id.in_(scoped_channel_account_ids(user)),
+            ChannelAccount.id.in_(channel_onboarding_account_ids(user)),
+            ChannelAccount.history_access_revoked_at.is_(None),
         )
     )
     if account is None:
@@ -508,10 +729,13 @@ def check_channel_refetch(
 
     channel = account.channel_type
     failure_kind: str | None = None
+    failure_detail: dict[str, str] | None = None
     ready = False
 
     if channel in {"gmail", "outlook"}:
+        record("出站网络配置", True, provider_proxy_summary())
         ciphertext = account.gmail_credential_ciphertext if channel == "gmail" else account.outlook_credential_ciphertext
+        client: object | None = None
         if not ciphertext:
             record("凭据已保存", False, "账号没有保存加密 refresh token")
             failure_kind = "credentials_missing"
@@ -520,29 +744,55 @@ def check_channel_refetch(
             try:
                 if channel == "gmail":
                     client = GmailApiClient(refresh_token=decrypt_refresh_token(ciphertext))
-                    record("凭据解密 / OAuth 配置", True, "refresh token 可解密，OAuth 客户端配置完整")
-                    client._get("profile")
                 else:
                     client = outlook_graph_client_for_ciphertext(ciphertext)
-                    record("凭据解密 / OAuth 配置", True, "refresh token 可解密，OAuth 客户端配置完整")
-                    client._get("/me", {"$select": "id"})
-                record("渠道 API 可达", True, "provider 已用该账号凭据成功响应")
-                ready = True
             except (GmailCredentialError, OutlookCredentialError):
                 failure_kind = "credential_decrypt_failed"
                 record("凭据解密 / OAuth 配置", False, "凭据无法解密或加密密钥不匹配")
             except GmailConfigurationError:
                 failure_kind = "oauth_config_missing"
                 record("凭据解密 / OAuth 配置", False, "OAuth 客户端配置不完整")
+            except OutlookGraphError as exc:
+                # outlook_graph_client_for_ciphertext reports a decryption
+                # failure as a generic Graph error; keep it actionable.
+                if "credential" in str(exc).lower():
+                    failure_kind = "credential_decrypt_failed"
+                    record("凭据解密 / OAuth 配置", False, "凭据无法解密或加密密钥不匹配")
+                else:
+                    failure_kind = "oauth_config_missing"
+                    record("凭据解密 / OAuth 配置", False, "OAuth 客户端配置不完整")
+
+        if client is not None and failure_kind is None:
+            record("凭据解密 / OAuth 配置", True, "refresh token 可解密，OAuth 客户端配置完整")
+            try:
+                if channel == "gmail":
+                    client._get("profile")
+                else:
+                    client._get("/me", {"$select": "id"})
+                record("渠道 API 可达", True, "provider 已用该账号凭据成功响应")
+                ready = True
             except ProviderAuthorizationFailure:
                 failure_kind = "authorization_expired"
                 record("渠道 API 可达", False, "provider 拒绝了访问令牌（401/403）")
+            except (ProviderRateLimited, ProviderTemporaryFailure, ProviderPermanentFailure):
+                failure_kind = "provider_unavailable"
+                record("渠道 API 可达", False, "provider 返回了错误状态码")
             except OutlookGraphError as exc:
-                failure_kind = "authorization_expired" if "authorization" in str(exc).lower() else "provider_unavailable"
-                record("渠道 API 可达", False, f"provider 返回错误：{exc}")
-            except (httpx.HTTPError, OSError):
+                message = str(exc).lower()
+                if "authorization" in message:
+                    failure_kind = "authorization_expired"
+                    record("渠道 API 可达", False, "provider 拒绝了访问令牌（401/403）")
+                elif "mapping" in message:
+                    failure_kind = "provider_unavailable"
+                    record("渠道路由校验", False, "Graph 返回的账号与本地映射不一致，请重新授权")
+                else:
+                    failure_kind = "provider_unavailable"
+                    record("渠道 API 可达", False, "provider 返回错误状态")
+            except (httpx.HTTPError, OSError) as exc:
                 failure_kind = "network_unavailable"
-                record("渠道 API 可达", False, "无法连接到 provider")
+                failure_detail = _classify_network_failure(exc)
+                host = f"（{failure_detail['host']}）" if failure_detail["host"] else ""
+                record("渠道 API 可达", False, f"无法连接 provider{host}：{failure_detail['label']}")
             except Exception as exc:
                 failure_kind = "unknown"
                 record("渠道 API 可达", False, f"未预期错误：{type(exc).__name__}")
@@ -552,7 +802,7 @@ def check_channel_refetch(
             state = HttpWhatsAppAdapterClient().status(channel_account_id=account.id)
             record("Bridge 可达", True, f"bridge 状态：{state.state}")
             connected = state.state in {"connected", "connected_pending_inbound"}
-            record("会话在线", connected, "会话已连接" if connected else "会话未连接")
+            record("会话在线", connected, "会话已连接" if connected else "会话未连接，需重新扫码")
             ready = connected
             if not connected:
                 failure_kind = "session_offline"
@@ -565,14 +815,38 @@ def check_channel_refetch(
     else:
         failure_kind = "unsupported_channel"
 
+    history_available = bool(
+        db.scalar(
+            select(func.count()).select_from(Message).where(Message.channel_account_id == account.id)
+        )
+        or 0
+    )
+
+    if ready:
+        severity = "ok"
+    elif failure_kind in NOT_READY_FAILURES:
+        severity = "not_ready"
+    else:
+        severity = "action_required"
+
+    action = "实时回源链路可用。" if ready else REFETCH_CHECK_ACTIONS.get(failure_kind or "unknown", "")
+    if failure_detail is not None:
+        action = f"{action}{failure_detail['hint']}"
+
     return {
         "account_id": account.id,
         "channel_type": channel,
         "ready": ready,
         "failure_kind": failure_kind,
-        "recommended_action": (
-            "实时回源链路可用。" if ready else REFETCH_CHECK_ACTIONS.get(failure_kind or "unknown", "")
+        "severity": severity,
+        "recommended_action": action,
+        "error_class": failure_detail["error_class"] if failure_detail else None,
+        "network": (
+            {"kind": failure_detail["kind"], "label": failure_detail["label"], "host": failure_detail["host"]}
+            if failure_detail
+            else None
         ),
+        "history_available": history_available,
         "steps": steps,
     }
 
@@ -592,6 +866,8 @@ def list_messages(
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=50, ge=1, le=100),
 ) -> dict[str, object]:
+    if user.role not in {"admin", "staff", "operations", "ops", "sales"}:
+        raise deny()
     query = scoped_messages(user)
     if handling_status != "all":
         query = query.where(Message.handling_status == handling_status)
@@ -635,6 +911,8 @@ def list_messages(
     ).all()
     has_more = len(messages) > page_size
     messages = messages[:page_size]
+    # A stub snapshot is only a real 撤回 when no original can be recovered.
+    _heal_recoverable_messages(db, user, messages)
     return {
         "items": [_message_view(message, db, user) for message in messages],
         "page": page,
@@ -649,6 +927,8 @@ def get_message(
     user: Annotated[User, Depends(current_user)],
     db: Session = Depends(get_db),
 ) -> dict[str, object]:
+    if user.role in {"admin", "engineering", "procurement", "production"}:
+        raise deny()
     message = get_scoped_message(db, user, message_id)
     # Message keeps its own content/provider data; the optional link state is
     # computed from identity metadata and authorized Inquiry candidates only.
@@ -684,7 +964,92 @@ def _resolve_outlook_web_link(db: Session, message: Message, account: ChannelAcc
     return link
 
 
-def _safe_provider_content(message: Message, *, full: bool = False) -> tuple[dict[str, object], str | None]:
+def _repair_message_body(db: Session, message: Message, body: str) -> bool:
+    """Persist a recovered provider body over a stale, bodyless stub snapshot.
+
+    WhatsApp can deliver a bodyless protocol stub first and the real message for
+    the same id moments later. The ingest row then keeps claiming 已撤回 /
+    原文不再可用 even though the original is visible in the "查看客户消息"
+    dialog. Healing the stored snapshot makes list, chain and detail views agree
+    on one authoritative body instead of contradicting each other.
+    """
+    body = str(body)
+    if not needs_body_repair(getattr(message, "raw_content", ""), body):
+        return False
+    message.raw_content = body
+    link = getattr(message, "inquiry_link", None)
+    inquiry = getattr(link, "inquiry", None) if link is not None else None
+    if inquiry is not None and needs_body_repair(getattr(inquiry, "raw_message", ""), body):
+        inquiry.raw_message = body
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        logger.warning(
+            "WhatsApp body repair failed to commit: message_id=%s",
+            getattr(message, "id", None),
+        )
+        return False
+    # The overview was skipped while the row looked revoked; regenerate it from
+    # the recovered text. A failure here must not undo the committed body.
+    try:
+        ensure_message_overview(db, message, force=True)
+        db.commit()
+    except Exception:
+        db.rollback()
+        logger.warning(
+            "Overview regeneration failed after WhatsApp body repair: message_id=%s",
+            getattr(message, "id", None),
+        )
+    logger.info("Recovered WhatsApp body for message %s", getattr(message, "id", None))
+    return True
+
+
+def _heal_recoverable_messages(
+    db: Session,
+    user: User,
+    messages: list[Message],
+    *,
+    limit: int = 6,
+) -> int:
+    """Bounded, best-effort self-healing of stub snapshots on read surfaces.
+
+    Only operator roles may trigger a provider refetch, and only WhatsApp rows
+    still labelled 已撤回 are candidates. An unconfigured or failing bridge
+    leaves the row untouched and never breaks the response.
+    """
+    if user.role not in {"staff", "operations", "ops"}:
+        return 0
+    healed = 0
+    for message in messages:
+        if healed >= limit:
+            break
+        if not is_revoked_content(getattr(message, "raw_content", "")):
+            continue
+        if not str(getattr(message, "provider", "") or "").startswith("whatsapp"):
+            continue
+        try:
+            view, diagnostic = _safe_provider_content(
+                message, allow_provider_refetch=True, db=db
+            )
+        except Exception:
+            logger.warning(
+                "WhatsApp body recheck failed: message_id=%s",
+                getattr(message, "id", None),
+            )
+            continue
+        if diagnostic is None and view.get("content_state") == CONTENT_STATE_READY:
+            healed += 1
+    return healed
+
+
+def _safe_provider_content(
+    message: Message,
+    *,
+    full: bool = False,
+    allow_provider_refetch: bool = True,
+    db: Session | None = None,
+) -> tuple[dict[str, object], str | None]:
     """Refresh provider content when possible; otherwise return the stored snapshot.
 
     The ingest snapshot is authoritative: mail and IM messages are immutable, and
@@ -693,10 +1058,14 @@ def _safe_provider_content(message: Message, *, full: bool = False) -> tuple[dic
     the original text. ``full`` selects the unbounded renderer used by the
     original-content detail view.
     """
-    render = full_content_view if full else content_view
+    def render(value: Any) -> dict[str, object]:
+        return safe_content_view(value, full=full)
+
     account = getattr(message, "channel_account", None)
     identity = (getattr(message, "external_message_id", None) or "").strip()
     cached = render(getattr(message, "raw_content", ""))
+    if not allow_provider_refetch:
+        return cached, "provider_refetch_not_requested"
     if not identity:
         return cached, "provider_message_id_missing"
     if account is None:
@@ -735,6 +1104,11 @@ def _safe_provider_content(message: Message, *, full: bool = False) -> tuple[dic
         refreshed = render(raw_content)
         if not refreshed["display_text"].strip():
             return cached, "provider_content_unrenderable"
+        # The provider still has the customer's words: this was not a revoke.
+        # Persist the recovered body so every other surface stops claiming
+        # 「已撤回 / 原文不再可用」.
+        if db is not None and needs_body_repair(getattr(message, "raw_content", ""), raw_content):
+            _repair_message_body(db, message, raw_content)
         return refreshed, None
     except GmailConfigurationError:
         logger.warning(
@@ -793,16 +1167,22 @@ def get_message_content(
     user: Annotated[User, Depends(current_user)],
     db: Session = Depends(get_db),
 ) -> dict[str, object]:
-    """Return the authoritative original text with an optional live integrity check.
+    """Return the authoritative original text to an authorized operating user.
 
-    Every inbound message is stored at ingestion time, so the snapshot is always
-    available regardless of provider uptime. A live refetch is attempted on a
-    best-effort basis; when it fails the snapshot is still returned in full and
-    ``fallback_reason`` only carries a diagnostic code, not an error state.
+    Admin inquiry access is summary-only; this direct body endpoint must not
+    turn the UI's hidden message-body controls into a bypass.
     """
+    if user.role == "admin":
+        raise deny()
     # Scope must be resolved before selecting a provider or attempting a fetch.
     message = get_scoped_message(db, user, message_id)
-    content, refetch_diagnostic = _safe_provider_content(message, full=True)
+    content, refetch_diagnostic = _safe_provider_content(
+        message,
+        full=True,
+        allow_provider_refetch=user.role in {"staff", "operations", "ops"},
+        # A successful refetch of a real body heals a stale 撤回 snapshot.
+        db=db if user.role in {"staff", "operations", "ops"} else None,
+    )
     lines = content["display_text"].splitlines()
     preview = "\n".join(lines[:8])
     snapshot_at = message.created_at or message.occurred_at
@@ -824,6 +1204,8 @@ def get_message_content(
             "snapshot_at": snapshot_at.isoformat() if snapshot_at is not None else None,
         },
         "raw_content_exposed": False,
+        # 撤回消息没有可回读的正文；前端据此显示「已撤回」而不是英文占位符。
+        "content_state": content["content_state"],
         "parsed_content": content,
         "preview_text": preview,
         "full_text": content["display_text"],
@@ -838,6 +1220,8 @@ def get_message_provider_action(
     user: Annotated[User, Depends(current_user)],
     db: Session = Depends(get_db),
 ) -> dict[str, object]:
+    if user.role in {"admin", "sales", "engineering", "procurement", "production"}:
+        raise deny()
     message = get_scoped_message(db, user, message_id)
     account = message.channel_account
     base = {
@@ -937,10 +1321,18 @@ def _visible_linked_message_ids(db: Session, user: User, inquiry: Inquiry) -> se
         select(InquiryMessage.message_id)
         .join(Message, Message.id == InquiryMessage.message_id)
         .join(ChannelAccount, ChannelAccount.id == Message.channel_account_id)
-        .where(InquiryMessage.inquiry_id == inquiry.id, ChannelAccount.status != "revoked")
+        .where(
+            InquiryMessage.inquiry_id == inquiry.id,
+            ChannelAccount.status != "revoked",
+            ChannelAccount.history_access_revoked_at.is_(None),
+        )
     )
-    if user.role != "sales":
-        query = query.where(Message.channel_account_id.in_(scoped_channel_account_ids(user)))
+    if user.role == "admin":
+        query = query.where(Message.direction == "inbound")
+    query = query.where(
+        Message.channel_account_id.in_(inquiry_message_account_scope(user)),
+        Message.direction == "inbound",
+    )
     return set(db.scalars(query).all())
 
 
@@ -951,6 +1343,8 @@ def _inquiry_response(
     *,
     visible_message_ids: set[int] | None = None,
     visible_events: list[InquiryEvent] | None = None,
+    assignee_labels: dict[int, dict[str, str]] | None = None,
+    transfer_labels: dict[int, dict[str, object]] | None = None,
 ) -> dict[str, object]:
     # Callers that expose/read an Inquiry enforce visibility in their scoped
     # SQL query. A transition may return a still-authorized Inquiry whose
@@ -960,6 +1354,8 @@ def _inquiry_response(
         db, user, inquiry,
         visible_message_ids=visible_ids,
         visible_events=visible_events,
+        assignee_labels=assignee_labels,
+        transfer_labels=transfer_labels,
     )
 
 
@@ -979,13 +1375,19 @@ def list_inquiries(
         select(InquiryMessage.inquiry_id)
         .join(Message, Message.id == InquiryMessage.message_id)
         .join(ChannelAccount, ChannelAccount.id == Message.channel_account_id)
-        .where(InquiryMessage.inquiry_id == Inquiry.id, ChannelAccount.status != "revoked")
-    )
-    if user.role != "sales":
-        visible_message_query = visible_message_query.where(
-            Message.channel_account_id.in_(scoped_channel_account_ids(user))
+        .where(
+            InquiryMessage.inquiry_id == Inquiry.id,
+            Message.channel_account_id.in_(inquiry_message_account_scope(user)),
         )
-    base_query = scoped_inquiries(user).where(exists(visible_message_query))
+    )
+    visible_message_query = visible_message_query.where(
+        ChannelAccount.status != "revoked",
+        ChannelAccount.history_access_revoked_at.is_(None),
+    )
+    visible_message_query = visible_message_query.where(Message.direction == "inbound")
+    base_query = scoped_inquiries(user)
+    if user.role != "admin":
+        base_query = base_query.where(exists(visible_message_query))
     if status is not None:
         base_query = base_query.where(Inquiry.status == status)
     if handling_status is not None:
@@ -998,8 +1400,9 @@ def list_inquiries(
             .where(
                 InquiryMessage.inquiry_id == Inquiry.id,
                 ChannelAccount.status != "revoked",
+                ChannelAccount.history_access_revoked_at.is_(None),
                 Message.channel_account_id == channel_account_id,
-                Message.channel_account_id.in_(scoped_channel_account_ids(user)),
+                Message.channel_account_id.in_(inquiry_message_account_scope(user)),
             )
             .exists()
         )
@@ -1020,6 +1423,8 @@ def list_inquiries(
     has_more = len(inquiries) > page_size
     inquiries = inquiries[:page_size]
     visible_by_inquiry = _batch_visible_message_ids(db, user, [item.id for item in inquiries])
+    assignee_labels = _assignee_labels(db, inquiries)
+    transfer_labels = _transfer_labels(db, inquiries)
     return {
         "items": [
             _inquiry_response(
@@ -1027,9 +1432,15 @@ def list_inquiries(
                 user,
                 inquiry,
                 visible_message_ids=visible_by_inquiry.get(inquiry.id, set()),
-                visible_events=_loaded_inquiry_events(
-                    inquiry, visible_by_inquiry.get(inquiry.id, set())
+                visible_events=(
+                    _visible_inquiry_events(db, user, inquiry)
+                    if user.role == "admin"
+                    else _loaded_inquiry_events(
+                        inquiry, visible_by_inquiry.get(inquiry.id, set())
+                    )
                 ),
+                assignee_labels=assignee_labels,
+                transfer_labels=transfer_labels,
             )
             for inquiry in inquiries
         ],
@@ -1058,8 +1469,17 @@ def get_inquiry(
     if inquiry is None:
         raise HTTPException(status_code=404, detail="没有权限访问")
     visible_message_ids = _visible_linked_message_ids(db, user, inquiry)
-    if not visible_message_ids:
+    if not visible_message_ids and user.role != "admin":
         raise HTTPException(status_code=404, detail="没有权限访问")
+    _heal_recoverable_messages(
+        db,
+        user,
+        [
+            link.message
+            for link in inquiry.message_links
+            if link.message_id in visible_message_ids
+        ],
+    )
     return _inquiry_response(db, user, inquiry, visible_message_ids=visible_message_ids)
 
 
@@ -1070,9 +1490,9 @@ def list_message_inquiry_candidates(
     db: Session = Depends(get_db),
 ) -> dict[str, object]:
     """Return exact-identity candidate inquiries without guessing a link."""
+    if user.role not in {"staff", "operations", "ops"}:
+        raise deny()
     message = get_scoped_message(db, user, message_id)
-    if user.role == "sales":
-        raise HTTPException(status_code=403, detail="没有权限访问")
     if effective_website_form(message):
         return {"message_id": message.id, "match_state": "unsupported_identity", "items": []}
     if message.inquiry_link is not None:
@@ -1152,8 +1572,8 @@ def link_message_to_inquiry(
     db: Session = Depends(get_db),
 ) -> dict[str, object]:
     user, _ = pair
-    if user.role == "sales":
-        raise HTTPException(status_code=403, detail="没有权限访问")
+    if user.role not in {"staff", "operations", "ops"}:
+        raise deny()
     # Authorize the target before inspecting an existing link, so a conflict
     # cannot disclose anything about an inquiry outside the caller's scope.
     inquiry = db.scalar(
@@ -1288,6 +1708,8 @@ def inquiry_action(
         scoped_inquiries(user).where(Inquiry.id == inquiry.id)
         .options(selectinload(Inquiry.attachments), selectinload(Inquiry.events), *_inquiry_message_options())
     )
+    if inquiry is None:
+        return {"id": inquiry_id, "handling_status": action, "messages": [], "timeline": [], "readable": False}
     return _inquiry_response(db, user, inquiry)
 
 
@@ -1309,6 +1731,8 @@ def reactivate_inquiry(
         scoped_inquiries(user).where(Inquiry.id == inquiry.id)
         .options(selectinload(Inquiry.attachments), selectinload(Inquiry.events), *_inquiry_message_options())
     )
+    if inquiry is None:
+        return {"id": inquiry_id, "handling_status": "pending", "messages": [], "timeline": [], "readable": False}
     return _inquiry_response(db, user, inquiry)
 
 
@@ -1320,9 +1744,74 @@ def retry_message_overview(
     db: Session = Depends(get_db),
 ) -> dict[str, object]:
     user, _ = pair
-    message = get_scoped_message(db, user, message_id, for_update=True)
-    if user.role == "sales" or message.handling_status != "pending":
-        raise HTTPException(status_code=409, detail="该消息不在待处理范围内")
+    manager_retry_authorized = False
+    if user.manager_overlay_enabled or user.role == "manager":
+        if not user.is_active:
+            raise deny()
+        authorized_inquiry = (
+            select(Inquiry.id)
+            .join(InquiryMessage, InquiryMessage.inquiry_id == Inquiry.id)
+            .join(
+                ManagerPermissionGrant,
+                and_(
+                    ManagerPermissionGrant.manager_user_id == user.id,
+                    ManagerPermissionGrant.department == user.department,
+                    ManagerPermissionGrant.target_user_id == Inquiry.assigned_sales_user_id,
+                    ManagerPermissionGrant.department == Inquiry.department,
+                    ManagerPermissionGrant.permission == "retry",
+                ),
+            )
+            .join(User, User.id == Inquiry.assigned_sales_user_id)
+            .join(Message, Message.id == InquiryMessage.message_id)
+            .join(ChannelAccount, ChannelAccount.id == Message.channel_account_id)
+            .where(
+                InquiryMessage.message_id == message_id,
+                Inquiry.assigned_sales_user_id.is_not(None),
+                User.is_active.is_(True),
+                User.department == Inquiry.department,
+                Inquiry.department == user.department,
+                Inquiry.department.is_not(None),
+                User.department.is_not(None),
+                ManagerPermissionGrant.department.is_not(None),
+                ManagerPermissionGrant.department.is_not(None),
+                ChannelAccount.status != "revoked",
+                ChannelAccount.history_access_revoked_at.is_(None),
+                Message.direction == "inbound",
+                Message.handling_status == "pending",
+            )
+            .limit(1)
+        )
+        message = db.scalar(
+            select(Message)
+            .where(
+                Message.id == message_id,
+                Message.handling_status == "pending",
+                Message.overview.has(MessageOverview.status == "failed"),
+                exists(authorized_inquiry),
+            )
+            .with_for_update()
+        )
+        if message is None:
+            # The overlay adds narrowly granted retry scope; it must not replace
+            # the base role's existing retry scope.
+            try:
+                message = get_scoped_message(db, user, message_id, for_update=True)
+            except HTTPException:
+                raise deny()
+            if message.handling_status != "pending" or user.role not in {"admin", "staff", "operations", "ops"}:
+                raise deny()
+        else:
+            manager_retry_authorized = True
+    else:
+        message = get_scoped_message(db, user, message_id, for_update=True)
+        if message.handling_status != "pending":
+            raise deny()
+        if user.role == "admin" and (message.overview is None or message.overview.status != "failed"):
+            raise deny()
+        if user.role == "admin" and message.direction != "inbound":
+            raise deny()
+        if user.role not in {"admin", "staff", "operations", "ops"}:
+            raise deny()
     overview = message.overview
     if overview is None:
         overview = MessageOverview(
@@ -1345,6 +1834,8 @@ def retry_message_overview(
         object_id=message.id,
         detail="已提交后台处理",
     )
+    if manager_retry_authorized:
+        return {"status": "retry_accepted"}
     return _message_view(message, db, user)
 
 
@@ -1356,7 +1847,7 @@ def restore_message(
 ) -> dict[str, object]:
     user, _ = pair
     message = get_scoped_message(db, user, message_id, for_update=True)
-    if user.role == "sales" or message.handling_status not in {"processed", "ignored"}:
+    if user.role not in {"admin", "staff", "operations", "ops"} or message.handling_status not in {"processed", "ignored"}:
         raise HTTPException(status_code=409, detail="该消息不在可恢复归档范围内")
 
     now = datetime.now(timezone.utc)
@@ -1372,12 +1863,13 @@ def restore_message(
         )
         # 仅在链路确实需要被重新激活时，才要求操作者对该链路全部关联
         # 消息来源账号都有授权，避免借一条可见消息激活含不可见消息的链路。
-        if (
-            inquiry is not None
-            and inquiry.handling_status in {"processed", "ignored"}
-            and not _operator_has_all_message_scopes(db, user, inquiry.id)
-        ):
-            raise HTTPException(status_code=403, detail="没有权限访问")
+        if inquiry is not None and inquiry.handling_status in {"processed", "ignored"}:
+            if inquiry.last_activity_at is None or (
+                datetime.now(timezone.utc) - as_utc(inquiry.last_activity_at)
+            ) >= timedelta(days=90):
+                raise HTTPException(status_code=409, detail="已到期清理的链路不能恢复")
+            if not _operator_has_all_message_scopes(db, user, inquiry.id):
+                raise HTTPException(status_code=403, detail="没有权限访问")
 
     message.handling_status = "pending"
     if inquiry is not None and inquiry.handling_status in {"processed", "ignored"}:
@@ -1444,12 +1936,20 @@ def message_action(
     db: Session = Depends(get_db),
 ) -> dict[str, object]:
     user, _ = pair
+    if user.role not in {"admin", "staff", "operations", "ops"}:
+        raise deny()
     message = get_scoped_message(db, user, message_id, for_update=True)
-    if user.role == "sales":
-        raise HTTPException(status_code=403, detail="没有权限访问")
 
     if message.handling_status == body.action:
         return _message_view(message, db, user)
+    # A delete-for-everyone stub has no recoverable customer body, so it must
+    # not be marked 已处理. It can still be 忽略: an operator has to be able to
+    # clear a wrongly classified or already-known revoke from the pending queue.
+    if is_revoked_content(message.raw_content) and body.action == "processed":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="客户已撤回的消息不能标记已处理，可选择忽略",
+        )
     if message.inquiry_link is not None:
         if message.inquiry_link.inquiry.handling_status in {"processed", "ignored"}:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="关联询盘已完成处理，不能单独改变消息状态")
@@ -1475,20 +1975,133 @@ def message_action(
     return _message_view(message, db, user)
 
 
+@router.post("/messages/bulk-action")
+def message_bulk_action(
+    body: MessageBulkActionBody,
+    pair: Annotated[tuple[User, UserSession], Depends(require_csrf)],
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    """Process a whole selection in one request.
+
+    The list view groups unlinked WhatsApp group / contact messages purely for
+    display, so before this endpoint existed an operator had to click each row.
+    Every row still goes through the same scope, terminal-state and
+    linked-inquiry rules as the single-message action. A 撤回 row may be 忽略
+    (so it can be cleared from the queue) but never 标记已处理. Linked rows are handled
+    through their inquiry (which processes all sibling messages) instead of
+    being mutated one by one, matching the existing single-row behaviour.
+
+    A skipped row is reported rather than aborting the batch: a stale selection
+    should not prevent the rest of the queue from being cleared.
+    """
+    user, _ = pair
+    if user.role not in {"admin", "staff", "operations", "ops"}:
+        raise deny()
+
+    # Preserve caller order and drop duplicates; one row must never be applied twice.
+    message_ids = list(dict.fromkeys(body.message_ids))
+    if any(message_id <= 0 for message_id in message_ids):
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="消息编号无效")
+
+    visible = {
+        message.id: message
+        for message in db.scalars(
+            scoped_messages(user).where(Message.id.in_(message_ids))
+        ).all()
+    }
+
+    direct: list[Message] = []
+    inquiry_ids: list[int] = []
+    skipped: list[dict[str, object]] = []
+
+    def skip(message_id: int | None, reason: str, detail: str, **extra: object) -> None:
+        skipped.append({"message_id": message_id, "reason": reason, "detail": detail, **extra})
+
+    for message_id in message_ids:
+        message = visible.get(message_id)
+        if message is None:
+            skip(message_id, "not_visible", "消息不在当前授权范围内")
+            continue
+        if is_revoked_content(message.raw_content) and body.action == "processed":
+            skip(message_id, "revoked", "客户已撤回，不能标记已处理；可改用批量忽略")
+            continue
+        if message.handling_status != "pending":
+            skip(message_id, "already_final", "该消息已完成处理，不能重复改变终态")
+            continue
+        link = message.inquiry_link
+        if link is not None:
+            if link.inquiry_id not in inquiry_ids:
+                inquiry_ids.append(link.inquiry_id)
+            continue
+        direct.append(message)
+
+    updated_message_ids: list[int] = []
+    if direct:
+        try:
+            for message in direct:
+                message.handling_status = body.action
+                if message.overview is not None:
+                    db.delete(message.overview)
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        updated_message_ids = [message.id for message in direct]
+
+    # transition_inquiry owns its own transaction and audits the linked chain.
+    # Handle inquiries after the direct rows are committed so one rejected
+    # chain cannot roll back the rest of a partially valid selection.
+    action = InquiryAction.COMPLETE if body.action == "processed" else InquiryAction.IGNORE
+    updated_inquiry_ids: list[int] = []
+    for inquiry_id in inquiry_ids:
+        try:
+            transition_inquiry(db, user, inquiry_id, action)
+        except HTTPException as exc:
+            skip(None, "inquiry_action_failed", str(exc.detail), inquiry_id=inquiry_id)
+            continue
+        updated_inquiry_ids.append(inquiry_id)
+
+    if updated_message_ids or updated_inquiry_ids:
+        _record_operation(
+            db,
+            user,
+            name="批量标记已处理" if body.action == "processed" else "批量忽略消息",
+            object_type="message",
+            object_id=None,
+            detail=f"消息 {len(updated_message_ids)} 条 / 询盘 {len(updated_inquiry_ids)} 条；跳过 {len(skipped)} 项",
+        )
+
+    return {
+        "action": body.action,
+        "updated_message_ids": updated_message_ids,
+        "updated_inquiry_ids": updated_inquiry_ids,
+        "skipped": skipped,
+    }
+
+
 @router.get("/inquiry-transfer-targets")
 def list_inquiry_transfer_targets(
     user: Annotated[User, Depends(current_user)],
     db: Session = Depends(get_db),
-) -> list[dict[str, int | str]]:
-    if user.role == "sales":
-        raise HTTPException(status_code=403, detail="没有权限访问")
+) -> list[dict[str, object]]:
+    if (
+        user.role != "admin"
+        and (not can_operate_channels(user) or user.manager_overlay_enabled)
+    ):
+        raise deny()
     targets = db.scalars(
         select(User)
         .where(User.role == "sales", User.is_active.is_(True))
         .order_by(User.id)
     ).all()
     return [
-        {"id": target.id, "username": target.username, "role": target.role}
+        {
+            "id": target.id,
+            "username": target.username,
+            "full_name": target.full_name,
+            "name": target.full_name or target.username,
+            "role": target.role,
+        }
         for target in targets
     ]
 
@@ -1577,7 +2190,7 @@ def internal_analysis(
     # used by the inbox. No object is loaded before the scope predicate.
     inquiry_query = scoped_inquiries(user).subquery()
     message_query = scoped_messages(user).subquery()
-    account_scope = scoped_channel_account_ids(user)
+    account_scope = inquiry_message_account_scope(user) if user.role == "admin" else scoped_channel_account_ids(user)
     pending_messages = db.scalar(
         select(func.count()).select_from(message_query).where(
             message_query.c.status == "received",
@@ -1761,7 +2374,11 @@ def internal_analysis(
         "generated_at": now,
         "mutation_performed": False,
         "write_operations_performed": 0,
-        "query_scope": "current_user_authorized_objects",
+        "query_scope": (
+            "company_wide_inquiry_inspection"
+            if user.role == "admin"
+            else "current_user_authorized_objects"
+        ),
         "test_only": "来源模型未声明；请以当前 fixture/test_only 环境标记解释",
         "stage_source": "inquiries.status",
         "event_source": "inquiry_events" if recent_events else "inquiries.updated_at",
@@ -1779,9 +2396,11 @@ def internal_analysis(
         "unlinked_messages": [
             {
                 "id": row["id"],
-                "channel_account_id": row["channel_account_id"],
-                "provider": row["provider"],
-                "external_message_id": row["external_message_id"],
+                **({} if user.role == "admin" else {
+                    "channel_account_id": row["channel_account_id"],
+                    "provider": row["provider"],
+                    "external_message_id": row["external_message_id"],
+                }),
                 "identity_state": row["contact_identity_state"],
                 "link_state": row["link_state"],
                 "occurred_at": row["occurred_at"],
@@ -1791,8 +2410,10 @@ def internal_analysis(
         "messages_needing_manual_review": [
             {
                 "id": row["id"],
-                "provider": row["provider"],
-                "external_message_id": row["external_message_id"],
+                **({} if user.role == "admin" else {
+                    "provider": row["provider"],
+                    "external_message_id": row["external_message_id"],
+                }),
                 "link_state": row["link_state"],
                 "identity_state": row["contact_identity_state"],
                 "occurred_at": row["occurred_at"],
@@ -1855,7 +2476,7 @@ def internal_analysis(
         ],
         "channel_statuses": [
             {
-                "channel_account_id": row["id"],
+                **({} if user.role == "admin" else {"channel_account_id": row["id"]}),
                 "channel_type": row["channel_type"],
                 "status": row["status"],
                 "is_abnormal": row["status"] in {"blocked", "error", "revoked", "not_connected"},
@@ -1879,6 +2500,8 @@ def internal_ai_query(
             "message": "该操作不会由内部 AI 执行，请在对应业务页面确认后提交。",
             "page": f"/{body.query}",
         }
+    if user.role == "admin" and body.query != "inquiries":
+        raise HTTPException(status_code=403, detail="没有权限访问")
 
     if body.query == "channel_accounts":
         result = db.scalars(
@@ -1904,8 +2527,12 @@ def internal_ai_query(
                 user,
                 inquiry,
                 visible_message_ids=visible_by_inquiry.get(inquiry.id, set()),
-                visible_events=_loaded_inquiry_events(
-                    inquiry, visible_by_inquiry.get(inquiry.id, set())
+                visible_events=(
+                    _visible_inquiry_events(db, user, inquiry)
+                    if user.role == "admin"
+                    else _loaded_inquiry_events(
+                        inquiry, visible_by_inquiry.get(inquiry.id, set())
+                    )
                 ),
             )
             for inquiry in result
@@ -1918,6 +2545,7 @@ def internal_ai_query(
         )
         if user.role == "sales":
             notification_scope = notification_scope.where(
+                Inquiry.id.in_(scoped_inquiries(user).with_only_columns(Inquiry.id)),
                 exists(
                     select(InquiryMessage.message_id)
                     .select_from(InquiryMessage)
@@ -1926,6 +2554,7 @@ def internal_ai_query(
                     .where(
                         InquiryMessage.inquiry_id == Inquiry.id,
                         ChannelAccount.status != "revoked",
+                        ChannelAccount.history_access_revoked_at.is_(None),
                     )
                     .correlate(Inquiry)
                 )
@@ -1938,7 +2567,7 @@ def internal_ai_query(
                     .join(Message, Message.id == InquiryMessage.message_id)
                     .where(
                         InquiryMessage.inquiry_id == Inquiry.id,
-                        Message.channel_account_id.in_(scoped_channel_account_ids(user)),
+                        Message.channel_account_id.in_(inquiry_message_account_scope(user)),
                     )
                     .correlate(Inquiry)
                 )

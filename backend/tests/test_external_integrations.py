@@ -28,6 +28,7 @@ def external_client(monkeypatch):
             username="operator",
             password_hash=hash_password("operator1"),
             role="staff",
+            department="inquiry",
             is_active=True,
             must_change_password=False,
         ))

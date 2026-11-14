@@ -44,17 +44,32 @@ def lifecycle_stage(inquiry: Inquiry, *, now: datetime | None = None) -> str:
 
 
 def _operator_has_all_message_scopes(db: Session, user: User, inquiry_id: int) -> bool:
-    account_ids = db.scalars(
-        select(Message.channel_account_id)
-        .join(InquiryMessage, InquiryMessage.message_id == Message.id)
-        .where(InquiryMessage.inquiry_id == inquiry_id)
-    ).all()
+    source_query = select(Message.channel_account_id).join(
+        InquiryMessage, InquiryMessage.message_id == Message.id
+    ).where(
+        InquiryMessage.inquiry_id == inquiry_id,
+        Message.direction == "inbound",
+    )
+    account_ids = db.scalars(source_query).all()
     if not account_ids:
-        inquiry_source = db.scalar(select(Inquiry.source_channel_account_id).where(Inquiry.id == inquiry_id))
-        if inquiry_source is None:
+        return False
+    if user.role == "admin":
+        eligible_ids = db.scalars(
+            select(Message.channel_account_id)
+            .join(InquiryMessage, InquiryMessage.message_id == Message.id)
+            .join(ChannelAccount, ChannelAccount.id == Message.channel_account_id)
+            .where(
+                InquiryMessage.inquiry_id == inquiry_id,
+                Message.direction == "inbound",
+                ChannelAccount.status != "revoked",
+                ChannelAccount.history_access_revoked_at.is_(None),
+            )
+        ).all()
+        source_account = db.scalar(select(Inquiry.source_channel_account_id).where(Inquiry.id == inquiry_id))
+        if source_account is not None and source_account not in eligible_ids:
             return False
-        account_ids = [inquiry_source]
-    return all(
+        return set(account_ids).issubset(set(eligible_ids)) and bool(eligible_ids)
+    return bool(account_ids) and all(
         db.scalar(
             select(
                 scoped_channel_account_ids(user)
@@ -77,7 +92,11 @@ def transition_inquiry(
     now: datetime | None = None,
 ) -> Inquiry:
     """Authorize first, lock the inquiry, then atomically transition and audit."""
-    if user.role == "sales":
+    if user.role not in {"admin", "staff", "operations", "ops"}:
+        raise HTTPException(status_code=403, detail="没有权限访问")
+    if user.role == "admin" and action not in {
+        InquiryAction.ASSIGN, InquiryAction.COMPLETE, InquiryAction.IGNORE, InquiryAction.REACTIVATE
+    }:
         raise HTTPException(status_code=403, detail="没有权限访问")
 
     # Query predicates enforce caller scope before loading or locking the object.
@@ -86,23 +105,6 @@ def transition_inquiry(
         .where(Inquiry.id == inquiry_id)
         .with_for_update()
     )
-    if inquiry is None:
-        # Compatibility for pre-association inquiries: permit an action only
-        # when their source account is in scope. Read routes remain message-scoped.
-        source_query = (
-            select(Inquiry)
-            .where(
-                Inquiry.id == inquiry_id,
-                Inquiry.source_channel_account_id.in_(scoped_channel_account_ids(user)),
-            )
-            .with_for_update()
-        )
-        if user.role == "sales":
-            source_query = select(Inquiry).where(
-                Inquiry.id == inquiry_id,
-                Inquiry.assigned_sales_user_id == user.id,
-            ).with_for_update()
-        inquiry = db.scalar(source_query)
     if inquiry is None:
         raise deny()
 
@@ -128,7 +130,8 @@ def transition_inquiry(
         if action in {InquiryAction.COMPLETE, InquiryAction.IGNORE, InquiryAction.REACTIVATE}:
             return inquiry
         raise HTTPException(status_code=409, detail="该动作已提交且目标状态不一致")
-    if current in {"processed", "ignored"} and action not in {InquiryAction.REACTIVATE}:
+    if current in {"processed", "ignored"} and action not in {InquiryAction.REACTIVATE} \
+        and not (user.role == "admin" and action is InquiryAction.ASSIGN):
         raise HTTPException(status_code=409, detail="当前链路已处理；请先恢复链路或等待新消息")
 
     previous = current
@@ -138,7 +141,7 @@ def transition_inquiry(
         if action is InquiryAction.ASSIGN:
             if target_sales_user_id == inquiry.assigned_sales_user_id and inquiry.status == "assigned":
                 return inquiry
-            if inquiry.status != "new":
+            if inquiry.status != "new" and not (user.role == "admin" and inquiry.status == "assigned"):
                 raise HTTPException(status_code=403, detail="询盘已分配给其他业务员")
             if target_sales_user_id is None:
                 raise HTTPException(status_code=422, detail="必须指定业务员")
@@ -220,7 +223,10 @@ def _process_linked_messages(db: Session, inquiry_id: int, handling_status: str 
     messages = db.scalars(
         select(Message)
         .join(InquiryMessage, InquiryMessage.message_id == Message.id)
-        .where(InquiryMessage.inquiry_id == inquiry_id)
+        .where(
+            InquiryMessage.inquiry_id == inquiry_id,
+            Message.direction == "inbound",
+        )
         .with_for_update()
     ).all()
     for message in messages:

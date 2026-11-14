@@ -1,7 +1,12 @@
 from pathlib import Path
 
+import importlib.util
+
 from alembic.config import Config
+from alembic.runtime.migration import MigrationContext
 from alembic.script import ScriptDirectory
+from alembic.operations import Operations
+from sqlalchemy import create_engine, inspect, text
 
 
 BACKEND_DIR = Path(__file__).resolve().parents[1]
@@ -15,6 +20,13 @@ def test_business_revision_is_the_only_migration_head():
     revisions = list(script.walk_revisions())
 
     assert [revision.revision for revision in revisions] == [
+        "0025_department_identity",
+        "0024_manager_overlay_department",
+        "0023_users_full_name",
+        "0022_manager_permission_grants",
+        "0021_whatsapp_contact_identity",
+        "0020_user_capability_grants",
+        "0019_phase_one_permissions",
         "0018_whatsapp_group_bindings",
         "0017_message_feed_indexes",
         "0016_operation_logs",
@@ -34,24 +46,44 @@ def test_business_revision_is_the_only_migration_head():
         "0002_business_authorization",
         "0001_auth_sessions",
     ]
-    assert revisions[0].down_revision == "0017_message_feed_indexes"
-    assert revisions[1].down_revision == "0016_operation_logs"
-    assert revisions[2].down_revision == "0015_website_form_messages"
-    assert revisions[3].down_revision == "0014_inquiry_business_type"
-    assert revisions[4].down_revision == "0013_inquiry_messages"
-    assert revisions[5].down_revision == "0012_message_overviews"
-    assert revisions[6].down_revision == "0011_message_provider_web_link"
-    assert revisions[7].down_revision == "0010_message_customer_contact"
-    assert revisions[8].down_revision == "0009_outlook_account_credential"
-    assert revisions[9].down_revision == "0008_gmail_account_runtime"
-    assert revisions[10].down_revision == "0007_message_handling_status"
-    assert revisions[11].down_revision == "0006_manual_handling_status"
-    assert revisions[12].down_revision == "0005_channel_external_account"
-    assert revisions[13].down_revision == "0004_inquiry_events"
-    assert revisions[14].down_revision == "0003_messages"
-    assert revisions[15].down_revision == "0002_business_authorization"
-    assert revisions[16].down_revision == "0001_auth_sessions"
-    assert revisions[17].down_revision is None
+    assert revisions[0].down_revision == "0024_manager_overlay_department"
+    assert revisions[1].down_revision == "0023_users_full_name"
+    assert revisions[2].down_revision == "0022_manager_permission_grants"
+    assert revisions[3].down_revision == "0021_whatsapp_contact_identity"
+    assert revisions[4].down_revision == "0020_user_capability_grants"
+    assert revisions[5].down_revision == "0019_phase_one_permissions"
+    assert revisions[6].down_revision == "0018_whatsapp_group_bindings"
+    assert revisions[7].down_revision == "0017_message_feed_indexes"
+    assert revisions[-1].down_revision is None
+
+
+def test_department_identity_migration_backfills_then_enforces_not_null():
+    migration = (BACKEND_DIR / "migrations" / "versions" / "0025_department_identity_backfill.py").read_text(encoding="utf-8")
+    assert 'WHERE department IS NULL OR trim(department) = ' in migration
+    assert 'department = \'unassigned\'' in migration
+    assert 'nullable=False' in migration
+    assert 'down_revision = "0024_manager_overlay_department"' in migration
+
+
+def test_department_identity_migration_backfills_null_and_blank_values_before_not_null():
+    migration_path = BACKEND_DIR / "migrations" / "versions" / "0025_department_identity_backfill.py"
+    spec = importlib.util.spec_from_file_location("migration_0025", migration_path)
+    migration = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(migration)
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    try:
+        with engine.begin() as connection:
+            connection.execute(text("CREATE TABLE users (id INTEGER PRIMARY KEY, department VARCHAR(64) NULL)"))
+            connection.execute(text("INSERT INTO users (id, department) VALUES (1, NULL), (2, ''), (3, '   '), (4, 'sales')"))
+            context = MigrationContext.configure(connection)
+            with Operations.context(context):
+                migration.upgrade()
+            values = connection.execute(text("SELECT id, department FROM users ORDER BY id")).all()
+            assert values == [(1, "unassigned"), (2, "unassigned"), (3, "unassigned"), (4, "sales")]
+            assert not inspect(connection).get_columns("users")[1]["nullable"]
+    finally:
+        engine.dispose()
 
 
 def test_auth_migration_contains_only_auth_tables():

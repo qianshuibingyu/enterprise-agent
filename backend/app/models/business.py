@@ -41,6 +41,7 @@ class ChannelAccount(Base):
     gmail_watch_history_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     gmail_watch_expiration: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     status: Mapped[str] = mapped_column(String(32), index=True)
+    history_access_revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
@@ -95,6 +96,7 @@ class Inquiry(Base):
     contact_identity_kind: Mapped[str | None] = mapped_column(String(16), nullable=True)
     customer_nickname: Mapped[str] = mapped_column(String(255))
     raw_message: Mapped[str] = mapped_column(Text)
+    department: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     source_channel_account_id: Mapped[int | None] = mapped_column(
         ForeignKey("channel_accounts.id", ondelete="SET NULL"), nullable=True, index=True
     )

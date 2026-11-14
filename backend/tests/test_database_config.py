@@ -47,7 +47,9 @@ def test_database_url_defaults_to_compose_db_and_postgres_port(monkeypatch):
 
 
 def test_missing_required_database_setting_fails_when_url_is_requested(monkeypatch):
-    monkeypatch.delenv("POSTGRES_USER", raising=False)
+    # The repository .env is a legitimate config source and may already export
+    # POSTGRES_USER; force an empty value so this case stays hermetic.
+    monkeypatch.setenv("POSTGRES_USER", "")
     monkeypatch.setenv("POSTGRES_PASSWORD", "unit_test_password")
     monkeypatch.setenv("POSTGRES_DB", "unit_test_db")
 
@@ -96,3 +98,20 @@ def test_load_project_env_preserves_exported_values_and_parses_quotes(monkeypatc
     assert os.environ["POSTGRES_USER"] == "exported_user"
     assert os.environ["POSTGRES_PASSWORD"] == "file password"
     assert os.environ["POSTGRES_DB"] == "file_db"
+
+
+def test_load_project_env_accepts_spaces_around_assignment(monkeypatch, tmp_path):
+    import app.environment as environment
+
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "POSTGRES_USER = spaced_user\n"
+        "POSTGRES_DB = spaced_db\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("POSTGRES_USER", raising=False)
+    monkeypatch.delenv("POSTGRES_DB", raising=False)
+    environment.load_project_env(env_file)
+
+    assert os.environ["POSTGRES_USER"] == "spaced_user"
+    assert os.environ["POSTGRES_DB"] == "spaced_db"

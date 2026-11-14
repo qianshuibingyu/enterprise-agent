@@ -10,6 +10,7 @@ import httpx
 
 from app.outlook_credentials import OutlookCredentialError, decrypt_refresh_token
 from app.outlook_oauth import OutlookOAuthClient
+from app.provider_transport import provider_http_client
 
 
 class OutlookGraphError(RuntimeError):
@@ -40,8 +41,8 @@ class OutlookGraphClient:
 
     def __init__(self, *, refresh_token: str, http: httpx.Client | None = None) -> None:
         self.refresh_token = refresh_token
-        self.http = http or httpx.Client(
-            timeout=float(os.environ.get("OUTLOOK_TIMEOUT_SECONDS", "20"))
+        self.http = http or provider_http_client(
+            float(os.environ.get("OUTLOOK_TIMEOUT_SECONDS", "20"))
         )
         self.oauth = OutlookOAuthClient(http=self.http)
         self._access_token: str | None = None

@@ -71,7 +71,9 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     throw new ChannelApiError(response.status, message)
   }
 
-  return response.json() as Promise<T>
+  // Mirror inboxApi: a successful response may legitimately have no body.
+  const text = await response.text()
+  return (text ? JSON.parse(text) : undefined) as T
 }
 
 export const channelsApi = {

@@ -9,6 +9,7 @@ from urllib.parse import urlencode
 import httpx
 
 from app.outlook_mcp import OutlookMcpConfigurationError
+from app.provider_transport import provider_http_client
 
 
 class OutlookOAuthProviderError(OutlookMcpConfigurationError):
@@ -60,8 +61,8 @@ class OutlookOAuthClient:
         self.scopes = " ".join(dict.fromkeys(scope_values))
         if not self.client_id or not self.client_secret or not self.redirect_uri:
             raise OutlookMcpConfigurationError("Outlook OAuth configuration is incomplete")
-        self.http = http or httpx.Client(
-            timeout=float(os.environ.get("OUTLOOK_TIMEOUT_SECONDS", "20"))
+        self.http = http or provider_http_client(
+            float(os.environ.get("OUTLOOK_TIMEOUT_SECONDS", "20"))
         )
         self.authorize_endpoint = (
             f"https://login.microsoftonline.com/{self.tenant_id}/oauth2/v2.0/authorize"

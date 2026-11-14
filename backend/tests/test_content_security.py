@@ -1,4 +1,4 @@
-from app.content_security import content_view
+from app.content_security import content_view, redact_contact_text
 
 
 def test_content_view_returns_plain_text_and_drops_active_html_content():
@@ -38,3 +38,17 @@ def test_content_view_degrades_malformed_markup_without_returning_markup():
     assert "<p>" not in result["display_text"]
     assert "<b>" not in result["display_text"]
     assert "before" in result["display_text"]
+
+
+def test_redact_contact_text_masks_known_names_emails_and_common_phone_numbers():
+    text = redact_contact_text(
+        "Jane Doe called +1 (650) 253-0000; email JANE.DOE@example.com, ref 2024-01-01.",
+        ("Jane Doe", "jane.doe@example.com"),
+    )
+
+    assert text == "[redacted] called [phone redacted]; email [email redacted], ref 2024-01-01."
+
+
+def test_redact_contact_text_leaves_non_contact_digit_sequences_and_none_alone():
+    assert redact_contact_text("Order 12345678, ref 20240101123456.") == "Order 12345678, ref 20240101123456."
+    assert redact_contact_text(None) is None

@@ -10,7 +10,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.auth import current_user, require_csrf
-from app.authorization import scoped_channel_account_ids
+from app.authorization import can_connect_channels, channel_onboarding_account_ids
 from app.database import get_db
 from app.gmail_credentials import GmailCredentialError, encrypt_refresh_token
 from app.outlook_credentials import OutlookCredentialError, encrypt_refresh_token as encrypt_outlook_refresh_token
@@ -77,11 +77,19 @@ def get_outlook_oauth_client() -> OutlookOAuthClient:
 
 
 def _scoped_account(db: Session, user: User, account_id: int, channel_type: str) -> ChannelAccount:
+    if not can_connect_channels(user):
+        raise HTTPException(status_code=403, detail="没有权限访问")
+    # Re-authorizing an account the caller already owns is not a new channel
+    # onboarding: the admin preauthorization grant is checked when the account
+    # shell is created (channel_routes.require_channel_preauthorization).
+    # Administrators may complete OAuth for an account they own and then hand
+    # it to an operator; message reads stay blocked for admins elsewhere.
     account = db.scalar(
         select(ChannelAccount).where(
             ChannelAccount.id == account_id,
             ChannelAccount.channel_type == channel_type,
-            ChannelAccount.id.in_(scoped_channel_account_ids(user)),
+            ChannelAccount.id.in_(channel_onboarding_account_ids(user)),
+            ChannelAccount.history_access_revoked_at.is_(None),
         ).with_for_update()
     )
     if account is None:
@@ -139,6 +147,8 @@ def gmail_authorize_callback(
         raise HTTPException(status_code=400, detail="OAuth state 无效或已过期")
     account = _scoped_account(db, user, consumed.channel_account_id, "gmail")
     try:
+        # Injected (not constructed inline) so deployments and tests can swap
+        # the OAuth client without reaching the real Google endpoints.
         authorization = client.exchange_code(code=code, state=state)
         if not authorization.refresh_token:
             raise GmailCredentialError("Google OAuth did not return a refresh token")
@@ -174,10 +184,10 @@ def outlook_authorize_start(
     account_id: int,
     pair: Annotated[tuple[User, UserSession], Depends(require_csrf)],
     db: Session = Depends(get_db),
-    client: OutlookOAuthClient = Depends(get_outlook_oauth_client),
 ) -> dict[str, int | str]:
     user, _ = pair
     account = _scoped_account(db, user, account_id, "outlook")
+    client = get_outlook_oauth_client()
     state = _oauth_states.issue(channel_account_id=account.id).value
     return {"channel_account_id": account.id, "authorization_url": client.authorization_url(state=state)}
 
@@ -188,16 +198,18 @@ def outlook_authorize_callback(
     state: str = Query(min_length=1),
     user: Annotated[User, Depends(current_user)] = None,
     db: Session = Depends(get_db),
-    client: OutlookOAuthClient = Depends(get_outlook_oauth_client),
 ) -> RedirectResponse:
     pending = _oauth_states.validate_any(state)
     if pending is None:
         return _outlook_frontend_redirect("error", "Outlook 授权状态无效或已过期。")
+    account = _scoped_account(db, user, pending.channel_account_id, "outlook")
     consumed = _oauth_states.consume_any(state)
     if consumed is None:
         return _outlook_frontend_redirect("error", "Outlook 授权状态无效或已过期。")
-    account = _scoped_account(db, user, consumed.channel_account_id, "outlook")
+    if consumed.channel_account_id != account.id:
+        return _outlook_frontend_redirect("error", "Outlook 授权状态无效或已过期。")
     try:
+        client = get_outlook_oauth_client()
         authorization = client.exchange_code(code=code)
         if not authorization.refresh_token:
             raise OutlookCredentialError("Microsoft OAuth did not return a refresh token")

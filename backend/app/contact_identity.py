@@ -34,7 +34,18 @@ def normalize_email(value: str | None) -> ContactIdentity:
     return ContactIdentity(raw, f"{local}@{domain}".casefold(), "certain", "email")
 
 
-def normalize_whatsapp(value: str | None) -> ContactIdentity:
+def normalize_whatsapp(value: str | None, *, assume_international: bool = False) -> ContactIdentity:
+    """Normalize a WhatsApp contact into E.164.
+
+    ``assume_international`` exists for provider-originated values only. A
+    WhatsApp direct chat is always addressed by a complete international
+    number, but the Baileys adapter extracts the JID user part and therefore
+    hands over bare digits (``46735037108``) without the leading ``+``. Those
+    values must become ``+46735037108`` so an exact contact match also works
+    for messages that were stored before the prefix was kept. Operator-typed
+    numbers (default ``False``) still require an explicit country code: a bare
+    local number is ambiguous and stays a manual decision.
+    """
     if value is None or not value.strip():
         return ContactIdentity(value, None, "needs_manual_review", None)
     raw = value
@@ -49,6 +60,11 @@ def normalize_whatsapp(value: str | None) -> ContactIdentity:
         candidate = f"+{candidate}" if candidate.isdigit() else candidate
     else:
         candidate = jid
+    if assume_international and candidate and not candidate.startswith("+"):
+        digits = "".join(ch for ch in candidate if ch.isdigit())
+        if not 8 <= len(digits) <= 15:
+            return ContactIdentity(raw, None, "needs_manual_review", "whatsapp")
+        candidate = f"+{digits}"
     if phonenumbers is None:
         # Keep the provider's international JID usable when the optional
         # parser is unavailable, without ever guessing a country code.

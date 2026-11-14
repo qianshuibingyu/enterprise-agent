@@ -23,7 +23,7 @@ def content_client():
     Base.metadata.create_all(engine)
     factory = sessionmaker(bind=engine, expire_on_commit=False)
     with factory() as db:
-        user = User(username="content-operator", password_hash=hash_password("operator1"), role="staff", is_active=True, must_change_password=False)
+        user = User(username="content-operator", password_hash=hash_password("operator1"), role="staff", department="inquiry", is_active=True, must_change_password=False)
         db.add(user)
         db.flush()
         account = ChannelAccount(
@@ -60,6 +60,18 @@ def content_client():
             occurred_at=datetime(2026, 11, 9, tzinfo=timezone.utc),
             raw_content="cached WhatsApp fallback",
             customer_contact="+16502530000",
+        ))
+        # 入站只抓到空 stub，但渠道里其实留有完整原文（用户截图里的 #307）。
+        db.add(Message(
+            channel_account_id=whatsapp_account.id,
+            provider="whatsapp_web_baileys",
+            external_message_id="wa-stub-1",
+            direction="inbound",
+            status="received",
+            handling_status="pending",
+            occurred_at=datetime(2026, 11, 9, tzinfo=timezone.utc),
+            raw_content="[empty WhatsApp message]",
+            customer_contact="+34655397876",
         ))
         db.commit()
 
@@ -270,3 +282,61 @@ def test_whatsapp_bridge_offline_replays_persisted_snapshot(monkeypatch):
     )
     assert failure == "persisted_snapshot_replayed"
     assert content["display_text"] == "persisted WhatsApp original"
+
+
+def login_operator(client):
+    csrf = client.get("/auth/csrf", headers={"Origin": "https://testserver"}).json()["csrf_token"]
+    response = client.post(
+        "/auth/login",
+        json={"username": "content-operator", "password": "operator1"},
+        headers={"Origin": "https://testserver", "X-CSRF-Token": csrf},
+    )
+    assert response.status_code == 200
+
+
+def test_recoverable_whatsapp_body_clears_a_false_revocation(monkeypatch, content_client):
+    """截图回归：弹窗能看到完整原文，列表却写「已撤回 / 原文不再可用」。"""
+    original = "Hola, Tengo una de vuestras cerraduras (wf-018pro)."
+
+    class BridgeWithOriginal:
+        def fetch_message(self, *, channel_account_id, message_id):
+            return {"raw_content": original}
+
+    monkeypatch.setattr(business_routes, "HttpWhatsAppAdapterClient", BridgeWithOriginal)
+    login_operator(content_client)
+
+    # 打开「查看客户消息」触发回源修复：这条消息不是撤回。
+    content = content_client.get("/api/messages/3/content")
+    assert content.status_code == 200, content.text
+    assert content.json()["content_state"] == "ready"
+    assert content.json()["full_text"] == original
+
+    # 修复必须持久化，列表与摘要不再互相矛盾。
+    items = content_client.get("/api/messages").json()["items"]
+    row = next(item for item in items if item["id"] == 3)
+    assert row["content_state"] == "ready"
+    assert original in row["display_text"]
+    assert row["overview"] is not None
+
+
+def test_unrecoverable_revoke_stays_revoked_and_can_be_ignored(monkeypatch, content_client):
+    """渠道也读不回正文时仍是撤回，但运营可以「忽略」清掉这条待办。"""
+    class BridgeWithoutBody:
+        def fetch_message(self, *, channel_account_id, message_id):
+            return {"raw_content": "[WhatsApp message revoked]"}
+
+    monkeypatch.setattr(business_routes, "HttpWhatsAppAdapterClient", BridgeWithoutBody)
+    login_operator(content_client)
+
+    items = content_client.get("/api/messages").json()["items"]
+    row = next(item for item in items if item["id"] == 3)
+    assert row["content_state"] == "revoked"
+
+    csrf = content_client.get("/auth/csrf", headers={"Origin": "https://testserver"}).json()["csrf_token"]
+    response = content_client.post(
+        "/api/messages/3/action",
+        json={"action": "ignored"},
+        headers={"Origin": "https://testserver", "X-CSRF-Token": csrf},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["handling_status"] == "ignored"

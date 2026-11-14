@@ -26,6 +26,7 @@ from app.models.business import (
     Message,
 )
 from app.models.user import User
+from app.models.permissions import UserChannelPreauthorization
 
 
 class FakeGmailClient:
@@ -70,6 +71,7 @@ def gmail_client(monkeypatch):
             username="gmail-owner",
             password_hash="hash",
             role="staff",
+            department="inquiry",
             is_active=True,
             must_change_password=False,
         ))
@@ -152,29 +154,70 @@ def headers(token="test-push-token"):
     return {"X-Gmail-PubSub-Token": token}
 
 
-def test_gmail_revoke_and_reconnect_requires_fresh_oauth():
+def _gmail_revoke_fixture(db, *, with_history: bool):
+    owner = User(username="owner", password_hash="hash", role="staff", department="inquiry", is_active=True, must_change_password=False)
+    db.add(owner)
+    db.flush()
+    account = ChannelAccount(owner_user_id=owner.id, channel_type="gmail", status="connected",
+                             external_account_id="owner@example.com", gmail_credential_ciphertext="old-secret",
+                             credential_reference="old", gmail_watch_history_id="old-cursor")
+    db.add(account)
+    db.flush()
+    db.add(ChannelGrant(channel_account_id=account.id, channel_type="gmail", owner_user_id=owner.id))
+    db.add(UserChannelPreauthorization(user_id=owner.id, channel_type="gmail", granted_by_user_id=owner.id))
+    if with_history:
+        db.add(Message(
+            channel_account_id=account.id,
+            provider="gmail_api_pubsub",
+            external_message_id="gmail-history-1",
+            direction="inbound",
+            status="received",
+            handling_status="pending",
+            occurred_at=datetime(2026, 11, 1, tzinfo=timezone.utc),
+            raw_content="collected before revoke",
+            link_state="linked",
+        ))
+    db.commit()
+    return owner, account
+
+
+def test_gmail_revoke_of_empty_shell_is_fully_cleaned_up():
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
     with sessionmaker(bind=engine, expire_on_commit=False)() as db:
-        owner = User(username="owner", password_hash="hash", role="staff", is_active=True, must_change_password=False)
-        db.add(owner)
-        db.flush()
-        account = ChannelAccount(owner_user_id=owner.id, channel_type="gmail", status="connected",
-                                 external_account_id="owner@example.com", gmail_credential_ciphertext="old-secret",
-                                 credential_reference="old", gmail_watch_history_id="old-cursor")
-        db.add(account)
-        db.flush()
-        db.add(ChannelGrant(channel_account_id=account.id, channel_type="gmail", owner_user_id=owner.id))
-        db.commit()
-        state = _oauth_states.issue(channel_account_id=account.id).value
-        revoke_channel(account.id, (owner, None), db)
+        owner, account = _gmail_revoke_fixture(db, with_history=False)
+        account_id = account.id
+        state = _oauth_states.issue(channel_account_id=account_id).value
+        revoke_channel(account_id, (owner, None), db)
         assert _oauth_states.validate_any(state) is None
         assert account.gmail_credential_ciphertext is None
         assert account.credential_reference is None
         assert account.gmail_watch_history_id is None
-        result = create_gmail_account((owner, None), db)
-        assert result["id"] == account.id
-        assert result["status"] == "not_ready"
+        # No revoked zombie shell remains: reconnect creates a clean new record.
+        assert db.get(ChannelAccount, account_id) is None
+        assert db.scalars(select(ChannelGrant).where(ChannelGrant.channel_account_id == account_id)).all() == []
+        fresh = create_gmail_account((owner, None), db)
+        # SQLite can reuse the deleted row's id; the point is that the new
+        # shell is clean (no credentials, no external mapping, no revoke flag).
+        assert fresh["status"] == "not_ready"
+        assert fresh["external_account_id"] is None
+        assert db.get(ChannelAccount, fresh["id"]).history_access_revoked_at is None
+    engine.dispose()
+
+
+def test_gmail_revoke_archives_shell_with_collected_history():
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with sessionmaker(bind=engine, expire_on_commit=False)() as db:
+        owner, account = _gmail_revoke_fixture(db, with_history=True)
+        revoke_channel(account.id, (owner, None), db)
+        # History is never destroyed: the shell is archived and reusing it is
+        # refused until an administrator restores history access.
+        with pytest.raises(HTTPException) as exc:
+            create_gmail_account((owner, None), db)
+        assert exc.value.status_code == 403
+        assert "历史访问已撤销" in exc.value.detail
+        assert account.status == "revoked"
         assert account.external_account_id == "owner@example.com"
         assert account.gmail_credential_ciphertext is None
     engine.dispose()
@@ -185,7 +228,7 @@ def test_gmail_reconnect_rejects_different_provider_identity(monkeypatch):
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
     with sessionmaker(bind=engine, expire_on_commit=False)() as db:
-        owner = User(username="owner", password_hash="hash", role="staff", is_active=True, must_change_password=False)
+        owner = User(username="owner", password_hash="hash", role="staff", department="inquiry", is_active=True, must_change_password=False)
         db.add(owner)
         db.flush()
         account = ChannelAccount(owner_user_id=owner.id, channel_type="gmail", status="not_ready", external_account_id="original@example.com")
@@ -229,8 +272,8 @@ def test_gmail_denied_callback_checks_scope_and_consumes_state(caplog):
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
     with sessionmaker(bind=engine, expire_on_commit=False)() as db:
-        owner = User(username="owner", password_hash="hash", role="staff", is_active=True, must_change_password=False)
-        other = User(username="other", password_hash="hash", role="staff", is_active=True, must_change_password=False)
+        owner = User(username="owner", password_hash="hash", role="staff", department="inquiry", is_active=True, must_change_password=False)
+        other = User(username="other", password_hash="hash", role="staff", department="inquiry", is_active=True, must_change_password=False)
         db.add_all([owner, other])
         db.flush()
         account = ChannelAccount(owner_user_id=owner.id, channel_type="gmail", status="not_ready")
@@ -256,7 +299,7 @@ def test_gmail_reconnect_does_not_restore_missing_grant():
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
     with sessionmaker(bind=engine, expire_on_commit=False)() as db:
-        owner = User(username="owner", password_hash="hash", role="staff", is_active=True, must_change_password=False)
+        owner = User(username="owner", password_hash="hash", role="staff", department="inquiry", is_active=True, must_change_password=False)
         db.add(owner)
         db.flush()
         account = ChannelAccount(owner_user_id=owner.id, channel_type="gmail", status="revoked", gmail_credential_ciphertext="old")

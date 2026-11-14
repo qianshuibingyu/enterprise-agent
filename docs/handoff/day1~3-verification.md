@@ -41,6 +41,10 @@
 
 服务器当时的 `/app/migrations` 只有 `env.py`，没有版本迁移文件；`alembic upgrade head` 退出 0，但 `alembic current` 无 revision 输出，`alembic_version` 查询为 0 行。用户明确当时没有身份表和权限表。新建 revision 草稿尚未应用，不应将上述历史记录覆盖成迁移已完成。
 
+### 9.5 阶段一验收记录位置
+
+2026-11-14 阶段一账号生命周期、授权边界、会话撤销、0024/0025 迁移、测试/构建、本机 Compose 部署和用户提供的黑盒 API 证据，已单独归档至[阶段一账号与授权验收交接文档](stage1-account-authorization-acceptance.md)。本 Day 1–3 文件继续保留其原始认证历史与时间线，不将阶段一验收详情并入认证章节。
+
 ---
 
 ## 10. Day 3 步骤 1：数据库与应用连接本轮核验（用户提供，2026-10-21）

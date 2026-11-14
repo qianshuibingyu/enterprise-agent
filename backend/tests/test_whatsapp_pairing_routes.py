@@ -54,6 +54,7 @@ def whatsapp_owner_client(monkeypatch):
             username="wa-owner",
             password_hash=hash_password("ownerpass1"),
             role="staff",
+            department="inquiry",
             is_active=True,
             must_change_password=False,
         )

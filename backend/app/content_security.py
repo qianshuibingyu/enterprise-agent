@@ -21,6 +21,7 @@ _DANGEROUS_TAGS = frozenset(
 )
 _BLOCK_TAGS = frozenset({"br", "p", "div", "li", "tr", "h1", "h2", "h3", "h4", "h5", "h6", "blockquote"})
 _EMAIL_RE = re.compile(r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b")
+_PHONE_RE = re.compile(r"(?<!\w)(?:\+?\d[\d ().-]{6,}\d)(?!\w)")
 
 
 class _TextExtractor(HTMLParser):
@@ -108,6 +109,54 @@ def full_content_view(value: Any) -> dict[str, object]:
         "content_sanitized": True,
         "content_truncated": False,
     }
+
+
+def redact_contact_text(value: Any, identities: tuple[str | None, ...] = ()) -> str | None:
+    """Mask common contact fields and known customer names in admin summaries."""
+    if value is None:
+        return None
+    text = str(value)
+    # Remove display-name brackets with the address so the redacted output does
+    # not retain contact-formatting markup.
+    text = re.sub(
+        r"<([^<>]+)>",
+        lambda match: "[email redacted]" if _EMAIL_RE.search(match.group(1)) else match.group(0),
+        text,
+    )
+    # Let the dedicated email rule choose its stable marker even when an email
+    # address is also present in the known-identity list.
+    text = _EMAIL_RE.sub("[email redacted]", text)
+    known_identities = [item.strip() for item in identities if item and item.strip()]
+    for identity in sorted(known_identities, key=len, reverse=True):
+        if "@" in identity:
+            # A stored contact may include a display name, e.g. "Jane Doe
+            # <jane@example.com>". Mask that name separately so the email
+            # keeps its dedicated marker after the email pass above.
+            display_name = re.match(r"^\s*(.*?)\s*<[^<>@]+@[^<>]+>\s*$", identity)
+            if display_name and display_name.group(1).strip():
+                text = re.sub(
+                    re.escape(display_name.group(1).strip()),
+                    "[redacted]",
+                    text,
+                    flags=re.IGNORECASE,
+                )
+            continue
+        text = re.sub(re.escape(identity), "[redacted]", text, flags=re.IGNORECASE)
+
+    def mask_phone(match: re.Match[str]) -> str:
+        candidate = match.group(0)
+        digits = sum(character.isdigit() for character in candidate)
+        # Do not treat dates or long, uninterrupted numeric references (for
+        # example timestamps or order IDs) as phone numbers. Formatted numbers
+        # and ordinary 9-12 digit phone numbers remain covered.
+        if re.fullmatch(r"\d{4}[-/.]\d{1,2}[-/.]\d{1,2}", candidate.strip()):
+            return candidate
+        formatted = candidate.startswith("+") or any(character in candidate for character in " ()-.")
+        if 9 <= digits <= 15 and (formatted or digits <= 12):
+            return "[phone redacted]"
+        return candidate
+
+    return _PHONE_RE.sub(mask_phone, text)
 
 
 def legacy_contact_view(raw_content: Any, provider: str | None) -> tuple[str | None, str | None]:

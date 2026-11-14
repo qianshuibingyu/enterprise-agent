@@ -83,6 +83,32 @@ function externalId(state: any): string | undefined {
   return typeof id === "string" && id.length > 0 ? id : undefined;
 }
 
+/**
+ * Remove the stored credentials of one channel account.
+ *
+ * A device that WhatsApp logged out can never be re-linked with the same
+ * credentials: Baileys keeps reporting `loggedOut` and never emits a QR, so
+ * "开始关联" would time out forever. Dropping the files is what makes a fresh
+ * QR possible. The encrypted inbox lives elsewhere and is never touched here.
+ */
+async function clearStoredAuth(channelAccountId: number): Promise<void> {
+  await rm(path.join(AUTH_ROOT, String(channelAccountId)), { recursive: true, force: true });
+}
+
+function isDeadSession(runtime: RuntimeState): boolean {
+  return runtime.connectionState === "revoked" || runtime.connectionState === "logged_out";
+}
+
+/** Wait until pairing produced a QR, connected, failed, or is known dead. */
+async function waitForPairing(runtime: RuntimeState, timeoutMs = 15_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (runtime.qrDataUrl || runtime.metrics.socketConnected || runtime.error) return;
+    if (isDeadSession(runtime)) return;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+}
+
 function serializedProviderMessage(message: WAMessage) {
   return {
     external_message_id: externalMessageIdForMessage(message),
@@ -279,6 +305,14 @@ function startSocket(runtime: RuntimeState): void {
       const code = (update.lastDisconnect?.error as any)?.output?.statusCode;
       if (code === DisconnectReason.loggedOut) {
         runtime.connectionState = "revoked";
+        runtime.qrDataUrl = undefined;
+        runtime.qrExpiresAt = undefined;
+        // These credentials are dead: WhatsApp unlinked the device. Keeping
+        // them would make every later pairing replay a logged-out session and
+        // never show a QR, so drop them and let the next attempt start clean.
+        void clearStoredAuth(runtime.channelAccountId).catch((error) => {
+          runtime.error = error instanceof Error ? error.message : "WhatsApp credential cleanup failed";
+        });
         return;
       }
       runtime.connectionState = "disconnected";
@@ -346,7 +380,10 @@ async function getRuntime(channelAccountId: number): Promise<RuntimeState> {
   return runtime;
 }
 
-async function resetRuntime(channelAccountId: number): Promise<RuntimeState> {
+async function resetRuntime(
+  channelAccountId: number,
+  options: { wipeAuth?: boolean } = {},
+): Promise<RuntimeState> {
   const current = runtimes.get(channelAccountId);
   if (current) {
     if (current.retryTimer) clearTimeout(current.retryTimer);
@@ -357,6 +394,7 @@ async function resetRuntime(channelAccountId: number): Promise<RuntimeState> {
   runtimes.delete(channelAccountId);
   // Pairing is non-destructive. Reuse a valid linked-device session and only
   // create a fresh QR when Baileys reports an unregistered/logged-out session.
+  if (options.wipeAuth) await clearStoredAuth(channelAccountId);
   return getRuntime(channelAccountId);
 }
 
@@ -382,10 +420,14 @@ app.use(express.json({ limit: "256kb" }));
 app.post("/internal/whatsapp/accounts/:channelAccountId/pair", async (request, response) => {
   if (!requireToken(request, response)) return;
   try {
-    const runtime = await resetRuntime(accountId(request));
-    const deadline = Date.now() + 15_000;
-    while (!runtime.qrDataUrl && !runtime.metrics.socketConnected && !runtime.error && Date.now() < deadline) {
-      await new Promise((resolve) => setTimeout(resolve, 100));
+    const id = accountId(request);
+    let runtime = await resetRuntime(id);
+    await waitForPairing(runtime);
+    // A previously unlinked device fails immediately with `revoked` and no QR.
+    // Clear those dead credentials and give pairing exactly one clean retry.
+    if (!runtime.qrDataUrl && !runtime.metrics.socketConnected && isDeadSession(runtime)) {
+      runtime = await resetRuntime(id, { wipeAuth: true });
+      await waitForPairing(runtime);
     }
     if (runtime.error) {
       response.status(503).json({ detail: "WhatsApp pairing could not start" });
@@ -396,7 +438,10 @@ app.post("/internal/whatsapp/accounts/:channelAccountId/pair", async (request, r
       return;
     }
     if (!runtime.qrDataUrl) {
-      response.status(503).json({ detail: "WhatsApp pairing timed out waiting for QR" });
+      response.status(503).json({
+        detail: "WhatsApp pairing timed out waiting for QR",
+        state: runtime.connectionState,
+      });
       return;
     }
     response.json({ qr: runtime.qrDataUrl, expires_at: runtime.qrExpiresAt ?? "", state: runtime.connectionState, test_only: false });
@@ -447,7 +492,10 @@ app.post("/internal/whatsapp/accounts/:channelAccountId/disconnect", async (requ
     runtime.connectionState = "revoked";
     runtime.generation += 1;
     runtime.socket?.end(undefined);
-    await rm(path.join(AUTH_ROOT, String(runtime.channelAccountId)), { recursive: true, force: true });
+    await clearStoredAuth(runtime.channelAccountId);
+    // Drop the in-memory runtime as well: a later scope check must observe a
+    // real "not linked" session instead of a cached revoked one.
+    runtimes.delete(runtime.channelAccountId);
     // Keep the encrypted inbox so any captured-but-undelivered messages survive disconnect.
     response.json({ state: runtime.connectionState, external_account_id: runtime.externalAccountId ?? null, detail: null });
   } catch {

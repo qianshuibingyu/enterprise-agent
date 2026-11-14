@@ -13,6 +13,7 @@ from app.channels.inbound import (
     ProviderRateLimited,
     ProviderTemporaryFailure,
 )
+from app.provider_transport import provider_http_client
 
 TOKEN_URL = "https://oauth2.googleapis.com/token"
 GMAIL_API_URL = "https://gmail.googleapis.com/gmail/v1/users"
@@ -36,7 +37,9 @@ class GmailApiClient:
         self.user_id = os.environ.get("GMAIL_USER_ID", "me")
         if not all((self.client_id, self.client_secret, self.refresh_token)):
             raise GmailConfigurationError("gmail OAuth client is not configured")
-        self.http = http or httpx.Client(timeout=20.0)
+        self.http = http or provider_http_client(
+            float(os.environ.get("GMAIL_TIMEOUT_SECONDS", "20"))
+        )
         self._access_token: str | None = None
 
     def _token(self) -> str:

@@ -22,7 +22,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from app.auth import current_user, require_csrf
-from app.authorization import scoped_channel_account_ids
+from app.authorization import can_operate_channels, scoped_channel_account_ids
 from app.business_routes import _record_operation
 from app.contact_identity import normalize_whatsapp
 from app.database import get_db
@@ -45,10 +45,11 @@ class BindingBody(BaseModel):
     note: str | None = Field(default=None, max_length=255)
 
 
-def _reject_sales(user: User) -> None:
-    # This is an operations feature; sales accounts do not participate at all.
-    if user.role == "sales":
+def _require_whatsapp_operator(db: Session, user: User) -> None:
+    if user.role == "admin" or not can_operate_channels(user):
         raise HTTPException(status_code=403, detail=DENIED)
+    # Group bindings are scoped by the operator's owned channel accounts below;
+    # the admin preauthorization grant only gates creating a new channel shell.
 
 
 def _iso(value: object) -> str | None:
@@ -81,16 +82,11 @@ def list_bindings(
     user: Annotated[User, Depends(current_user)],
     db: Session = Depends(get_db),
 ) -> list[dict[str, object]]:
-    _reject_sales(user)
+    _require_whatsapp_operator(db, user)
     scope = scoped_channel_account_ids(user)
     bindings = db.scalars(
         select(WhatsAppGroupBinding)
-        .where(
-            or_(
-                WhatsAppGroupBinding.channel_account_id.is_(None),
-                WhatsAppGroupBinding.channel_account_id.in_(scope),
-            )
-        )
+        .where(WhatsAppGroupBinding.channel_account_id.in_(scope))
         .order_by(WhatsAppGroupBinding.id)
     ).all()
     return [_binding_view(db, binding) for binding in bindings]
@@ -101,7 +97,7 @@ def list_phone_candidates(
     user: Annotated[User, Depends(current_user)],
     db: Session = Depends(get_db),
 ) -> list[dict[str, object]]:
-    _reject_sales(user)
+    _require_whatsapp_operator(db, user)
     # Pure read-only enumeration of customer phone numbers already obtained on
     # the caller's authorized WhatsApp accounts. This is ONLY a picker list for
     # a human to choose from: it performs no inference of "which group belongs
@@ -119,6 +115,7 @@ def list_phone_candidates(
         .where(
             ChannelAccount.channel_type == "whatsapp",
             ChannelAccount.status != "revoked",
+            ChannelAccount.history_access_revoked_at.is_(None),
             Message.normalized_customer_contact.is_not(None),
             Message.normalized_customer_contact != "",
             Message.contact_identity_state == "certain",
@@ -148,7 +145,7 @@ def upsert_binding(
     db: Session = Depends(get_db),
 ) -> dict[str, object]:
     user, _ = pair
-    _reject_sales(user)
+    _require_whatsapp_operator(db, user)
 
     group_jid = body.group_jid.strip()
     if not GROUP_JID_RE.fullmatch(group_jid):
@@ -190,9 +187,11 @@ def upsert_binding(
         select(WhatsAppGroupBinding).where(WhatsAppGroupBinding.group_jid == group_jid)
     )
     is_rebind = binding is not None
-    # A group JID is globally unique. Without this check an operator could
-    # silently overwrite another operator's binding by rebinding the same JID.
-    if is_rebind and binding.channel_account_id is not None:
+    # Legacy rows without an account cannot be safely attributed to an
+    # operator, so they remain inaccessible until an explicit migration path.
+    if is_rebind:
+        if binding.channel_account_id is None:
+            raise HTTPException(status_code=403, detail=DENIED)
         allowed_ids = set(db.scalars(scoped_channel_account_ids(user)).all())
         if binding.channel_account_id not in allowed_ids:
             raise HTTPException(status_code=403, detail=DENIED)
@@ -240,15 +239,16 @@ def delete_binding(
     db: Session = Depends(get_db),
 ) -> dict[str, bool]:
     user, _ = pair
-    _reject_sales(user)
+    _require_whatsapp_operator(db, user)
 
     binding = db.get(WhatsAppGroupBinding, binding_id)
     if binding is None:
         raise HTTPException(status_code=404, detail="绑定不存在")
-    if binding.channel_account_id is not None:
-        allowed_ids = set(db.scalars(scoped_channel_account_ids(user)).all())
-        if binding.channel_account_id not in allowed_ids:
-            raise HTTPException(status_code=403, detail=DENIED)
+    if binding.channel_account_id is None:
+        raise HTTPException(status_code=403, detail=DENIED)
+    allowed_ids = set(db.scalars(scoped_channel_account_ids(user)).all())
+    if binding.channel_account_id not in allowed_ids:
+        raise HTTPException(status_code=403, detail=DENIED)
 
     object_id = binding.id
     detail = f"群 {binding.group_jid} -> {binding.normalized_phone}"[:255]

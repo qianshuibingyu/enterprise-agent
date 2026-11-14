@@ -64,7 +64,9 @@ def receive_whatsapp_event(
     except Exception:
         db.rollback()
         raise
-    if result.created:
+    # A repaired row had its overview skipped while it looked like a revoke;
+    # regenerate it from the recovered customer body.
+    if result.created or result.content_repaired:
         background_tasks.add_task(schedule_message_overview, result.message.id)
     return {
         "accepted": True,

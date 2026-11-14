@@ -12,6 +12,7 @@ import httpx
 from sqlalchemy.orm import Session
 
 from app.content_security import content_view
+from app.message_semantics import is_revoked_content
 from app.models.business import Message
 from app.models.overview import MessageOverview
 
@@ -194,6 +195,8 @@ def ensure_message_overview(
         message.direction != "inbound"
         or message.handling_status != "pending"
         or message.test_only
+        # 撤回/双端删除没有正文，生成「意图不明：消息内容为空」只会误导运营。
+        or is_revoked_content(message.raw_content)
     ):
         return None
     overview = message.overview

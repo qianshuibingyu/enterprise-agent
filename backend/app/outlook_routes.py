@@ -2,12 +2,13 @@ from typing import Annotated
 import ast
 import logging
 
+import httpx
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.auth import current_user
-from app.authorization import scoped_channel_account_ids
+from app.authorization import can_operate_channels, scoped_channel_account_ids
 from app.database import get_db
 from app.message_ingestion import ingest_provider_message
 from app.models.business import ChannelAccount, Message
@@ -15,6 +16,7 @@ from app.models.user import User
 from app.outlook_graph import OutlookGraphError, OutlookGraphClient, outlook_graph_client_for_ciphertext
 from app.overview_service import schedule_message_overview
 from app.provider_links import outlook_web_link
+from app.provider_transport import network_failure_message
 
 router = APIRouter(prefix="/api/integrations/outlook", tags=["outlook"])
 logger = logging.getLogger(__name__)
@@ -25,32 +27,32 @@ logger = logging.getLogger(__name__)
 LINK_BACKFILL_LIMIT = 20
 
 
-def get_outlook_client(account_id: int, db: Session = Depends(get_db)) -> OutlookGraphClient:
-    account = db.scalar(
-        select(ChannelAccount).where(
-            ChannelAccount.id == account_id,
-            ChannelAccount.channel_type == "outlook",
-        )
-    )
-    if account is None or not account.outlook_credential_ciphertext:
-        raise HTTPException(status_code=503, detail="Outlook OAuth is not configured for this account")
-    try:
-        return outlook_graph_client_for_ciphertext(account.outlook_credential_ciphertext)
-    except OutlookGraphError as exc:
-        raise HTTPException(status_code=503, detail="Outlook credential is unavailable") from exc
-
-
 def _account(db: Session, user: User, account_id: int) -> ChannelAccount:
+    if user.role == "admin" or not can_operate_channels(user):
+        raise HTTPException(status_code=403, detail="没有权限访问")
+    # Reading the inbox of an account the user already owns is not a new
+    # channel onboarding; see channel_routes.require_channel_preauthorization.
     account = db.scalar(
         select(ChannelAccount).where(
             ChannelAccount.id == account_id,
             ChannelAccount.channel_type == "outlook",
             ChannelAccount.id.in_(scoped_channel_account_ids(user)),
+            ChannelAccount.history_access_revoked_at.is_(None),
         )
     )
     if account is None or not account.external_account_id:
         raise HTTPException(status_code=403, detail="没有权限访问")
     return account
+
+
+def get_outlook_client(account_id: int, db: Session = Depends(get_db), user: User = Depends(current_user)) -> OutlookGraphClient:
+    account = _account(db, user, account_id)
+    if not account.outlook_credential_ciphertext:
+        raise HTTPException(status_code=503, detail="Outlook OAuth is not configured for this account")
+    try:
+        return outlook_graph_client_for_ciphertext(account.outlook_credential_ciphertext)
+    except OutlookGraphError as exc:
+        raise HTTPException(status_code=503, detail="Outlook credential is unavailable") from exc
 
 
 def _outlook_sender(item: dict[str, object]) -> tuple[str | None, str | None]:
@@ -172,6 +174,14 @@ def list_outlook_messages(
         # Surface the concrete provider failure (expired grant, mapping
         # mismatch, Graph error) instead of a generic message.
         raise HTTPException(status_code=502, detail=f"Outlook Graph 读取失败：{exc}") from exc
+    except (httpx.HTTPError, OSError) as exc:
+        # A blocked/unreachable egress network is an operator problem, not a
+        # server bug: report it as 502 with the failing host and the transport
+        # reason instead of letting an unhandled 500 hide the cause.
+        raise HTTPException(
+            status_code=502,
+            detail=f"Outlook 读取失败：{network_failure_message(exc, target='Microsoft Graph')}",
+        ) from exc
 
     output: list[dict[str, object]] = []
     for item in messages:

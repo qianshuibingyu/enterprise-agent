@@ -7,7 +7,9 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.contact_identity import normalize_email, normalize_whatsapp
+from app.message_semantics import needs_body_repair
 from app.models.business import ChannelAccount, Inquiry, InquiryEvent, InquiryMessage, Message, MessageAttachment
+from app.models.user import User
 
 MESSAGE_IDENTITY_CONSTRAINT = "uq_messages_account_provider_external_id"
 WEBSITE_FORM_EMAIL = "lingorm1115@outlook.com"
@@ -75,6 +77,7 @@ class InboundMessageInput:
 class IngestResult:
     message: Message
     created: bool
+    content_repaired: bool = False
 
 
 def _coerce_occurred_at(value: Any) -> datetime:
@@ -159,7 +162,12 @@ def map_provider_message(
     if identity_kind == "email" or (provider in {"gmail_api_pubsub", "outlook_mcp_graph"}):
         identity = normalize_email(identity_source)
     elif identity_kind == "whatsapp" or provider == "whatsapp_web_baileys":
-        identity = normalize_whatsapp(raw_contact)
+        # WhatsApp direct chats always carry a complete international number;
+        # the adapter strips the JID suffix, so the bare digits are still exact.
+        identity = normalize_whatsapp(
+            raw_contact,
+            assume_international=provider == "whatsapp_web_baileys",
+        )
     else:
         identity = None
     # The website form is identified by the displayed From address only: the
@@ -292,6 +300,16 @@ def ingest_message(db: Session, payload: InboundMessageInput) -> IngestResult:
             existing.contact_identity_state = "forwarded" if payload.contact_forwarded else "certain"
             existing.contact_identity_kind = payload.contact_identity_kind
             existing.original_sender_contact = payload.original_sender_contact
+        # A first capture may be a bodyless WhatsApp stub while a later event
+        # for the same provider id carries the real customer text. Recovering it
+        # is a repair, not a rewrite: only a stub can be replaced by real text.
+        content_repaired = needs_body_repair(existing.raw_content, payload.raw_content)
+        if content_repaired:
+            existing.raw_content = payload.raw_content
+            if existing.inquiry_link is not None:
+                inquiry = existing.inquiry_link.inquiry
+                if inquiry is not None and needs_body_repair(inquiry.raw_message, payload.raw_content):
+                    inquiry.raw_message = payload.raw_content
         # Provider re-reads can contain metadata that was unavailable when an
         # older row was first ingested. Backfill only missing presentation
         # fields; the provider identity and message body remain immutable.
@@ -306,7 +324,7 @@ def ingest_message(db: Session, payload: InboundMessageInput) -> IngestResult:
             existing.provider_web_link = payload.provider_web_link
         if existing.direction == "inbound" and existing.inquiry_link is None and existing.link_state in {"pending", "manual_review", "unmatched"} and existing.contact_identity_state == "certain":
             _link_inbound_message_to_inquiry(db, existing)
-        return IngestResult(message=existing, created=False)
+        return IngestResult(message=existing, created=False, content_repaired=content_repaired)
 
     message = Message(
         channel_account_id=payload.channel_account_id,
@@ -358,8 +376,23 @@ def ingest_message(db: Session, payload: InboundMessageInput) -> IngestResult:
     return IngestResult(message=message, created=True)
 
 
+def _inquiry_department_for_account(db: Session, channel_account_id: int) -> str | None:
+    """Use the owning operator's department for newly created inquiries."""
+    account = db.get(ChannelAccount, channel_account_id)
+    if account is None:
+        return None
+    owner = db.execute(
+        select(User.role, User.department).where(User.id == account.owner_user_id)
+    ).first()
+    if owner is None or owner.role not in {"staff", "operations", "ops"}:
+        return None
+    department = (owner.department or "").strip()
+    return department or None
+
+
 def _link_inbound_message_to_inquiry(db: Session, message: Message) -> None:
     """Create or continue the unique exact-contact inquiry, without guessing ties."""
+    department = _inquiry_department_for_account(db, message.channel_account_id)
     if message.is_website_form:
         inquiry = Inquiry(
             customer_contact=f"官网表单提交 #{message.id}",
@@ -368,6 +401,7 @@ def _link_inbound_message_to_inquiry(db: Session, message: Message) -> None:
             contact_identity_kind=None,
             customer_nickname=f"官网表单提交 #{message.id}",
             raw_message=message.raw_content,
+            department=department,
             source_channel_account_id=message.channel_account_id,
             status="new",
             handling_status="pending",
@@ -468,6 +502,7 @@ def _link_inbound_message_to_inquiry(db: Session, message: Message) -> None:
             contact_identity_kind=message.contact_identity_kind,
             customer_nickname=message.customer_nickname or message.customer_contact or contact,
             raw_message=message.raw_content,
+            department=department,
             source_channel_account_id=message.channel_account_id,
             status="new",
             handling_status="pending",

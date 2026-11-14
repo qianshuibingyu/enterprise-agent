@@ -35,6 +35,7 @@ def client():
             username="reviewer",
             password_hash=hash_password("reviewer1"),
             role="staff",
+            department="inquiry",
             is_active=True,
             must_change_password=False,
         )
@@ -79,6 +80,7 @@ def client():
         ))
         db.add(Inquiry(
             customer_contact="+16502530000",
+            department="inquiry",
             normalized_customer_contact="+16502530000",
             contact_identity_state="certain",
             contact_identity_kind="whatsapp",

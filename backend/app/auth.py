@@ -140,6 +140,9 @@ def require_csrf(
     pair: Annotated[tuple[User, UserSession], Depends(authenticated_pair)],
 ) -> tuple[User, UserSession]:
     csrf_check(request, pair[1])
+    user, _ = pair
+    if user.must_change_password and request.url.path not in {"/auth/password", "/auth/logout"}:
+        raise HTTPException(status_code=403, detail="首次登录必须修改密码")
     return pair
 
 
@@ -171,3 +174,12 @@ def require_admin(user: Annotated[User, Depends(current_user)]) -> User:
     if user.role != "admin":
         raise HTTPException(status_code=403, detail="没有权限访问")
     return user
+
+
+def require_admin_csrf(
+    pair: Annotated[tuple[User, UserSession], Depends(require_csrf)],
+) -> tuple[User, UserSession]:
+    user, _ = pair
+    if user.role != "admin":
+        raise HTTPException(status_code=403, detail="没有权限访问")
+    return pair

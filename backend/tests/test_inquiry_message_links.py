@@ -36,9 +36,9 @@ def link_db():
     factory = sessionmaker(bind=engine, expire_on_commit=False)
     with factory() as db:
         db.add_all([
-            User(username="op1", password_hash="x", role="staff", is_active=True, must_change_password=False),
-            User(username="op2", password_hash="x", role="staff", is_active=True, must_change_password=False),
-            User(username="sales", password_hash="x", role="sales", is_active=True, must_change_password=False),
+            User(username="op1", password_hash="x", role="staff", department="inquiry", is_active=True, must_change_password=False),
+            User(username="op2", password_hash="x", role="staff", department="after_sales", is_active=True, must_change_password=False),
+            User(username="sales", password_hash="x", role="sales", department="inquiry", is_active=True, must_change_password=False),
         ])
         db.flush()
         db.add_all([
@@ -139,6 +139,7 @@ def test_multiple_candidate_inquiries_leave_message_unlinked(link_db):
     contact = first.message.customer_contact
     source = first.message.inquiry_link.inquiry.source_channel_account_id
     second_inquiry = Inquiry(
+        department="inquiry",
         customer_contact=contact,
         customer_nickname="Ambiguous",
         raw_message="separate inquiry, same identity",

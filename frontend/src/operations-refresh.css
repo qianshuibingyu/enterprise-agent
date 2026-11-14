@@ -203,8 +203,12 @@ h1, h2, h3 { color: var(--ink); letter-spacing: 0; }
 .message-overview, .message-preview, .message-content-view { min-width: 0; margin: 0; color: #344b50; font-size: 13px; line-height: 1.6; overflow-wrap: anywhere; }
 .message-overview { padding: 10px 12px; background: #f3f7f5; border-left: 2px solid #83a897; }
 .message-overview.fallback { background: var(--warning-bg); border-color: #b69a56; }
-.message-preview { display: -webkit-box; grid-column: 2; -webkit-box-orient: vertical; -webkit-line-clamp: 3; overflow: hidden; }
+/* Scope placement to direct children: .message-content-view is its own grid,
+   so a descendant `.message-preview` must not be forced into column 2 there. */
+.message-row > .message-preview { display: -webkit-box; grid-column: 2; -webkit-box-orient: vertical; -webkit-line-clamp: 3; overflow: hidden; }
 .message-content-view { display: grid; gap: 8px; grid-column: 2; }
+.message-content-view > * { grid-column: 1; grid-row: auto; min-width: 0; }
+.message-content-view > .content-expand-link { justify-self: start; }
 .message-original-preview, .message-full-content { margin: 0; padding: 10px 12px; color: var(--ink); background: var(--raised); border: 1px solid var(--line); border-radius: 4px; white-space: pre-wrap; overflow-wrap: anywhere; }
 .content-label { display: block; margin-bottom: 5px; color: var(--muted); font-size: 11px; }
 .message-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-content: start; gap: 6px; margin: 0; }
@@ -382,7 +386,7 @@ h1, h2, h3 { color: var(--ink); letter-spacing: 0; }
   .filter-group select { width: 100%; }
   .inquiry-row { padding: 11px 14px; }
   .message-row { grid-template-columns: minmax(0, 1fr); gap: 7px; }
-  .message-meta, .message-row .message-preview, .message-row .message-content-view, .message-row .message-actions { grid-column: 1; }
+  .message-meta, .message-row .message-preview, .message-row > .message-brief, .message-row .message-content-view, .message-row .message-actions { grid-column: 1; }
   .message-actions { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .message-row.is-focused-message::after { position: static; grid-column: 1; justify-self: start; margin-top: 2px; }
   .message-group { padding: 0 10px; }
